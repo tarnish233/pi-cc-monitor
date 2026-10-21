@@ -87,6 +87,32 @@ mid-response"*）。
 }
 ```
 
+### 界面设置（与 pi-cc-loop 共享）
+
+两个扩展读同一个 `~/.pi/agent/pi-cc.json`，用 `/loop settings` 切换：
+
+```
+/loop settings messages on|off   紧凑消息 / 旧的带底色卡片
+/loop settings tools on|off      一行工具结果 / Pi 默认工具行
+```
+
+如果装了 `pi-cc-extensions`，`tools on` 时本扩展会把 `Monitor` / `monitor_stop` /
+`monitor_list` 加进它的 `excludeRenderers`（`tools off` 时只移除自己加的名字），
+它只在启动时读配置，所以切换后需要 `/reload`。设 `"managePiCcExtensions": false`
+或 `PI_CC_MANAGE_CCSTYLE=0` 可关闭自动同步。
+
+`compactToolRows` 打开时，三个工具的结果也压成一行（结果返回后调用行自动隐藏）：
+
+```
+✓ Armed bd9j9ugm · 60m timeout · errors in deploy.log
+✓ Stopped bd9j9ugm
+✓ 2 monitors · bd9j9ugm running (3 events) · xyz stopped (0 events)
+```
+
+也可以直接编辑配置文件后 `/reload`。环境变量 `PI_CC_COMPACT_MESSAGES=0` /
+`PI_CC_COMPACT_TOOL_ROWS=0` 可临时覆盖。
+
+
 ---
 
 ## 对齐 Claude Code 的细节
@@ -175,6 +201,7 @@ you armed"*。
 
 ```
 index.ts      Monitor / monitor_stop / monitor_list，事件分发
+config.ts     共享设置（~/.pi/agent/pi-cc.json）
 process.ts    detached spawn + 进程组 kill
 stream.ts     逐行切分 + 200ms 批量 + 洪水检测
 shell.ts      shell 配置与环境

@@ -15,6 +15,7 @@ function makeHarness() {
 	const commands = new Map();
 	const tools = new Map();
 	const renderers = new Map();
+	const toolRenderers = [];
 	const handlers = new Map();
 	const sent = [];
 	const events = [];
@@ -29,6 +30,9 @@ function makeHarness() {
 		},
 		registerMessageRenderer(customType, renderer) {
 			renderers.set(customType, renderer);
+		},
+		registerToolRenderer(resolver) {
+			toolRenderers.push(resolver);
 		},
 		on(event, handler) {
 			handlers.set(event, handler);
@@ -66,7 +70,7 @@ function makeHarness() {
 		hasPendingMessages: () => false,
 	};
 
-	return { pi, ctx, commands, tools, handlers, sent, events, notifications };
+	return { pi, ctx, commands, tools, renderers, toolRenderers, handlers, sent, events, notifications };
 }
 
 async function start(h) {

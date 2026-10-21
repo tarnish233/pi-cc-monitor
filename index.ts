@@ -28,10 +28,26 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ChildProcess } from "node:child_process";
-import type { ExtensionAPI, ExtensionContext, ThemeColor } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	Theme,
+	ThemeColor,
+	ToolRenderers,
+} from "@earendil-works/pi-coding-agent";
+import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { invalidateConfig, loadConfig, syncPiCcExtensionsExcludes } from "./config.ts";
 import { killTree, spawnMonitor } from "./process.ts";
-import { bodyLines, contentText, formatStamp, renderBlock, stripProvenance } from "./render.ts";
+import {
+	bodyLines,
+	contentText,
+	firstLine,
+	formatStamp,
+	renderBlock,
+	renderCard,
+	stripProvenance,
+} from "./render.ts";
 import { monitorEnv, monitorShell } from "./shell.ts";
 import { FloodGuard, LineBatcher } from "./stream.ts";
 
@@ -45,6 +61,8 @@ export const WAKE_CHANNEL = "monitor:wake";
 export const LOOP_STOPPED_CHANNEL = "loop:stopped";
 /** The custom message type used for notifications. */
 export const EVENT_MESSAGE_TYPE = "pi-cc-monitor-event";
+const CONFIG_CHANNEL = "pi-cc:config";
+const MONITOR_TOOL_NAMES = ["Monitor", "monitor_stop", "monitor_list"];
 
 /** Claude Code's defaults: 5 minutes, capped at 1 hour. */
 export const DEFAULT_TIMEOUT_MS = 300_000;
@@ -142,6 +160,52 @@ function generateId(): string {
 	let out = "";
 	for (let i = 0; i < 8; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
 	return out;
+}
+
+function truncate(text: string, max: number): string {
+	const clean = text.replace(/\s+/g, " ").trim();
+	return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+}
+
+/** A compact one-line call row for a tool. */
+function toolCall(label: string, detail: string, theme: Theme): Text {
+	const title = theme.fg("toolTitle", theme.bold(label));
+	return new Text(detail ? `${title} ${theme.fg("muted", detail)}` : title, 0, 0);
+}
+
+/** A compact one-line result row for a tool. */
+function toolResult(
+	summary: string,
+	detail: string | undefined,
+	options: { expanded: boolean; isPartial: boolean; isError: boolean },
+	theme: Theme,
+): Text {
+	if (options.isPartial) return new Text(theme.fg("warning", "Working…"), 0, 0);
+	const prefix = options.isError ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
+	const body = options.isError ? theme.fg("error", summary) : theme.fg("toolOutput", summary);
+	const text = prefix + body;
+	if (options.expanded && detail) return new Text(`${text}\n${theme.fg("dim", detail)}`, 0, 0);
+	return new Text(text, 0, 0);
+}
+
+/** Hide the call row once the result has arrived, leaving one result line. */
+function completedCall(): Container {
+	return new Container();
+}
+
+/** The first text line of a tool result, used as a fallback summary. */
+function resultText(result: { content?: Array<{ type?: string; text?: string }> }): string {
+	for (const block of result.content ?? []) {
+		if (block?.type === "text" && typeof block.text === "string") {
+			return block.text.split("\n")[0] ?? "";
+		}
+	}
+	return "";
+}
+
+function monitorSummary(record: MonitorRecord): string {
+	const events = `${record.eventCount} event${record.eventCount === 1 ? "" : "s"}`;
+	return `${record.id} ${record.status} (${events})`;
 }
 
 // ------------------------------------------------------------------ extension
@@ -493,6 +557,18 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		const cause = details.cause ?? "output";
 		const text = contentText(message.content);
 		const body = stripProvenance(text, /^\[monitor[^\]]*\]\n?/);
+		if (!loadConfig().compactMessages) {
+			const summary = firstLine(body);
+			const header = `monitor · ${details.description ?? "watch"}`;
+			const suffix = cause === "output" ? "" : ` (${cause})`;
+			return renderCard({
+				header: `${header}${suffix}${summary && cause === "output" ? ` · ${summary}` : ""}`,
+				body,
+				expanded: options.expanded,
+				outputPad: options.outputPad,
+				theme,
+			});
+		}
 
 		const stamp = formatStamp(message.timestamp);
 		const parts = [theme.fg("accent", theme.bold("monitor"))];
@@ -715,6 +791,158 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				details: { monitors: list },
 			};
 		},
+	});
+
+	// -------------------------------------------------------------- rendering
+
+	/**
+	 * Compact one-line tool rows.
+	 *
+	 * The resolver is consulted every time a tool row renders, so setting
+	 * `compactToolRows` to false falls back to Pi's default rendering without
+	 * re-registering the tool or reloading the extension.
+	 */
+	function registerToolRenderers(): void {
+		if (typeof pi.registerToolRenderer !== "function") return;
+		const renderers: Record<string, ToolRenderers> = {
+			Monitor: {
+				renderCall(args: any, theme: Theme, context: any) {
+					if (!context.isPartial && context.executionStarted) return completedCall();
+					const description = truncate(args.description ?? "", 40);
+					const target = args.ws?.url ? `ws ${truncate(args.ws.url, 40)}` : truncate(args.command ?? "", 40);
+					return toolCall("Watch", [description, target].filter(Boolean).join(" · "), theme);
+				},
+				renderResult(result: any, options: any, theme: Theme, context: any) {
+					if (context.isError) {
+						return toolResult(
+							resultText(result) || "Failed",
+							undefined,
+							{ expanded: options.expanded, isPartial: options.isPartial, isError: true },
+							theme,
+						);
+					}
+					const d = (result.details ?? {}) as {
+						taskId?: string;
+						timeoutMs?: number;
+						persistent?: boolean;
+						outputPath?: string;
+						stderrPath?: string;
+					};
+					const lifetime = d.persistent
+						? "session lifetime"
+						: `${Math.round((d.timeoutMs ?? 0) / 60_000)}m timeout`;
+					const description = context.args.description
+						? ` · ${truncate(context.args.description, 40)}`
+						: "";
+					const summary = `Armed ${d.taskId ?? "?"} · ${lifetime}${description}`;
+					const detail = options.expanded
+						? [
+								context.args.command ? `command: ${context.args.command}` : undefined,
+								context.args.ws?.url ? `ws: ${context.args.ws.url}` : undefined,
+								d.outputPath ? `output: ${d.outputPath}` : undefined,
+								d.stderrPath ? `stderr: ${d.stderrPath}` : undefined,
+							]
+								.filter(Boolean)
+								.join("\n")
+						: undefined;
+					return toolResult(
+						summary,
+						detail || undefined,
+						{ expanded: options.expanded, isPartial: options.isPartial, isError: context.isError },
+						theme,
+					);
+				},
+			},
+			monitor_stop: {
+				renderCall(args: any, theme: Theme, context: any) {
+					if (!context.isPartial && context.executionStarted) return completedCall();
+					return toolCall("Stop", args.id ?? "", theme);
+				},
+				renderResult(result: any, options: any, theme: Theme, context: any) {
+					if (context.isError) {
+						return toolResult(
+							resultText(result) || "Failed",
+							undefined,
+							{ expanded: options.expanded, isPartial: options.isPartial, isError: true },
+							theme,
+						);
+					}
+					const d = (result.details ?? {}) as { stopped?: boolean; id?: string };
+					const summary = d.stopped ? `Stopped ${d.id ?? "?"}` : `No monitor ${d.id ?? "?"}`;
+					return toolResult(
+						summary,
+						undefined,
+						{ expanded: options.expanded, isPartial: options.isPartial, isError: context.isError },
+						theme,
+					);
+				},
+			},
+			monitor_list: {
+				renderCall(_args: any, theme: Theme, context: any) {
+					if (!context.isPartial && context.executionStarted) return completedCall();
+					return toolCall("List monitors", "", theme);
+				},
+				renderResult(result: any, options: any, theme: Theme, context: any) {
+					if (context.isError) {
+						return toolResult(
+							resultText(result) || "Failed",
+							undefined,
+							{ expanded: options.expanded, isPartial: options.isPartial, isError: true },
+							theme,
+						);
+					}
+					const d = (result.details ?? {}) as { monitors?: MonitorRecord[] };
+					const list = d.monitors ?? [];
+					let summary: string;
+					if (!list.length) summary = "No monitors";
+					else if (list.length === 1) summary = `1 monitor · ${monitorSummary(list[0])}`;
+					else {
+						const shown = list.slice(0, 2).map(monitorSummary).join(" · ");
+						summary = `${list.length} monitors · ${shown}${list.length > 2 ? " …" : ""}`;
+					}
+					const detail = options.expanded
+						? list.map((record) => `${monitorSummary(record)} · ${record.description}`).join("\n")
+						: undefined;
+					return toolResult(
+						summary || resultText(result),
+						detail,
+						{ expanded: options.expanded, isPartial: options.isPartial, isError: context.isError },
+						theme,
+					);
+				},
+			},
+		};
+
+		pi.registerToolRenderer((toolName, next) => {
+			if (!loadConfig().compactToolRows) return next();
+			return renderers[toolName] ?? next();
+		});
+	}
+
+	registerToolRenderers();
+
+	/** pi-cc-loop owns the shared exclusion list when it is installed. */
+	function loopToolAvailable(): boolean {
+		try {
+			return pi.getAllTools().some((tool) => tool.name === "cron_create");
+		} catch {
+			return false;
+		}
+	}
+
+	// The loop extension writes the shared config file and announces the change.
+	pi.events.on(CONFIG_CHANNEL, () => {
+		invalidateConfig();
+		if (!loopToolAvailable()) {
+			syncPiCcExtensionsExcludes(MONITOR_TOOL_NAMES, loadConfig().compactToolRows);
+		}
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		lastCtx = ctx;
+		if (!loopToolAvailable() && syncPiCcExtensionsExcludes(MONITOR_TOOL_NAMES, loadConfig().compactToolRows)) {
+			notify(ctx, "pi-cc-extensions excludeRenderers updated · /reload to apply", "info");
+		}
 	});
 
 	// --------------------------------------------------------------- lifecycle

@@ -42,6 +42,7 @@ function makeHarness() {
 		registerMessageRenderer(customType, renderer) {
 			renderers.set(customType, renderer);
 		},
+		registerToolRenderer() {},
 		on() {
 			return () => {};
 		},
