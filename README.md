@@ -59,7 +59,7 @@ Schema 与 Claude Code v2.1.306 **逐字段一致**：
 `[pi-cc-monitor-event]` 这种机器名，本扩展注册了自己的 renderer）：
 
 ```
-⟳ monitor · errors in deploy.log · ERROR: connection refused on :3000    (Ctrl+O 展开)
+monitor · errors in deploy.log · ERROR: connection refused on :3000    (Ctrl+O 展开)
 ```
 
 展开后是完整的输出。renderer 只影响显示，模型看到的内容不变。

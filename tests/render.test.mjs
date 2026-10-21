@@ -75,7 +75,7 @@ test("the event is drawn as a readable card, not [pi-cc-monitor-event]", () => {
 	};
 
 	const collapsed = render(renderer, message, false);
-	assert.ok(collapsed.includes("⟳ monitor · errors in deploy.log"), collapsed);
+	assert.ok(collapsed.includes("monitor · errors in deploy.log"), collapsed);
 	assert.ok(collapsed.includes("ERROR: connection refused on :3000"), collapsed);
 	assert.ok(!collapsed.includes("[pi-cc-monitor-event]"), "the machine name is gone");
 });

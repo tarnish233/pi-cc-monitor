@@ -458,7 +458,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		const body = text.replace(/^\[monitor[^\]]*\]\n?/, "");
 		const cause = details.cause ?? "output";
 		const summary = firstLine(body);
-		const header = `⟳ monitor · ${details.description ?? "watch"}`;
+		const header = `monitor · ${details.description ?? "watch"}`;
 		const suffix = cause === "output" ? "" : ` (${cause})`;
 		return renderCard({
 			header: `${header}${suffix}${summary && cause === "output" ? ` · ${summary}` : ""}`,
