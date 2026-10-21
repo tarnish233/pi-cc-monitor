@@ -3,14 +3,18 @@
  *
  * Pi renders a custom message with the raw `customType` as its title
  * (`[pi-cc-monitor-event]`), which reads like a machine name. A custom
- * renderer replaces that with a readable, collapsible card.
+ * renderer replaces that with a quiet block: a timestamped header plus the
+ * captured output, modelled on Claude Code's `scheduled_task_fire` marker.
+ *
+ * No icon and no background. Long batches are capped to a few lines while
+ * collapsed; expanding shows the full output and the monitor metadata.
  *
  * The renderer only affects the display. The message content the model sees is
  * unchanged.
  */
 
-import { keyHint, type Theme } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import { Container, Text } from "@earendil-works/pi-tui";
 
 /** Flatten a custom message body to plain text. */
 export function contentText(content: unknown): string {
@@ -27,48 +31,63 @@ export function contentText(content: unknown): string {
 	return "";
 }
 
-/** The first non-empty line of a text block. */
-export function firstLine(text: string): string {
-	for (const line of text.split("\n")) {
-		const trimmed = line.trim();
-		if (trimmed) return trimmed;
-	}
-	return "";
+/** Remove the provenance line the model needs but the reader does not. */
+export function stripProvenance(text: string, pattern: RegExp): string {
+	return text.replace(pattern, "");
+}
+
+/** Split a text block into displayable lines, dropping blank ones. */
+export function bodyLines(text: string): string[] {
+	return text
+		.split("\n")
+		.map((line) => line.replace(/\r$/, ""))
+		.filter((line) => line.trim().length > 0);
 }
 
 /**
- * The hint for the expand shortcut. The keybinding is configurable and the
- * theme has to be initialised, so fall back to the default when the hint
- * would come out empty.
+ * Format a timestamp the way Claude Code does: just the time for today,
+ * "Oct 21 4:13 PM" for an older message.
  */
-function expandHint(): string {
-	try {
-		const hint = keyHint("app.tools.expand", "to expand");
-		const plain = hint.replace(/\x1b\[[0-9;]*m/g, "");
-		if (!plain.trim() || plain.trim().startsWith("to expand")) {
-			return "(Ctrl+O to expand)";
-		}
-		return hint;
-	} catch {
-		return "(Ctrl+O to expand)";
-	}
+export function formatStamp(epochMs: number | undefined): string {
+	const date = new Date(epochMs ?? Date.now());
+	if (Number.isNaN(date.getTime())) return "";
+	const now = new Date();
+	const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+	if (date.toDateString() === now.toDateString()) return time;
+	const day = date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+	return `${day} ${time}`;
 }
 
-/** Draw a card with a coloured header on Pi's custom-message background. */
-export function renderCard(options: {
+/**
+ * Draw a quiet event block: one coloured header line, then an indented body.
+ *
+ * Collapsed shows at most `maxBodyLines` body lines (plus a "+N more" note);
+ * expanded shows the whole body and the metadata line.
+ */
+export function renderBlock(options: {
 	header: string;
-	body?: string;
+	body: string[];
+	meta?: string[];
 	expanded: boolean;
 	outputPad: number;
 	theme: Theme;
-}): Box {
-	const { header, body, expanded, outputPad, theme } = options;
-	const box = new Box(outputPad, 1, (text) => theme.bg("customMessageBg", text));
-	box.addChild(new Text(theme.fg("customMessageLabel", header), 0, 0));
-	if (expanded && body) {
-		box.addChild(new Text(theme.fg("customMessageText", `\n${body}`), 0, 0));
-	} else if (!expanded) {
-		box.addChild(new Text(theme.fg("dim", `  ${expandHint()}`), 0, 0));
+	maxBodyLines?: number;
+}): Container {
+	const { header, body, meta, expanded, outputPad, theme } = options;
+	const limit = options.maxBodyLines ?? 3;
+	const container = new Container();
+	container.addChild(new Text(header, outputPad, 0));
+
+	const indent = outputPad + 2;
+	const shown = expanded ? body : body.slice(0, limit);
+	for (const line of shown) {
+		container.addChild(new Text(theme.fg("customMessageText", line), indent, 0));
 	}
-	return box;
+	if (!expanded && body.length > shown.length) {
+		container.addChild(new Text(theme.fg("dim", `+${body.length - shown.length} more lines`), indent, 0));
+	}
+	if (expanded && meta?.length) {
+		container.addChild(new Text(theme.fg("dim", meta.join(" · ")), indent, 0));
+	}
+	return container;
 }

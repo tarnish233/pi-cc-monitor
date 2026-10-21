@@ -55,14 +55,19 @@ Schema 与 Claude Code v2.1.306 **逐字段一致**：
 
 ### 事件怎么到达 agent
 
-每条通知是一个 custom message，界面上画成可折叠的卡片（Pi 默认会画成
+每条通知是一个 custom message，界面上画成两行的轻量块（无图标、无底色。Pi 默认会画成
 `[pi-cc-monitor-event]` 这种机器名，本扩展注册了自己的 renderer）：
 
 ```
-monitor · errors in deploy.log · ERROR: connection refused on :3000    (Ctrl+O 展开)
+monitor · 4:14 PM · errors in deploy.log
+  ERROR: connection refused on :3000
+  ERROR: retry failed
+  ERROR: gave up
+  +1 more lines
 ```
 
-展开后是完整的输出。renderer 只影响显示，模型看到的内容不变。
+折叠态最多显示 3 行输出，超出时用 `+N more lines` 标记；`Ctrl+O` 展开后显示完整输出和
+`id … · N events`。renderer 只影响显示，模型看到的内容不变。
 
 投递走 `followUp` 低优先级通道 —— agent 忙的时候排队等这一轮结束，不会插进去打断
 （对齐 CC 的 *"A scheduled prompt fires between your turns, not while Claude is

@@ -28,10 +28,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ChildProcess } from "node:child_process";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { killTree, spawnMonitor } from "./process.ts";
-import { contentText, firstLine, renderCard } from "./render.ts";
+import { bodyLines, contentText, formatStamp, renderBlock, stripProvenance } from "./render.ts";
 import { monitorEnv, monitorShell } from "./shell.ts";
 import { FloodGuard, LineBatcher } from "./stream.ts";
 
@@ -191,6 +191,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					cause,
 					lines,
 					eventCount: record.eventCount,
+					exitCode: record.exitCode,
 					outputPath: record.outputPath,
 					stderrPath: record.stderrPath,
 				},
@@ -443,8 +444,42 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 
 	// ---------------------------------------------------------------- tools
 
+	/** A short, human-readable label for a non-output cause. */
+	function causeLabel(cause: MonitorCause, exitCode: number | null | undefined): string {
+		switch (cause) {
+			case "exit":
+				return exitCode === null || exitCode === undefined ? "exited" : `exited (code ${exitCode})`;
+			case "timeout":
+				return "timed out";
+			case "error":
+				return "failed";
+			case "closed":
+				return "closed";
+			case "stopped":
+				return "stopped";
+			case "flooded":
+				return "stopped (too much output)";
+			default:
+				return "";
+		}
+	}
+
+	function causeColor(cause: MonitorCause, exitCode: number | null | undefined): ThemeColor {
+		switch (cause) {
+			case "exit":
+				return exitCode === 0 ? "success" : "error";
+			case "timeout":
+			case "flooded":
+				return "warning";
+			case "error":
+				return "error";
+			default:
+				return "muted";
+		}
+	}
+
 	/**
-	 * Draw the event as a readable card instead of Pi's default
+	 * Draw the event as a quiet block instead of Pi's default
 	 * `[pi-cc-monitor-event]` title.
 	 */
 	pi.registerMessageRenderer(EVENT_MESSAGE_TYPE, (message, options, theme) => {
@@ -452,20 +487,35 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			description?: string;
 			cause?: MonitorCause;
 			eventCount?: number;
+			monitorId?: string;
+			exitCode?: number | null;
 		};
-		const text = contentText(message.content);
-		// The content starts with the "[monitor · <description>]" line.
-		const body = text.replace(/^\[monitor[^\]]*\]\n?/, "");
 		const cause = details.cause ?? "output";
-		const summary = firstLine(body);
-		const header = `monitor · ${details.description ?? "watch"}`;
-		const suffix = cause === "output" ? "" : ` (${cause})`;
-		return renderCard({
-			header: `${header}${suffix}${summary && cause === "output" ? ` · ${summary}` : ""}`,
-			body: body,
+		const text = contentText(message.content);
+		const body = stripProvenance(text, /^\[monitor[^\]]*\]\n?/);
+
+		const stamp = formatStamp(message.timestamp);
+		const parts = [theme.fg("accent", theme.bold("monitor"))];
+		if (stamp) parts.push(theme.fg("muted", stamp));
+		if (details.description) parts.push(theme.fg("customMessageText", details.description));
+		const causeText = causeLabel(cause, details.exitCode);
+		if (causeText) parts.push(theme.fg(causeColor(cause, details.exitCode), causeText));
+		const header = parts.join(theme.fg("dim", " · "));
+
+		const meta: string[] = [];
+		if (details.monitorId) meta.push(`id ${details.monitorId}`);
+		if (details.eventCount !== undefined) {
+			meta.push(`${details.eventCount} event${details.eventCount === 1 ? "" : "s"}`);
+		}
+
+		return renderBlock({
+			header,
+			body: bodyLines(body),
+			meta,
 			expanded: options.expanded,
 			outputPad: options.outputPad,
 			theme,
+			maxBodyLines: 3,
 		});
 	});
 
