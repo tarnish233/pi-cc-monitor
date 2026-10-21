@@ -119,6 +119,24 @@ export interface MonitorRecord {
 	flood?: FloodGuard;
 }
 
+/** A serializable view of a monitor, safe to put in tool result details. */
+export interface MonitorSnapshot {
+	id: string;
+	kind: "command" | "ws";
+	description: string;
+	command?: string;
+	wsUrl?: string;
+	timeoutMs: number;
+	persistent: boolean;
+	createdAt: number;
+	eventCount: number;
+	status: MonitorStatus;
+	exitCode?: number | null;
+	loopPrompt?: string;
+	outputPath: string;
+	stderrPath: string;
+}
+
 // ------------------------------------------------------------------ helpers
 
 /** Control characters would be invisible in an approval dialog. */
@@ -203,7 +221,26 @@ function resultText(result: { content?: Array<{ type?: string; text?: string }> 
 	return "";
 }
 
-function monitorSummary(record: MonitorRecord): string {
+function snapshotMonitor(record: MonitorRecord): MonitorSnapshot {
+	return {
+		id: record.id,
+		kind: record.kind,
+		description: record.description,
+		...(record.command !== undefined ? { command: record.command } : {}),
+		...(record.wsUrl !== undefined ? { wsUrl: record.wsUrl } : {}),
+		timeoutMs: record.timeoutMs,
+		persistent: record.persistent,
+		createdAt: record.createdAt,
+		eventCount: record.eventCount,
+		status: record.status,
+		...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
+		...(record.loopPrompt !== undefined ? { loopPrompt: record.loopPrompt } : {}),
+		outputPath: record.outputPath,
+		stderrPath: record.stderrPath,
+	};
+}
+
+function monitorSummary(record: MonitorSnapshot): string {
 	const events = `${record.eventCount} event${record.eventCount === 1 ? "" : "s"}`;
 	return `${record.id} ${record.status} (${events})`;
 }
@@ -772,7 +809,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			lastCtx = ctx;
-			const list = [...monitors.values()];
+			const list = [...monitors.values()].map(snapshotMonitor);
 			if (!list.length) {
 				return {
 					content: [{ type: "text" as const, text: "No monitors." }],
@@ -891,7 +928,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 							theme,
 						);
 					}
-					const d = (result.details ?? {}) as { monitors?: MonitorRecord[] };
+					const d = (result.details ?? {}) as { monitors?: MonitorSnapshot[] };
 					const list = d.monitors ?? [];
 					let summary: string;
 					if (!list.length) summary = "No monitors";

@@ -328,3 +328,29 @@ test("a loop:stopped event for another chain leaves the monitor alone", async ()
 	const list = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
 	assert.equal(list.details.monitors[0].status, "running");
 });
+
+test("monitor_list details are JSON and structured-clone safe", async () => {
+	const h = await start(makeHarness());
+	const armed = await h.tools
+		.get("Monitor")
+		.execute(
+			"c",
+			{ command: "sleep 5", description: "serialize test", timeout_ms: 60_000 },
+			undefined,
+			undefined,
+			h.ctx,
+		);
+	const id = armed.details.taskId;
+	const listed = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
+
+	assert.doesNotThrow(() => JSON.stringify(listed.details));
+	assert.doesNotThrow(() => structuredClone(listed.details));
+	const record = listed.details.monitors[0];
+	assert.equal(record.id, id);
+	assert.equal(record.child, undefined);
+	assert.equal(record.timeoutTimer, undefined);
+	assert.equal(record.batcher, undefined);
+	assert.equal(record.flood, undefined);
+
+	await h.tools.get("monitor_stop").execute("c", { id }, undefined, undefined, h.ctx);
+});
