@@ -1,17 +1,45 @@
 {
 	"name": "pi-cc-monitor",
 	"version": "0.1.0",
-	"description": "Claude Code's Monitor tool for the Pi coding agent: a background watch that turns stdout lines or WebSocket frames into notifications that wake the agent.",
+	"description": "Claude Code compatible Monitor for the Pi coding agent: a background watch that turns stdout lines or WebSocket frames into notifications that wake the agent.",
 	"type": "module",
 	"license": "MIT",
-	"keywords": ["pi-package", "extension", "monitor", "background", "watch", "claude-code"],
+	"keywords": [
+		"pi-package",
+		"extension",
+		"monitor",
+		"background",
+		"watch",
+		"claude-code"
+	],
+	"homepage": "https://github.com/tarnish233/pi-cc-monitor#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/tarnish233/pi-cc-monitor.git"
+	},
+	"bugs": {
+		"url": "https://github.com/tarnish233/pi-cc-monitor/issues"
+	},
+	"files": [
+		"index.ts",
+		"process.ts",
+		"stream.ts",
+		"shell.ts",
+		"render.ts",
+		"config.ts",
+		"README.md",
+		"LICENSE"
+	],
 	"pi": {
-		"extensions": ["./index.ts"]
+		"extensions": [
+			"./index.ts"
+		]
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-coding-agent": "*",
-		"@earendil-works/pi-tui": "*"
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
 	},
 	"engines": {
 		"node": ">=22.19.0"
@@ -19,5 +47,8 @@
 	"scripts": {
 		"test": "node --test tests/*.test.mjs",
 		"typecheck": "tsc --noEmit -p tsconfig.json"
+	},
+	"publishConfig": {
+		"access": "public"
 	}
 }
