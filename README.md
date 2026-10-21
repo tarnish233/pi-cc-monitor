@@ -22,7 +22,7 @@ Monitor({
 | --- | --- |
 | `Monitor` | 起一个后台监视 |
 | `monitor_stop` | 按 id 停掉一个监视 |
-| `monitor_list` | 列出当前所有监视 |
+| `monitor_list` | 列出当前所有监视；运行时长在退出后冻结，并显示 exit code |
 
 ### `Monitor` 的参数
 

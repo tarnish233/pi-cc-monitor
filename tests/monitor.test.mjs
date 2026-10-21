@@ -263,6 +263,30 @@ test("monitor_list reports the monitors", async () => {
 	assert.equal(list.details.monitors[0].description, "listed");
 });
 
+test("monitor_list freezes the duration and includes the exit code", async () => {
+	const h = await start(makeHarness());
+	await h.tools
+		.get("Monitor")
+		.execute("c", { command: "echo one", description: "exited" }, undefined, undefined, h.ctx);
+	await waitFor(() => h.sent.some((entry) => entry.message?.details?.cause === "exit"));
+
+	const first = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
+	const text = first.content[0].text;
+	assert.match(text, /exited/);
+	assert.match(text, /exit 0/);
+	const age = /events\s+(\d+)s/.exec(text)?.[1];
+	assert.ok(age !== undefined, text);
+
+	await new Promise((resolve) => setTimeout(resolve, 1100));
+	const second = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
+	const frozenAge = /events\s+(\d+)s/.exec(second.content[0].text)?.[1];
+	assert.equal(frozenAge, age, "the duration stops growing after exit");
+
+	const snapshot = second.details.monitors[0];
+	assert.equal(typeof snapshot.endedAt, "number");
+	assert.equal(snapshot.exitCode, 0);
+});
+
 test("loopPrompt travels on the wake event", async () => {
 	const h = await start(makeHarness());
 	await h.tools

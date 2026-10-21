@@ -107,6 +107,8 @@ export interface MonitorRecord {
 	createdAt: number;
 	eventCount: number;
 	status: MonitorStatus;
+	/** Epoch ms when the monitor left the running state. */
+	endedAt?: number;
 	/** The exit code of a command monitor, once it ended. */
 	exitCode?: number | null;
 	loopPrompt?: string;
@@ -131,6 +133,7 @@ export interface MonitorSnapshot {
 	createdAt: number;
 	eventCount: number;
 	status: MonitorStatus;
+	endedAt?: number;
 	exitCode?: number | null;
 	loopPrompt?: string;
 	outputPath: string;
@@ -233,6 +236,7 @@ function snapshotMonitor(record: MonitorRecord): MonitorSnapshot {
 		createdAt: record.createdAt,
 		eventCount: record.eventCount,
 		status: record.status,
+		...(record.endedAt !== undefined ? { endedAt: record.endedAt } : {}),
 		...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
 		...(record.loopPrompt !== undefined ? { loopPrompt: record.loopPrompt } : {}),
 		outputPath: record.outputPath,
@@ -242,7 +246,11 @@ function snapshotMonitor(record: MonitorRecord): MonitorSnapshot {
 
 function monitorSummary(record: MonitorSnapshot): string {
 	const events = `${record.eventCount} event${record.eventCount === 1 ? "" : "s"}`;
-	return `${record.id} ${record.status} (${events})`;
+	const code =
+		record.status !== "running" && record.exitCode !== undefined && record.exitCode !== null
+			? `, code ${record.exitCode}`
+			: "";
+	return `${record.id} ${record.status}${code} (${events})`;
 }
 
 // ------------------------------------------------------------------ extension
@@ -327,6 +335,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	function finalize(record: MonitorRecord, status: MonitorStatus): void {
 		if (record.status !== "running") return;
 		record.status = status;
+		record.endedAt = Date.now();
 		if (record.timeoutTimer) {
 			clearTimeout(record.timeoutTimer);
 			record.timeoutTimer = undefined;
@@ -818,9 +827,13 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			}
 			const text = list
 				.map((record) => {
-					const age = Math.round((Date.now() - record.createdAt) / 1000);
+					const age = Math.round(((record.endedAt ?? Date.now()) - record.createdAt) / 1000);
+					const code =
+						record.status !== "running" && record.exitCode !== undefined && record.exitCode !== null
+							? `exit ${record.exitCode}  `
+							: "";
 					const target = record.kind === "ws" ? record.wsUrl : record.command;
-					return `${record.id}  ${record.status}  ${record.kind}  ${record.eventCount} events  ${age}s  ${record.description}  ${target ?? ""}`;
+					return `${record.id}  ${record.status}  ${record.kind}  ${record.eventCount} events  ${age}s  ${code}${record.description}  ${target ?? ""}`;
 				})
 				.join("\n");
 			return {
