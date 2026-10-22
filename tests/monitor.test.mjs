@@ -528,12 +528,23 @@ test("blank lines are not events", () => {
 	assert.deepEqual(got, ["a", "b"]);
 });
 
-test("the armed message shows a short timeout in seconds", async () => {
+test("the launch result is Claude Code's: expiry, keep working, an event is not a reply", async () => {
 	const h = await start(makeHarness());
 	const armed = await h.tools
 		.get("Monitor")
-		.execute("c", { command: "sleep 1", description: "short", timeout_ms: 20000 }, undefined, undefined, h.ctx);
-	assert.match(armed.content[0].text, /watching for 20s/, armed.content[0].text);
+		.execute("c", { command: "sleep 1", description: "short", timeout_ms: 1_800_000 }, undefined, undefined, h.ctx);
+	const text = armed.content[0].text;
+	assert.match(text, /^Monitor started \(task \w+, expires in 30 minutes unless the source ends first/);
+	assert.match(text, /You will be notified on each event\. Keep working \u2014 do not poll or sleep\./);
+	assert.match(text, /an event is not their reply/);
+});
+
+test("a persistent monitor says it runs until stopped", async () => {
+	const h = await start(makeHarness());
+	const armed = await h.tools
+		.get("Monitor")
+		.execute("c", { command: "sleep 1", description: "long", persistent: true }, undefined, undefined, h.ctx);
+	assert.match(armed.content[0].text, /runs until you stop it or the session ends/);
 });
 
 // -------------------------------------------------------------- rate limits

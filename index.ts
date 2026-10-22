@@ -741,16 +741,21 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				record = armWebSocket({ ...input, url: ws.url, protocols: ws.protocols });
 			}
 
+			// Claude Code's launch result: what was armed, when it expires, and the two
+			// things a model gets wrong about monitors - polling, and reading an event
+			// as the user's answer.
 			const lifetime = record.persistent
-				? "for the lifetime of the session"
-				: `for ${formatDuration(record.timeoutMs)}`;
+				? "runs until you stop it or the session ends"
+				: `expires in ${Math.round(record.timeoutMs / 60_000)} minutes unless the source ends first; ` +
+					"you get one notice at expiry \u2014 re-arm if you still need the watch";
 			return {
 				content: [
 					{
 						type: "text",
 						text:
-							`Monitor ${record.id} armed \u00b7 ${record.description} \u00b7 watching ${lifetime}. ` +
-							`Stop it with monitor_stop { "id": "${record.id}" }.`,
+							`Monitor started (task ${record.id}, ${lifetime}). You will be notified on each event. ` +
+							"Keep working \u2014 do not poll or sleep. " +
+							"Events may arrive while you are waiting for the user \u2014 an event is not their reply.",
 					},
 				],
 				details: {
@@ -779,7 +784,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			const record = monitors.get(params.id);
 			if (!record) {
 				return {
-					content: [{ type: "text" as const, text: `No monitor with id ${params.id}.` }],
+					content: [{ type: "text" as const, text: `No monitor found with ID: ${params.id}` }],
 					details: { stopped: false, id: params.id },
 				};
 			}
@@ -799,7 +804,10 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				notice: () => STOPPED_NOTICE,
 			});
 			return {
-				content: [{ type: "text" as const, text: `Stopped monitor ${params.id}.` }],
+				// Claude Code's TaskStop result, with the description in place of the command.
+				content: [
+					{ type: "text" as const, text: `Successfully stopped monitor: ${params.id} (${record.description})` },
+				],
 				details: { stopped: true, id: params.id },
 			};
 		},
