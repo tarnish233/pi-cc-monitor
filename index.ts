@@ -20,8 +20,9 @@
  * userinfo or whitespace, and ws protocols must be unique RFC 6455 tokens.
  *
  * The one addition is `loopPrompt`, which lets a monitor name the /loop chain
- * it belongs to: when pi-cc-loop ends that chain, the monitor is stopped with
- * it.
+ * it belongs to: when pi-cc-loop (and only it) ends that chain, the monitor is
+ * stopped with it. Without that extension the field is ignored, so this package
+ * stands alone.
  *
  * Runtime behaviour follows Claude Code too: lines within 200ms form one
  * notification, notifications are capped (500 characters a line, 3000 a
@@ -181,6 +182,19 @@ function cleanOldLogs(now = Date.now()): void {
 		}
 	} catch {
 		// cleanup is best effort
+	}
+}
+
+/**
+ * True when the pi-cc-loop extension is loaded. `loopPrompt` is only a promise
+ * while that extension is there to publish `loop:stopped`; on its own this
+ * package must not store a binding nothing will ever honour.
+ */
+function loopExtensionLoaded(pi: ExtensionAPI): boolean {
+	try {
+		return (pi.getAllTools?.() ?? []).some((tool) => tool.name === "cron_delete");
+	} catch {
+		return false;
 	}
 }
 
@@ -691,7 +705,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			loopPrompt: Type.Optional(
 				Type.String({
 					description:
-						"The /loop prompt this monitor belongs to, verbatim. When that loop ends, the monitor is stopped with it.",
+						"The /loop prompt this monitor belongs to, verbatim. Only used when the pi-cc-loop extension is loaded: " +
+						"when it ends that loop, this monitor is stopped with it. Ignored otherwise.",
 				}),
 			),
 		}),
@@ -718,7 +733,12 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					throw new Error(`timeout_ms must be \u2264 ${MAX_TIMEOUT_MS}`);
 				}
 			}
-			const input: ArmInput = { description: params.description, timeoutMs, persistent, loopPrompt: params.loopPrompt };
+			const input: ArmInput = {
+				description: params.description,
+				timeoutMs,
+				persistent,
+				loopPrompt: loopExtensionLoaded(pi) ? params.loopPrompt : undefined,
+			};
 
 			let record: MonitorRecord;
 			if (hasCommand) {
@@ -746,7 +766,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			// as the user's answer.
 			const lifetime = record.persistent
 				? "runs until you stop it or the session ends"
-				: `expires in ${Math.round(record.timeoutMs / 60_000)} minutes unless the source ends first; ` +
+				: `expires in ${Math.round(record.timeoutMs / 60_000)} minute${Math.round(record.timeoutMs / 60_000) === 1 ? "" : "s"} unless the source ends first; ` +
 					"you get one notice at expiry \u2014 re-arm if you still need the watch";
 			return {
 				content: [

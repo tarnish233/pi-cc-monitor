@@ -21,6 +21,8 @@ function makeHarness() {
 	const sent = [];
 	const events = [];
 	const notifications = [];
+	/** Tools other extensions registered: pi-cc-loop's cron_delete marks it as loaded. */
+	const registeredToolNames = [];
 	// Pi invalidates an extension's API right after session_shutdown (reload,
 	// new, resume, fork): every later call throws.
 	const runtime = { stale: false };
@@ -53,6 +55,9 @@ function makeHarness() {
 			assertActive();
 			sent.push({ kind: "custom", message, options });
 		},
+		getAllTools() {
+			return [...tools.keys(), ...registeredToolNames].map((name) => ({ name }));
+		},
 		events: {
 			emit(channel, data) {
 				assertActive();
@@ -79,7 +84,7 @@ function makeHarness() {
 		hasPendingMessages: () => false,
 	};
 
-	return { pi, ctx, commands, tools, renderers, toolRenderers, handlers, sent, events, notifications, runtime };
+	return { pi, ctx, commands, tools, renderers, toolRenderers, handlers, sent, events, notifications, runtime, registeredToolNames };
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -298,8 +303,10 @@ test("monitor_list freezes the duration and includes the exit code", async () =>
 	assert.equal(snapshot.exitCode, 0);
 });
 
-test("loopPrompt is kept on the monitor", async () => {
-	const h = await start(makeHarness());
+test("loopPrompt is kept when pi-cc-loop is loaded", async () => {
+	const h = makeHarness();
+	h.registeredToolNames.push("cron_create", "cron_delete", "schedule_wakeup");
+	await start(h);
 	await h.tools
 		.get("Monitor")
 		.execute(
@@ -314,6 +321,25 @@ test("loopPrompt is kept on the monitor", async () => {
 	assert.equal(h.events.length, 0, "no monitor:wake bus event any more");
 });
 
+test("loopPrompt is ignored when pi-cc-loop is not loaded", async () => {
+	const h = await start(makeHarness());
+	await h.tools
+		.get("Monitor")
+		.execute(
+			"c",
+			{ command: "sleep 1", description: "standalone", loopPrompt: "check the deploy" },
+			undefined,
+			undefined,
+			h.ctx,
+		);
+	const list = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
+	assert.equal(
+		list.details.monitors[0].loopPrompt,
+		undefined,
+		"nothing may promise to stop this monitor with a loop that is not installed",
+	);
+});
+
 test("a persistent monitor has no timeout", async () => {
 	const h = await start(makeHarness());
 	const armed = await h.tools
@@ -325,6 +351,7 @@ test("a persistent monitor has no timeout", async () => {
 
 test("a loop:stopped event stops the monitor that named the chain", async () => {
 	const h = await start(makeHarness());
+	h.registeredToolNames.push("cron_delete");
 	const armed = await h.tools
 		.get("Monitor")
 		.execute(
@@ -547,6 +574,14 @@ test("a persistent monitor says it runs until stopped", async () => {
 	assert.match(armed.content[0].text, /runs until you stop it or the session ends/);
 });
 
+test("a one minute timeout is not '1 minutes'", async () => {
+	const h = await start(makeHarness());
+	const armed = await h.tools
+		.get("Monitor")
+		.execute("c", { command: "sleep 1", description: "short", timeout_ms: 60_000 }, undefined, undefined, h.ctx);
+	assert.match(armed.content[0].text, /expires in 1 minute unless/);
+});
+
 // -------------------------------------------------------------- rate limits
 
 test("the rate limiter follows Claude Code: 10 at once, then one every 2s", () => {
@@ -671,6 +706,7 @@ test("the tool description carries Claude Code's usage guidance", async () => {
 
 test("a chained monitor's notifications name their loop", async () => {
 	const h = await start(makeHarness());
+	h.registeredToolNames.push("cron_delete");
 	await h.tools
 		.get("Monitor")
 		.execute("c", { command: "printf 'x\\n'", description: "chained", loopPrompt: "check the deploy" }, undefined, undefined, h.ctx);
