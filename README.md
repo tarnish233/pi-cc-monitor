@@ -89,9 +89,20 @@ pi install npm:pi-cc-monitor
 
 ## 渲染
 
-事件消息不做单独渲染：走 Pi 的默认自定义消息样式，标签就是 `[Monitor]`，内容是
-`monitor <id> · <描述>` 加事件行。`compactMessages` 只影响 pi-cc-loop 的定时任务块，
-对本扩展无效。
+事件和 pi-cc-loop 的定时任务块一个样式：
+
+```text
+✻ monitor · 10:22pm · errors in deploy.log
+   ERROR: connection refused on :3000
+
+✻ monitor ended · 10:22pm · errors in deploy.log
+   [Monitor ended — exit code 0, 3 events delivered]
+```
+
+表头按原因分：`monitor`（有事件）、`monitor ended`（命令退出）、`monitor expired`
+（超时）、`monitor failed`（启动/连接失败）、`monitor closed`（WS 关闭）、
+`monitor stopped`（手动停止或洪泛）。折叠时正文最多 3 行，Ctrl+O 展开后多一行元信息
+（id、事件数、退出码）。`compactMessages` 为 off 时回到旧的带底色卡片。
 
 > 本扩展不写其他插件的配置文件。
 

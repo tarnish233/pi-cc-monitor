@@ -35,14 +35,23 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ChildProcess } from "node:child_process";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { invalidateConfig, loadConfig } from "./config.ts";
 import { killTree, spawnMonitor } from "./process.ts";
 import { MONITOR_DESCRIPTION, MONITOR_LIST_SNIPPET, MONITOR_SNIPPET, MONITOR_STOP_SNIPPET } from "./prompts.ts";
 import { monitorEnv, monitorShell } from "./shell.ts";
 import { LineBatcher, RateLimiter } from "./stream.ts";
-import { formatDuration, truncate } from "./render.ts";
+import {
+	bodyLines,
+	contentText,
+	formatDuration,
+	formatStamp,
+	renderBlock,
+	renderCard,
+	stripProvenance,
+	truncate,
+} from "./render.ts";
 
 /**
  * The event bus channel pi-cc-loop publishes when a chain ends. Monitors that
@@ -51,11 +60,25 @@ import { formatDuration, truncate } from "./render.ts";
  */
 export const LOOP_STOPPED_CHANNEL = "loop:stopped";
 /**
- * The custom message type for events. Pi prints it as the message label
- * (`[Monitor]`), which is all the decoration an event needs: the default
- * rendering is used, no renderer of ours.
+ * The custom message type for events. It is also the label Pi falls back to;
+ * our renderer draws the header instead, in the shape of a scheduled fire.
  */
 export const EVENT_MESSAGE_TYPE = "Monitor";
+
+/**
+ * The header a cause gets, in the shape of the loop's scheduled-task block:
+ * `\u273b monitor stopped \u00b7 10:22pm`. Claude Code has no equivalent line (its
+ * notifications are task messages), so the wording says what happened.
+ */
+const CAUSE_LABEL: Record<MonitorCause, string> = {
+	output: "\u273b monitor",
+	exit: "\u273b monitor ended",
+	timeout: "\u273b monitor expired",
+	error: "\u273b monitor failed",
+	closed: "\u273b monitor closed",
+	stopped: "\u273b monitor stopped",
+	flooded: "\u273b monitor stopped",
+};
 const CONFIG_CHANNEL = "pi-cc:config";
 
 /** Claude Code's defaults: 5 minutes, capped at 1 hour. */
@@ -565,6 +588,49 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	}
 
 	// ---------------------------------------------------------------- tools
+
+	/**
+	 * Draw an event the way a scheduled fire is drawn: `\u273b monitor stopped \u00b7
+	 * 10:22pm` over its lines. The "monitor <id> \u00b7 <description>" line the model
+	 * receives is not repeated; the description moves into the header.
+	 */
+	pi.registerMessageRenderer(EVENT_MESSAGE_TYPE, (message, options, theme: Theme) => {
+		const details = (message.details ?? {}) as {
+			description?: string;
+			cause?: MonitorCause;
+			eventCount?: number;
+			monitorId?: string;
+			exitCode?: number | null;
+		};
+		const cause = details.cause ?? "output";
+		const body = stripProvenance(contentText(message.content), /^monitor \S+ \u00b7[^\n]*\n?/);
+		const label = CAUSE_LABEL[cause] ?? CAUSE_LABEL.output;
+
+		if (!loadConfig().compactMessages) {
+			const header = `${label.replace("\u273b ", "")}${details.description ? ` \u00b7 ${details.description}` : ""}`;
+			return renderCard({ header, body, expanded: options.expanded, outputPad: options.outputPad, theme });
+		}
+
+		const stamp = formatStamp(message.timestamp);
+		const parts = [theme.fg(cause === "output" ? "accent" : "warning", theme.bold(label))];
+		if (stamp) parts.push(theme.fg("muted", stamp));
+		if (details.description) parts.push(theme.fg("dim", details.description));
+
+		const meta: string[] = [];
+		if (details.monitorId) meta.push(`id ${details.monitorId}`);
+		if (details.eventCount !== undefined) meta.push(eventsText(details.eventCount));
+		if (details.exitCode !== undefined && details.exitCode !== null) meta.push(`exit code ${details.exitCode}`);
+
+		return renderBlock({
+			header: parts.join(theme.fg("dim", " \u00b7 ")),
+			body: bodyLines(body),
+			meta,
+			expanded: options.expanded,
+			outputPad: options.outputPad,
+			theme,
+			maxBodyLines: 3,
+		});
+	});
 
 	pi.registerTool({
 		name: "Monitor",
