@@ -35,20 +35,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ChildProcess } from "node:child_process";
-import type { ExtensionAPI, ExtensionContext, ThemeColor } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { invalidateConfig, loadConfig } from "./config.ts";
 import { killTree, spawnMonitor } from "./process.ts";
 import { MONITOR_DESCRIPTION, MONITOR_LIST_SNIPPET, MONITOR_SNIPPET, MONITOR_STOP_SNIPPET } from "./prompts.ts";
-import {
-	bodyLines,
-	contentText,
-	firstLine,
-	formatStamp,
-	renderBlock,
-	renderCard,
-	stripProvenance,
-} from "./render.ts";
 import { monitorEnv, monitorShell } from "./shell.ts";
 import { LineBatcher, RateLimiter } from "./stream.ts";
 import { formatDuration, truncate } from "./render.ts";
@@ -59,8 +50,12 @@ import { formatDuration, truncate } from "./render.ts";
  * ScheduleWakeup with stop: true and TaskStop any Monitor you armed".
  */
 export const LOOP_STOPPED_CHANNEL = "loop:stopped";
-/** The custom message type used for notifications. */
-export const EVENT_MESSAGE_TYPE = "pi-cc-monitor-event";
+/**
+ * The custom message type for events. Pi prints it as the message label
+ * (`[Monitor]`), which is all the decoration an event needs: the default
+ * rendering is used, no renderer of ours.
+ */
+export const EVENT_MESSAGE_TYPE = "Monitor";
 const CONFIG_CHANNEL = "pi-cc:config";
 
 /** Claude Code's defaults: 5 minutes, capped at 1 hour. */
@@ -262,40 +257,6 @@ function snapshotMonitor(record: MonitorRecord): MonitorSnapshot {
 	};
 }
 
-/** A short, human-readable label for a non-output cause. */
-function causeLabel(cause: MonitorCause, exitCode: number | null | undefined): string {
-	switch (cause) {
-		case "exit":
-			return exitCode === null || exitCode === undefined ? "exited" : `exited (code ${exitCode})`;
-		case "timeout":
-			return "timed out";
-		case "error":
-			return "failed";
-		case "closed":
-			return "closed";
-		case "stopped":
-			return "stopped";
-		case "flooded":
-			return "stopped (too much output)";
-		default:
-			return "";
-	}
-}
-
-function causeColor(cause: MonitorCause, exitCode: number | null | undefined): ThemeColor {
-	switch (cause) {
-		case "exit":
-			return exitCode === 0 ? "success" : "error";
-		case "timeout":
-		case "flooded":
-			return "warning";
-		case "error":
-			return "error";
-		default:
-			return "muted";
-	}
-}
-
 // ------------------------------------------------------------------ extension
 
 export default function piCcMonitorExtension(pi: ExtensionAPI): void {
@@ -332,7 +293,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			pi.sendMessage(
 				{
 					customType: EVENT_MESSAGE_TYPE,
-					content: `[monitor \u00b7 ${record.description}]\n${lines.join("\n")}`,
+					content: `monitor ${record.id} \u00b7 ${record.description}\n${lines.join("\n")}`,
 					display: true,
 					details: {
 						monitorId: record.id,
@@ -604,57 +565,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	}
 
 	// ---------------------------------------------------------------- tools
-
-	/**
-	 * Draw the event as a quiet block instead of Pi's default
-	 * `[pi-cc-monitor-event]` title.
-	 */
-	pi.registerMessageRenderer(EVENT_MESSAGE_TYPE, (message, options, theme) => {
-		const details = (message.details ?? {}) as {
-			description?: string;
-			cause?: MonitorCause;
-			eventCount?: number;
-			monitorId?: string;
-			exitCode?: number | null;
-		};
-		const cause = details.cause ?? "output";
-		const text = contentText(message.content);
-		const body = stripProvenance(text, /^\[monitor[^\]]*\]\n?/);
-		if (!loadConfig().compactMessages) {
-			const summary = firstLine(body);
-			const header = `monitor \u00b7 ${details.description ?? "watch"}`;
-			const suffix = cause === "output" ? "" : ` (${cause})`;
-			return renderCard({
-				header: `${header}${suffix}${summary && cause === "output" ? ` \u00b7 ${summary}` : ""}`,
-				body,
-				expanded: options.expanded,
-				outputPad: options.outputPad,
-				theme,
-			});
-		}
-
-		const stamp = formatStamp(message.timestamp);
-		const parts = [theme.fg("accent", theme.bold("monitor"))];
-		if (stamp) parts.push(theme.fg("muted", stamp));
-		if (details.description) parts.push(theme.fg("customMessageText", details.description));
-		const causeText = causeLabel(cause, details.exitCode);
-		if (causeText) parts.push(theme.fg(causeColor(cause, details.exitCode), causeText));
-		const header = parts.join(theme.fg("dim", " \u00b7 "));
-
-		const meta: string[] = [];
-		if (details.monitorId) meta.push(`id ${details.monitorId}`);
-		if (details.eventCount !== undefined) meta.push(eventsText(details.eventCount));
-
-		return renderBlock({
-			header,
-			body: bodyLines(body),
-			meta,
-			expanded: options.expanded,
-			outputPad: options.outputPad,
-			theme,
-			maxBodyLines: 3,
-		});
-	});
 
 	pi.registerTool({
 		name: "Monitor",

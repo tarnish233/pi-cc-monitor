@@ -235,7 +235,7 @@ test("each stdout line becomes one notification", async () => {
 	// Lines written within the batch window are merged into one notification.
 	await waitFor(() => h.sent.length >= 1 && h.sent[0].message.content.includes("three"));
 	const content = h.sent[0].message.content;
-	assert.ok(content.includes("[monitor · test monitor]"));
+	assert.match(content, /^monitor \w+ · test monitor$/m);
 	assert.ok(content.includes("one"));
 	assert.ok(content.includes("two"));
 	assert.ok(content.includes("three"));
@@ -251,7 +251,7 @@ test("the exit ends the watch and is reported", async () => {
 
 	await waitFor(() => h.sent.length >= 2, 8000);
 	const last = h.sent[h.sent.length - 1].message.content;
-	assert.ok(last.includes("[monitor · exiting]"));
+	assert.match(last, /^monitor \w+ · exiting$/m);
 	assert.ok(/ended|exit/i.test(last), `expected an exit report, got: ${last}`);
 });
 

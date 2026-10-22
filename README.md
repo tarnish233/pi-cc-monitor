@@ -87,24 +87,13 @@ pi install npm:pi-cc-monitor
 - `tail -f` / `while true` 不会自己退出；不需要时用 `monitor_stop` 或 `timeout_ms`
 - 每行都是一条消息；测试时别一次打印几十行
 
-## 设置
+## 渲染
 
-两个 pi-cc 扩展共享 `~/.pi/agent/pi-cc.json`：
+事件消息不做单独渲染：走 Pi 的默认自定义消息样式，标签就是 `[Monitor]`，内容是
+`monitor <id> · <描述>` 加事件行。`compactMessages` 只影响 pi-cc-loop 的定时任务块，
+对本扩展无效。
 
-```jsonc
-{
-  "compactMessages": true,          // 两行 marker / 旧的带底色卡片
-}
-```
-
-用 `/loop settings` 切换（pi-cc-loop 提供该命令）：
-
-```text
-/loop settings messages on|off
-```
-
-> 本扩展不写其他插件的配置文件。工具行交给 Pi 或 pi-cc-extensions 渲染：
-> 旧版本加过的 `Monitor` / `monitor_stop` / `monitor_list` 三条 `excludeRenderers` 可以删掉。
+> 本扩展不写其他插件的配置文件。
 
 ## 兼容性
 
