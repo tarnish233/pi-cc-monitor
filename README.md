@@ -94,21 +94,17 @@ pi install npm:pi-cc-monitor
 ```jsonc
 {
   "compactMessages": true,          // 两行 marker / 旧的带底色卡片
-  "compactToolRows": true,          // 一行工具结果 / Pi 默认工具行
-  "managePiCcExtensions": true      // 自动维护 pi-cc-extensions 的 excludeRenderers
 }
 ```
 
-用 `/loop settings` 切换：
+用 `/loop settings` 切换（pi-cc-loop 提供该命令）：
 
 ```text
 /loop settings messages on|off
-/loop settings tools on|off
 ```
 
-> 如果装了 `pi-cc-extensions`，`tools on` 会把 `Monitor` / `monitor_stop` / `monitor_list`
-> 加入它的 `excludeRenderers`；切换后需要 `/reload`。
-> 设 `managePiCcExtensions: false` 关闭自动同步。
+> 本扩展不写其他插件的配置文件。工具行交给 Pi 或 pi-cc-extensions 渲染：
+> 旧版本加过的 `Monitor` / `monitor_stop` / `monitor_list` 三条 `excludeRenderers` 可以删掉。
 
 ## 兼容性
 

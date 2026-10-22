@@ -126,15 +126,15 @@ function renderEvent(h, expanded = false) {
 	return { text: lines.join("\n"), lines, bgCalls };
 }
 
-test("the defaults are compact messages and compact tool rows", () => {
-	writeConfig({ compactMessages: true, compactToolRows: true });
+test("the defaults are compact messages and no tool-row renderers", () => {
+	writeConfig({ compactMessages: true });
 	const h = makeHarness();
 	notifyConfig(h);
 
 	const event = renderEvent(h);
 	assert.equal(event.lines.length, 3, event.text);
 	assert.equal(event.bgCalls.count, 0);
-	assert.ok(resolveTool(h, "Monitor")?.renderCall, "compact Monitor renderer is armed");
+	assert.equal(resolveTool(h, "Monitor"), undefined, "tool rows are left to Pi and other extensions");
 });
 
 test("compactMessages off restores the legacy card", () => {
@@ -154,81 +154,3 @@ test("compactMessages off restores the legacy card", () => {
 	assert.equal(compact.bgCalls.count, 0);
 });
 
-test("compactToolRows off falls back to the default renderer and on restores it", () => {
-	writeConfig({ compactToolRows: false });
-	const h = makeHarness();
-	notifyConfig(h);
-	assert.equal(resolveTool(h, "Monitor"), undefined);
-
-	writeConfig({ compactToolRows: true });
-	notifyConfig(h);
-	assert.ok(resolveTool(h, "Monitor")?.renderResult);
-});
-
-test("the compact Monitor row is one line and collapses the call row after completion", () => {
-	writeConfig({ compactToolRows: true });
-	const h = makeHarness();
-	notifyConfig(h);
-	const renderers = resolveTool(h, "Monitor");
-	assert.ok(renderers, "compact renderers are armed");
-
-	const { theme } = makeTheme();
-	const call = renderers.renderCall(
-		{ command: "tail -f deploy.log", description: "errors in deploy.log" },
-		theme,
-		{ isPartial: false, executionStarted: true },
-	);
-	assert.deepEqual(call.render(100), [], "the finished call row disappears");
-
-	const result = {
-		content: [{ type: "text", text: "Monitor bd9j9ugm armed" }],
-		details: {
-			taskId: "bd9j9ugm",
-			timeoutMs: 3_600_000,
-			persistent: false,
-			kind: "command",
-			outputPath: "/tmp/bd9j9ugm.out",
-		},
-	};
-	const rendered = renderers
-		.renderResult(result, { expanded: false, isPartial: false }, theme, {
-			isError: false,
-			args: { command: "tail -f deploy.log", description: "errors in deploy.log" },
-		})
-		.render(100)
-		.join("\n");
-	assert.match(rendered, /^✓ Armed bd9j9ugm · 1h timeout · errors in deploy\.log/);
-	assert.equal(rendered.split("\n").length, 1);
-
-	// A short timeout is shown in seconds, not rounded down to "0m".
-	const short = renderers
-		.renderResult(
-			{ ...result, details: { ...result.details, timeoutMs: 5000 } },
-			{ expanded: false, isPartial: false },
-			theme,
-			{ isError: false, args: { command: "sleep 300", description: "timeout test" } },
-		)
-		.render(100)
-		.join("\n");
-	assert.match(short, /^✓ Armed bd9j9ugm · 5s timeout · timeout test/);
-});
-
-test("session_start syncs the monitor tools into pi-cc-extensions excludeRenderers", async () => {
-	writeConfig({ compactToolRows: true });
-	const h = makeHarness();
-	notifyConfig(h);
-	await h.handlers.get("session_start")?.({}, h.ctx);
-
-	let ccstyle = JSON.parse(fs.readFileSync(ccstyleConfig, "utf8"));
-	assert.ok(ccstyle.excludeRenderers.includes("Monitor"));
-	assert.ok(ccstyle.excludeRenderers.includes("monitor_stop"));
-	assert.ok(ccstyle.excludeRenderers.includes("monitor_list"));
-
-	writeConfig({ compactToolRows: false });
-	notifyConfig(h);
-	await h.handlers.get("session_start")?.({}, h.ctx);
-	ccstyle = JSON.parse(fs.readFileSync(ccstyleConfig, "utf8"));
-	assert.ok(!ccstyle.excludeRenderers.includes("Monitor"));
-	assert.ok(!ccstyle.excludeRenderers.includes("monitor_stop"));
-	assert.ok(!ccstyle.excludeRenderers.includes("monitor_list"));
-});

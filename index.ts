@@ -34,9 +34,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ChildProcess } from "node:child_process";
-import type { ExtensionAPI, ExtensionContext, ThemeColor, ToolRenderers } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { invalidateConfig, loadConfig, syncPiCcExtensionsExcludes } from "./config.ts";
+import { invalidateConfig, loadConfig } from "./config.ts";
 import { killTree, spawnMonitor } from "./process.ts";
 import { MONITOR_DESCRIPTION, MONITOR_LIST_SNIPPET, MONITOR_SNIPPET, MONITOR_STOP_SNIPPET } from "./prompts.ts";
 import {
@@ -50,7 +50,7 @@ import {
 } from "./render.ts";
 import { monitorEnv, monitorShell } from "./shell.ts";
 import { LineBatcher, RateLimiter } from "./stream.ts";
-import { compactRenderers, formatDuration, truncate } from "./tool-rows.ts";
+import { formatDuration, truncate } from "./render.ts";
 
 /**
  * The event bus channel pi-cc-loop publishes when a chain ends. Monitors that
@@ -61,7 +61,6 @@ export const LOOP_STOPPED_CHANNEL = "loop:stopped";
 /** The custom message type used for notifications. */
 export const EVENT_MESSAGE_TYPE = "pi-cc-monitor-event";
 const CONFIG_CHANNEL = "pi-cc:config";
-const MONITOR_TOOL_NAMES = ["Monitor", "monitor_stop", "monitor_list"];
 
 /** Claude Code's defaults: 5 minutes, capped at 1 hour. */
 export const DEFAULT_TIMEOUT_MS = 300_000;
@@ -247,14 +246,6 @@ function snapshotMonitor(record: MonitorRecord): MonitorSnapshot {
 		outputPath: record.outputPath,
 		stderrPath: record.stderrPath,
 	};
-}
-
-function monitorSummary(record: MonitorSnapshot): string {
-	const code =
-		record.status !== "running" && record.exitCode !== undefined && record.exitCode !== null
-			? `, code ${record.exitCode}`
-			: "";
-	return `${record.id} ${record.status}${code} (${eventsText(record.eventCount)})`;
 }
 
 /** A short, human-readable label for a non-output cause. */
@@ -849,94 +840,16 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// -------------------------------------------------------------- rendering
-
-	/**
-	 * Compact one-line tool rows. The resolver is consulted every time a row
-	 * renders, so turning `compactToolRows` off falls back to Pi's default
-	 * rendering without reloading.
-	 */
-	const renderers: Record<string, ToolRenderers> = {
-		Monitor: compactRenderers({
-			call: (args) => ({
-				label: "Watch",
-				detail: [
-					truncate(args.description ?? "", 40),
-					args.ws?.url ? `ws ${truncate(args.ws.url, 40)}` : truncate(args.command ?? "", 40),
-				]
-					.filter(Boolean)
-					.join(" \u00b7 "),
-			}),
-			summary: (d, args) => {
-				const lifetime = d.persistent ? "session lifetime" : `${formatDuration(d.timeoutMs ?? 0)} timeout`;
-				const description = args.description ? ` \u00b7 ${truncate(args.description, 40)}` : "";
-				return `Armed ${d.taskId ?? "?"} \u00b7 ${lifetime}${description}`;
-			},
-			detail: (d, args) =>
-				[
-					args.command ? `command: ${args.command}` : undefined,
-					args.ws?.url ? `ws: ${args.ws.url}` : undefined,
-					d.outputPath ? `output: ${d.outputPath}` : undefined,
-					d.stderrPath ? `stderr: ${d.stderrPath}` : undefined,
-				]
-					.filter(Boolean)
-					.join("\n") || undefined,
-		}),
-		monitor_stop: compactRenderers({
-			call: (args) => ({ label: "Stop", detail: args.id ?? "" }),
-			summary: (d) =>
-				d.stopped
-					? `Stopped ${d.id ?? "?"}`
-					: d.status
-						? `${d.id ?? "?"} already ${d.status}`
-						: `No monitor ${d.id ?? "?"}`,
-		}),
-		monitor_list: compactRenderers({
-			call: () => ({ label: "List monitors" }),
-			summary: (d) => {
-				const list: MonitorSnapshot[] = d.monitors ?? [];
-				if (!list.length) return "No monitors";
-				if (list.length === 1) return `1 monitor \u00b7 ${monitorSummary(list[0])}`;
-				const shown = list.slice(0, 2).map(monitorSummary).join(" \u00b7 ");
-				return `${list.length} monitors \u00b7 ${shown}${list.length > 2 ? " \u2026" : ""}`;
-			},
-			detail: (d) =>
-				((d.monitors ?? []) as MonitorSnapshot[])
-					.map((record) => `${monitorSummary(record)} \u00b7 ${record.description}`)
-					.join("\n") || undefined,
-		}),
-	};
-
-	if (typeof pi.registerToolRenderer === "function") {
-		pi.registerToolRenderer((toolName, next) => {
-			if (!loadConfig().compactToolRows) return next();
-			return renderers[toolName] ?? next();
-		});
-	}
-
-	/** pi-cc-loop owns the shared exclusion list when it is installed. */
-	function loopToolAvailable(): boolean {
-		try {
-			return pi.getAllTools().some((tool) => tool.name === "cron_create");
-		} catch {
-			return false;
-		}
-	}
-
 	// The loop extension writes the shared config file and announces the change.
 	pi.events.on(CONFIG_CHANNEL, () => {
 		invalidateConfig();
-		if (!loopToolAvailable()) {
-			syncPiCcExtensionsExcludes(MONITOR_TOOL_NAMES, loadConfig().compactToolRows);
-		}
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		lastCtx = ctx;
+		// Another process may have edited the shared settings file.
+		invalidateConfig();
 		cleanOldLogs();
-		if (!loopToolAvailable() && syncPiCcExtensionsExcludes(MONITOR_TOOL_NAMES, loadConfig().compactToolRows)) {
-			notify(ctx, "pi-cc-extensions excludeRenderers updated \u00b7 /reload to apply", "info");
-		}
 	});
 
 	// --------------------------------------------------------------- lifecycle
