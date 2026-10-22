@@ -197,8 +197,20 @@ test("the compact Monitor row is one line and collapses the call row after compl
 		})
 		.render(100)
 		.join("\n");
-	assert.match(rendered, /^✓ Armed bd9j9ugm · 60m timeout · errors in deploy\.log/);
+	assert.match(rendered, /^✓ Armed bd9j9ugm · 1h timeout · errors in deploy\.log/);
 	assert.equal(rendered.split("\n").length, 1);
+
+	// A short timeout is shown in seconds, not rounded down to "0m".
+	const short = renderers
+		.renderResult(
+			{ ...result, details: { ...result.details, timeoutMs: 5000 } },
+			{ expanded: false, isPartial: false },
+			theme,
+			{ isError: false, args: { command: "sleep 300", description: "timeout test" } },
+		)
+		.render(100)
+		.join("\n");
+	assert.match(short, /^✓ Armed bd9j9ugm · 5s timeout · timeout test/);
 });
 
 test("session_start syncs the monitor tools into pi-cc-extensions excludeRenderers", async () => {

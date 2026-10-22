@@ -929,7 +929,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					};
 					const lifetime = d.persistent
 						? "session lifetime"
-						: `${Math.round((d.timeoutMs ?? 0) / 60_000)}m timeout`;
+						: `${formatDuration(d.timeoutMs ?? 0)} timeout`;
 					const description = context.args.description
 						? ` · ${truncate(context.args.description, 40)}`
 						: "";
