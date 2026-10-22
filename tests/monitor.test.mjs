@@ -6,6 +6,7 @@ import test from "node:test";
 import { loadModule } from "./helpers.mjs";
 
 const mod = await loadModule("index.ts");
+const stream = await loadModule("stream.ts");
 const factory = mod.default;
 
 function makeHarness() {
@@ -20,6 +21,12 @@ function makeHarness() {
 	const sent = [];
 	const events = [];
 	const notifications = [];
+	// Pi invalidates an extension's API right after session_shutdown (reload,
+	// new, resume, fork): every later call throws.
+	const runtime = { stale: false };
+	const assertActive = () => {
+		if (runtime.stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+	};
 
 	const pi = {
 		registerCommand(name, options) {
@@ -43,10 +50,12 @@ function makeHarness() {
 			sent.push({ kind: "user", content, options });
 		},
 		sendMessage(message, options) {
+			assertActive();
 			sent.push({ kind: "custom", message, options });
 		},
 		events: {
 			emit(channel, data) {
+				assertActive();
 				events.push({ channel, data });
 			},
 			on(channel, handler) {
@@ -70,7 +79,14 @@ function makeHarness() {
 		hasPendingMessages: () => false,
 	};
 
-	return { pi, ctx, commands, tools, renderers, toolRenderers, handlers, sent, events, notifications };
+	return { pi, ctx, commands, tools, renderers, toolRenderers, handlers, sent, events, notifications, runtime };
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** One line per notification, for assertion messages. */
+function summarize(sent) {
+	return sent.map((entry) => `${entry.message.details.cause}: ${entry.message.content.split("\n").slice(1).join(" | ")}`).join("\n");
 }
 
 async function start(h) {
@@ -220,12 +236,7 @@ test("each stdout line becomes one notification", async () => {
 	assert.ok(content.includes("three"));
 	assert.equal(h.sent[0].options.deliverAs, "followUp", "notifications use the low priority lane");
 	assert.equal(h.sent[0].options.triggerTurn, true, "a notification wakes the agent");
-
-	// The bus event carries the same payload.
-	const wake = h.events.find((e) => e.channel === "monitor:wake");
-	assert.ok(wake, "monitor:wake was emitted");
-	assert.equal(wake.data.description, "test monitor");
-	assert.equal(wake.data.kind, "command");
+	assert.equal(h.sent[0].message.details.eventCount, 3);
 });
 
 test("the exit ends the watch and is reported", async () => {
@@ -287,20 +298,20 @@ test("monitor_list freezes the duration and includes the exit code", async () =>
 	assert.equal(snapshot.exitCode, 0);
 });
 
-test("loopPrompt travels on the wake event", async () => {
+test("loopPrompt is kept on the monitor", async () => {
 	const h = await start(makeHarness());
 	await h.tools
 		.get("Monitor")
 		.execute(
 			"c",
-			{ command: "printf 'x\\n'", description: "chained", loopPrompt: "check the deploy" },
+			{ command: "sleep 1", description: "chained", loopPrompt: "check the deploy" },
 			undefined,
 			undefined,
 			h.ctx,
 		);
-	await waitFor(() => h.events.length >= 1);
-	const wake = h.events.find((e) => e.channel === "monitor:wake");
-	assert.equal(wake.data.loopPrompt, "check the deploy");
+	const list = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
+	assert.equal(list.details.monitors[0].loopPrompt, "check the deploy");
+	assert.equal(h.events.length, 0, "no monitor:wake bus event any more");
 });
 
 test("a persistent monitor has no timeout", async () => {
@@ -377,4 +388,150 @@ test("monitor_list details are JSON and structured-clone safe", async () => {
 	assert.equal(record.flood, undefined);
 
 	await h.tools.get("monitor_stop").execute("c", { id }, undefined, undefined, h.ctx);
+});
+
+// ---------------------------------------------------------------- lifecycle
+
+test("a monitor still running at /reload never touches the stale session", async () => {
+	const h = await start(makeHarness());
+	await h.tools
+		.get("Monitor")
+		.execute("c", { command: "tail -f /dev/null", description: "log tail", persistent: true }, undefined, undefined, h.ctx);
+	await sleep(200);
+
+	const errors = [];
+	const capture = (error) => errors.push(error);
+	process.on("uncaughtException", capture);
+	try {
+		await h.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, h.ctx);
+		// Pi invalidates the old runtime as soon as session_shutdown returns.
+		h.runtime.stale = true;
+		await sleep(1000);
+	} finally {
+		process.off("uncaughtException", capture);
+	}
+	assert.deepEqual(
+		errors.map((error) => error.message),
+		[],
+		"an exception escaping a child-process callback makes Pi exit",
+	);
+	assert.equal(h.sent.length, 0, `nothing is sent to the old session:\n${summarize(h.sent)}`);
+});
+
+test("monitor_stop sends exactly one notice", async () => {
+	const h = await start(makeHarness());
+	const armed = await h.tools
+		.get("Monitor")
+		.execute("c", { command: "sleep 30", description: "stop me" }, undefined, undefined, h.ctx);
+	await h.tools.get("monitor_stop").execute("c", { id: armed.details.taskId }, undefined, undefined, h.ctx);
+	await sleep(600);
+
+	assert.equal(h.sent.length, 1, `one notice, not one per teardown step:\n${summarize(h.sent)}`);
+	assert.equal(h.sent[0].message.details.cause, "stopped");
+	assert.ok(h.sent[0].message.content.includes("[Monitor stopped]"), h.sent[0].message.content);
+});
+
+test("a timeout sends exactly one notice that suggests re-arming", async () => {
+	const h = await start(makeHarness());
+	await h.tools
+		.get("Monitor")
+		.execute("c", { command: "sleep 30", description: "short watch", timeout_ms: 1000 }, undefined, undefined, h.ctx);
+	await sleep(1800);
+
+	assert.equal(h.sent.length, 1, summarize(h.sent));
+	assert.equal(h.sent[0].message.details.cause, "timeout");
+	assert.match(h.sent[0].message.content, /expired after 1s with no events delivered\. Re-arm it/);
+});
+
+test("a monitor stopped together with its loop never wakes the agent", async () => {
+	const h = await start(makeHarness());
+	await h.tools
+		.get("Monitor")
+		.execute(
+			"c",
+			{ command: "sleep 30", description: "chained", loopPrompt: "check the deploy" },
+			undefined,
+			undefined,
+			h.ctx,
+		);
+	await h.handlers.get("bus:loop:stopped")({ prompt: "check the deploy", reason: "stopped by the user" }, h.ctx);
+	await sleep(600);
+
+	assert.equal(h.sent.length, 0, `the user just stopped the loop:\n${summarize(h.sent)}`);
+});
+
+test("output printed after a stop is dropped", async () => {
+	const h = await start(makeHarness());
+	const armed = await h.tools
+		.get("Monitor")
+		.execute(
+			"c",
+			{ command: "trap 'echo bye-after-stop; exit 0' TERM; while true; do sleep 0.1; done", description: "trap" },
+			undefined,
+			undefined,
+			h.ctx,
+		);
+	await sleep(300);
+	await h.tools.get("monitor_stop").execute("c", { id: armed.details.taskId }, undefined, undefined, h.ctx);
+	await sleep(800);
+
+	assert.ok(!h.sent.some((entry) => entry.message.content.includes("bye-after-stop")), summarize(h.sent));
+	assert.equal(h.sent.length, 1, summarize(h.sent));
+});
+
+// ------------------------------------------------------------------- output
+
+test("long lines and large batches are capped like Claude Code", async () => {
+	const h = await start(makeHarness());
+	await h.tools
+		.get("Monitor")
+		.execute(
+			"c",
+			{ command: "head -c 5000 /dev/zero | tr '\\0' x; echo; seq 1 1500", description: "huge" },
+			undefined,
+			undefined,
+			h.ctx,
+		);
+	await waitFor(() => h.sent.some((entry) => entry.message.details.cause === "exit"), 8000);
+
+	const outputs = h.sent.filter((entry) => entry.message.details.cause === "output");
+	assert.ok(outputs.length >= 1, summarize(h.sent));
+	for (const entry of outputs) {
+		const body = entry.message.content.split("\n").slice(1).join("\n");
+		assert.ok(body.length <= 3000 + "\n...(truncated)".length, `notification body is ${body.length} chars`);
+		for (const line of body.split("\n")) {
+			assert.ok(line.length <= 500 + "...(truncated)".length, `line is ${line.length} chars`);
+		}
+	}
+	assert.ok(
+		outputs.some((entry) => entry.message.content.includes("...(truncated)")),
+		"the long line is marked as truncated",
+	);
+	assert.equal(outputs.at(-1).message.details.eventCount, 1501, "every line still counts as an event");
+});
+
+test("a UTF-8 character split across chunks stays intact", () => {
+	const got = [];
+	const batcher = new stream.LineBatcher({ windowMs: 5, onBatch: (lines) => got.push(...lines) });
+	const bytes = Buffer.from("构建失败\n", "utf8");
+	batcher.push(bytes.subarray(0, 4));
+	batcher.push(bytes.subarray(4));
+	batcher.flush();
+	assert.deepEqual(got, ["构建失败"]);
+});
+
+test("blank lines are not events", () => {
+	const got = [];
+	const batcher = new stream.LineBatcher({ windowMs: 5, onBatch: (lines) => got.push(...lines) });
+	batcher.push("a\n\n   \nb\r\n");
+	batcher.flush();
+	assert.deepEqual(got, ["a", "b"]);
+});
+
+test("the armed message shows a short timeout in seconds", async () => {
+	const h = await start(makeHarness());
+	const armed = await h.tools
+		.get("Monitor")
+		.execute("c", { command: "sleep 1", description: "short", timeout_ms: 20000 }, undefined, undefined, h.ctx);
+	assert.match(armed.content[0].text, /watching for 20s/, armed.content[0].text);
 });

@@ -107,13 +107,13 @@ test("a non-output cause is shown in the header", () => {
 	const h = makeHarness();
 	const renderer = h.renderers.get("pi-cc-monitor-event");
 	const message = eventMessage(
-		"[monitor · errors in deploy.log]\nthe watch ended (exit code 0, 3 events)",
+		"[monitor · errors in deploy.log]\n[Monitor ended — exit code 0, 3 events delivered]",
 		{ cause: "exit", exitCode: 0, eventCount: 3 },
 	);
 
 	const { text } = render(renderer, message, false);
 	assert.ok(text.includes("exited (code 0)"), text);
-	assert.ok(text.includes("the watch ended"), text);
+	assert.ok(text.includes("Monitor ended"), text);
 });
 
 test("long batches are capped when collapsed and complete when expanded", () => {

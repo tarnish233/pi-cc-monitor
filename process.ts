@@ -72,10 +72,10 @@ export function spawnMonitor(options: SpawnOptions): ChildProcess {
  * Kill an entire process tree.
  *
  * Because children are spawned detached, their pid is the process group id on
- * POSIX, so a negative pid signals the whole group. This runs on every stop,
- * including a clean exit, so a command that backgrounds a child and exits
- * does not leave that child orphaned. Escalates to SIGKILL if the group is
- * still alive shortly after SIGTERM.
+ * POSIX, so a negative pid signals the whole group, including children the
+ * script put in the background. Used when a monitor is stopped, times out,
+ * floods or the session shuts down. Escalates to SIGKILL if the group is still
+ * alive shortly after SIGTERM.
  */
 export function killTree(child: ChildProcess | undefined, signal: NodeJS.Signals = "SIGTERM"): void {
 	if (!child || child.pid === undefined) return;

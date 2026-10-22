@@ -23,6 +23,7 @@ pi install npm:pi-cc-monitor
 | 事件唤醒 | 事件到达即开一轮 agent turn | 自动 |
 | 超时/常驻 | `timeout_ms` 默认 5 分钟；`persistent` 到会话结束 | `Monitor` |
 | 批量 | 200ms 内的行合并成一条通知 | 自动 |
+| 长度上限 | 单行 500 字符、单条通知 3000 字符，超出截断 | 自动 |
 | 洪水保护 | 输出过量自动停止 | 自动 |
 | 停止/列表 | 按 id 停止、列出状态与退出码 | `monitor_stop` / `monitor_list` |
 
@@ -43,7 +44,7 @@ pi install npm:pi-cc-monitor
 | `description` | string | 出现在每条通知里 |
 | `timeout_ms` | number? | 1000–3600000，默认 300000 |
 | `persistent` | boolean? | 会话级常驻，不超时 |
-| `loopPrompt` | string? | 属于哪条 `/loop` chain；事件会顶掉它的兜底心跳 |
+| `loopPrompt` | string? | 所属 `/loop` 的 prompt（原样）；loop 结束时连带停止 |
 
 `command` 和 `ws` 二选一。
 
@@ -73,11 +74,13 @@ pi install npm:pi-cc-monitor
 /loop check whether the deploy finished
 ```
 
-模型会起一个带 `loopPrompt` 的 Monitor；事件到达时立即唤醒 loop，`schedule_wakeup` 的延迟只作为兜底心跳。
+模型会起一个带 `loopPrompt` 的 Monitor。事件到达即唤醒 agent；`schedule_wakeup` 的延迟是兜底心跳，事件不会取消它。loop 结束时，绑定的 Monitor 会被静默停止。
 
 ## 规则
 
 - 只有 stdout 是事件流；stderr 写进文件，不触发唤醒
+- 退出、停止、超时都只发一条结束通知；停止之后的输出会被丢弃
+- 空行不算事件；超长内容以 `...(truncated)` 截断
 - 管道要逐行 flush：`grep --line-buffered`；`head` 不行
 - 只匹配成功标记的脚本在 crash/hang 时会静默；把 `ERROR|FAILED|Killed` 也覆盖进去
 - `tail -f` / `while true` 不会自己退出；不需要时用 `monitor_stop` 或 `timeout_ms`

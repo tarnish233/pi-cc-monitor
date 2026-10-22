@@ -20,8 +20,12 @@
  * userinfo or whitespace, and ws protocols must be unique RFC 6455 tokens.
  *
  * The one addition is `loopPrompt`, which lets a monitor name the /loop chain
- * it belongs to. pi-cc-loop subscribes to the `monitor:wake` event and uses
- * it to supersede the fallback heartbeat of that chain.
+ * it belongs to: when pi-cc-loop ends that chain, the monitor is stopped with
+ * it.
+ *
+ * Every monitor ends exactly once (exit, stop, timeout, flood, error, loop
+ * end or session shutdown) and produces at most one closing notice, like
+ * Claude Code. Output that arrives after the end is dropped.
  */
 
 import fs from "node:fs";
@@ -51,8 +55,6 @@ import {
 import { monitorEnv, monitorShell } from "./shell.ts";
 import { FloodGuard, LineBatcher } from "./stream.ts";
 
-/** The event bus channel pi-cc-loop listens on. */
-export const WAKE_CHANNEL = "monitor:wake";
 /**
  * The event bus channel pi-cc-loop publishes when a chain ends. Monitors that
  * named that chain are stopped, the way Claude Code requires: "call
@@ -81,18 +83,8 @@ export const MAX_EVENTS = 2_000;
 
 export type MonitorCause = "output" | "exit" | "timeout" | "error" | "closed" | "stopped" | "flooded";
 
-export interface MonitorWake {
-	monitorId: string;
-	description: string;
-	kind: "command" | "ws";
-	cause: MonitorCause;
-	/** The lines that triggered this wake. */
-	lines: string[];
-	/** How many events this monitor has produced so far. */
-	eventCount: number;
-	/** The /loop chain this monitor belongs to, when one was named. */
-	loopPrompt?: string;
-}
+/** Claude Code's notice when a monitor is stopped. */
+export const STOPPED_NOTICE = "[Monitor stopped]";
 
 export type MonitorStatus = "running" | "stopped" | "exited" | "timed_out" | "failed" | "flooded";
 
@@ -174,6 +166,42 @@ function outputDir(): string {
 	const dir = path.join(os.tmpdir(), "pi-cc-monitor");
 	fs.mkdirSync(dir, { recursive: true });
 	return dir;
+}
+
+/** "20s", "5m", "1m 30s", "1h". */
+function formatDuration(ms: number): string {
+	const seconds = Math.max(0, Math.round(ms / 1000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	const restSeconds = seconds % 60;
+	if (minutes < 60) return restSeconds ? `${minutes}m ${restSeconds}s` : `${minutes}m`;
+	const hours = Math.floor(minutes / 60);
+	const restMinutes = minutes % 60;
+	return restMinutes ? `${hours}h ${restMinutes}m` : `${hours}h`;
+}
+
+function eventsText(count: number): string {
+	return count === 0 ? "no events" : `${count} event${count === 1 ? "" : "s"}`;
+}
+
+/** Claude Code's expiry notice. */
+function expiryNotice(record: MonitorRecord): string {
+	const after = formatDuration(record.timeoutMs);
+	if (record.eventCount === 0) {
+		return `[Monitor expired after ${after} with no events delivered. Re-arm it if you still need the watch \u2014 and widen the filter if silence was unexpected.]`;
+	}
+	return `[Monitor expired after ${after} with ${eventsText(record.eventCount)} delivered. Re-arm it if you still need the watch.]`;
+}
+
+function exitNotice(record: MonitorRecord, signal: NodeJS.Signals | null): string {
+	const code = record.exitCode;
+	const how =
+		code !== null && code !== undefined ? `exit code ${code}` : signal ? `killed by ${signal}` : "no exit code";
+	return `[Monitor ended \u2014 ${how}, ${eventsText(record.eventCount)} delivered]`;
+}
+
+function floodNotice(record: MonitorRecord): string {
+	return `[Monitor stopped \u2014 too much output (${eventsText(record.eventCount)} delivered). Restart it with a more selective filter.]`;
 }
 
 function generateId(): string {
@@ -258,107 +286,122 @@ function monitorSummary(record: MonitorSnapshot): string {
 export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	const monitors = new Map<string, MonitorRecord>();
 	let lastCtx: ExtensionContext | undefined;
+	/**
+	 * True once the session is shutting down. Pi invalidates this extension's
+	 * API right after `session_shutdown` (quit, reload, new, resume, fork); a
+	 * child-process callback that touched it afterwards would throw an uncaught
+	 * exception, and Pi exits on uncaught exceptions.
+	 */
+	let disposed = false;
 
 	function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info"): void {
-		if (ctx.hasUI) ctx.ui.notify(message, level);
+		if (disposed) return;
+		try {
+			if (ctx.hasUI) ctx.ui.notify(message, level);
+		} catch {
+			// a stale context must never break the monitor
+		}
 	}
 
 	/**
-	 * Deliver an event to the agent.
+	 * Send one notification to the agent.
 	 *
-	 * The bus event is emitted first so a listener (pi-cc-loop) can supersede
-	 * a pending fallback heartbeat before the turn starts. `followUp` keeps the
-	 * message in the low-priority lane: it waits for the current turn to end
-	 * instead of cutting into it.
+	 * `followUp` keeps the message in the low-priority lane: it waits for the
+	 * current turn to end instead of cutting into it.
 	 */
-	function emitWake(record: MonitorRecord, lines: string[], cause: MonitorCause): void {
-		const payload: MonitorWake = {
-			monitorId: record.id,
-			description: record.description,
-			kind: record.kind,
-			cause,
-			lines,
-			eventCount: record.eventCount,
-			...(record.loopPrompt ? { loopPrompt: record.loopPrompt } : {}),
-		};
+	function deliver(record: MonitorRecord, cause: MonitorCause, lines: string[]): void {
+		if (disposed) return;
 		try {
-			pi.events.emit(WAKE_CHANNEL, payload);
-		} catch {
-			// a listener must never break the monitor
-		}
-
-		const header = `[monitor · ${record.description}]`;
-		const body = lines.length ? lines.join("\n") : describeCause(record, cause);
-		pi.sendMessage(
-			{
-				customType: EVENT_MESSAGE_TYPE,
-				content: `${header}\n${body}`,
-				display: true,
-				details: {
-					monitorId: record.id,
-					description: record.description,
-					cause,
-					lines,
-					eventCount: record.eventCount,
-					exitCode: record.exitCode,
-					outputPath: record.outputPath,
-					stderrPath: record.stderrPath,
+			pi.sendMessage(
+				{
+					customType: EVENT_MESSAGE_TYPE,
+					content: `[monitor \u00b7 ${record.description}]\n${lines.join("\n")}`,
+					display: true,
+					details: {
+						monitorId: record.id,
+						description: record.description,
+						cause,
+						lines: cause === "output" ? lines : [],
+						eventCount: record.eventCount,
+						exitCode: record.exitCode,
+						outputPath: record.outputPath,
+						stderrPath: record.stderrPath,
+					},
 				},
-			},
-			{ deliverAs: "followUp", triggerTurn: true },
-		);
-	}
-
-	function describeCause(record: MonitorRecord, cause: MonitorCause): string {
-		const events = `${record.eventCount} event${record.eventCount === 1 ? "" : "s"}`;
-		switch (cause) {
-			case "exit": {
-				const code = record.exitCode;
-				const codeText = code === null || code === undefined ? "no exit code" : `exit code ${code}`;
-				return `the watch ended (${codeText}, ${events})`;
-			}
-			case "timeout":
-				return `the watch timed out (${events})`;
-			case "error":
-				return `the watch failed (${events})`;
-			case "closed":
-				return `the socket closed (${events})`;
-			case "stopped":
-				return `the watch was stopped (${events})`;
-			case "flooded":
-				return `the watch produced too much output and was stopped (${events})`;
-			default:
-				return `the watch produced an event (${events})`;
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+		} catch {
+			// the session is gone; there is nobody left to tell
 		}
 	}
 
-	function finalize(record: MonitorRecord, status: MonitorStatus): void {
+	interface Ending {
+		status: Exclude<MonitorStatus, "running">;
+		cause: MonitorCause;
+		/** The one closing notice the agent gets; omitted for a silent stop. */
+		notice?: () => string;
+		/** Deliver the output that already arrived before the notice. */
+		flush?: boolean;
+		/** Kill the process tree and close the socket. */
+		kill?: boolean;
+	}
+
+	/**
+	 * End a monitor. Only the first call has an effect, so every way a monitor
+	 * can end produces at most one notice, and output arriving afterwards (for
+	 * example from a script that prints on SIGTERM) is dropped.
+	 */
+	function endMonitor(record: MonitorRecord, ending: Ending): void {
 		if (record.status !== "running") return;
-		record.status = status;
+		if (ending.flush) record.batcher?.flushRemainder();
+		// Flushing can itself end the monitor (event cap).
+		if (record.status !== "running") return;
+		record.batcher?.close();
+		record.status = ending.status;
 		record.endedAt = Date.now();
 		if (record.timeoutTimer) {
 			clearTimeout(record.timeoutTimer);
 			record.timeoutTimer = undefined;
 		}
+		if (ending.kill) {
+			killTree(record.child);
+			try {
+				record.socket?.close();
+			} catch {
+				// already closed
+			}
+		}
+		if (ending.notice) deliver(record, ending.cause, [ending.notice()]);
 	}
 
-	function stopMonitor(record: MonitorRecord, cause: MonitorCause, notifyAgent: boolean): void {
+	/** The batch handler shared by command and WebSocket monitors. */
+	function onBatch(record: MonitorRecord, lines: string[], count: number): void {
 		if (record.status !== "running") return;
-		finalize(record, cause === "stopped" ? "stopped" : cause === "timeout" ? "timed_out" : cause === "flooded" ? "flooded" : "failed");
-		killTree(record.child);
-		try {
-			record.socket?.close();
-		} catch {
-			// already closed
+		record.eventCount += count;
+		deliver(record, "output", lines);
+		if (record.eventCount >= MAX_EVENTS) {
+			endMonitor(record, { status: "flooded", cause: "flooded", kill: true, notice: () => floodNotice(record) });
 		}
-		record.batcher?.flushRemainder();
-		if (notifyAgent) emitWake(record, [], cause);
+	}
+
+	function startTimeout(record: MonitorRecord): void {
+		if (record.persistent || record.status !== "running") return;
+		record.timeoutTimer = setTimeout(() => {
+			endMonitor(record, {
+				status: "timed_out",
+				cause: "timeout",
+				flush: true,
+				kill: true,
+				notice: () => expiryNotice(record),
+			});
+		}, record.timeoutMs);
+		record.timeoutTimer.unref?.();
 	}
 
 	/**
-	 * A /loop chain ended: stop the monitors that named it. Without this a
-	 * monitor keeps firing, wakes the agent, and the agent reschedules the
-	 * loop the user just stopped.
+	 * A /loop chain ended: stop the monitors that named it, silently. Without
+	 * this a monitor keeps firing, wakes the agent, and the agent reschedules
+	 * the loop the user just stopped.
 	 */
 	pi.events.on(LOOP_STOPPED_CHANNEL, (data) => {
 		const payload = data as { prompt?: string; reason?: string } | undefined;
@@ -366,7 +409,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		for (const record of [...monitors.values()]) {
 			if (record.loopPrompt !== payload.prompt) continue;
 			if (record.status !== "running") continue;
-			stopMonitor(record, "stopped", false);
+			endMonitor(record, { status: "stopped", cause: "stopped", kill: true });
 			const ctx = lastCtx;
 			if (ctx) {
 				notify(
@@ -410,20 +453,14 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 
 		record.batcher = new LineBatcher({
 			windowMs: BATCH_WINDOW_MS,
-			onBatch: (lines) => {
-				record.eventCount += lines.length;
-				emitWake(record, lines, "output");
-				if (record.eventCount >= MAX_EVENTS && record.status === "running") {
-					stopMonitor(record, "flooded", true);
-				}
-			},
+			onBatch: (lines, count) => onBatch(record, lines, count),
 			onLine: () => record.flood?.noteOutput(),
 		});
 		record.flood = new FloodGuard({
 			quietGapMs: QUIET_GAP_MS,
 			killAfterMs: KILL_AFTER_MS,
 			onFlood: () => {
-				if (record.status === "running") stopMonitor(record, "flooded", true);
+				endMonitor(record, { status: "flooded", cause: "flooded", kill: true, notice: () => floodNotice(record) });
 			},
 		});
 
@@ -438,33 +475,37 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			stdoutPath: record.outputPath,
 			stderrPath: record.stderrPath,
 			onStdout: (chunk) => {
+				if (record.status !== "running") return;
 				record.batcher?.push(chunk);
 				record.flood?.isFlooding();
 			},
 			onStderr: () => {
 				// stderr goes to the output file, it never triggers a notification
 			},
-			onExit: (code) => {
+			onExit: (code, signal) => {
 				record.exitCode = code;
-				// Flush anything the batcher still holds before reporting the exit,
-				// otherwise the events arrive after the "watch ended" notice.
-				record.batcher?.flushRemainder();
-				finalize(record, "exited");
-				emitWake(record, [], "exit");
+				// A monitor that was stopped, timed out or flooded has already
+				// been reported (or silenced): the exit that follows the kill is
+				// not news.
+				endMonitor(record, {
+					status: "exited",
+					cause: "exit",
+					// Deliver what the batcher still holds before the exit notice.
+					flush: true,
+					notice: () => exitNotice(record, signal),
+				});
 			},
 			onError: (error) => {
-				finalize(record, "failed");
-				emitWake(record, [error.message], "error");
+				endMonitor(record, {
+					status: "failed",
+					cause: "error",
+					kill: true,
+					notice: () => `[Monitor failed \u2014 ${error.message}]`,
+				});
 			},
 		});
 
-		if (!input.persistent) {
-			record.timeoutTimer = setTimeout(() => {
-				if (record.status === "running") stopMonitor(record, "timeout", true);
-			}, record.timeoutMs);
-			record.timeoutTimer.unref?.();
-		}
-
+		startTimeout(record);
 		return record;
 	}
 
@@ -499,13 +540,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 
 		record.batcher = new LineBatcher({
 			windowMs: BATCH_WINDOW_MS,
-			onBatch: (lines) => {
-				record.eventCount += lines.length;
-				emitWake(record, lines, "output");
-				if (record.eventCount >= MAX_EVENTS && record.status === "running") {
-					stopMonitor(record, "flooded", true);
-				}
-			},
+			onBatch: (lines, count) => onBatch(record, lines, count),
 		});
 
 		try {
@@ -515,6 +550,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			record.socket = socket;
 
 			socket.addEventListener("message", (event: MessageEvent) => {
+				if (record.status !== "running") return;
 				const data = event.data;
 				if (typeof data === "string") {
 					// A multiline frame stays one event.
@@ -526,29 +562,28 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			});
 			socket.addEventListener("error", () => {
 				// Errors are surfaced before the close.
-				if (record.status === "running") {
-					finalize(record, "failed");
-					emitWake(record, ["[WebSocket error]"], "error");
-				}
+				endMonitor(record, {
+					status: "failed",
+					cause: "error",
+					flush: true,
+					kill: true,
+					notice: () => "[WebSocket error]",
+				});
 			});
 			socket.addEventListener("close", (event: CloseEvent) => {
-				record.batcher?.flushRemainder();
-				if (record.status !== "running") return;
-				finalize(record, "exited");
-				emitWake(record, [`[WebSocket closed: ${event.code}]`], "closed");
+				endMonitor(record, {
+					status: "exited",
+					cause: "closed",
+					flush: true,
+					notice: () => `[WebSocket closed: ${event.code}]`,
+				});
 			});
 		} catch (error) {
-			finalize(record, "failed");
-			emitWake(record, [error instanceof Error ? error.message : String(error)], "error");
+			const message = error instanceof Error ? error.message : String(error);
+			endMonitor(record, { status: "failed", cause: "error", notice: () => `[Monitor failed \u2014 ${message}]` });
 		}
 
-		if (!input.persistent && record.status === "running") {
-			record.timeoutTimer = setTimeout(() => {
-				if (record.status === "running") stopMonitor(record, "timeout", true);
-			}, record.timeoutMs);
-			record.timeoutTimer.unref?.();
-		}
-
+		startTimeout(record);
 		return record;
 	}
 
@@ -693,7 +728,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			loopPrompt: Type.Optional(
 				Type.String({
 					description:
-						"The /loop chain this monitor belongs to. When set, the loop's fallback heartbeat is superseded by each event.",
+						"The /loop prompt this monitor belongs to, verbatim. When that loop ends, the monitor is stopped with it.",
 				}),
 			),
 		}),
@@ -763,7 +798,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 
 			const lifetime = record.persistent
 				? "for the lifetime of the session"
-				: `for ${Math.round(record.timeoutMs / 60000)} minutes`;
+				: `for ${formatDuration(record.timeoutMs)}`;
 			return {
 				content: [
 					{
@@ -802,7 +837,21 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					details: { stopped: false, id: params.id },
 				};
 			}
-			stopMonitor(record, "stopped", true);
+			if (record.status !== "running") {
+				return {
+					content: [
+						{ type: "text" as const, text: `Monitor ${params.id} is not running (${record.status}).` },
+					],
+					details: { stopped: false, id: params.id, status: record.status },
+				};
+			}
+			endMonitor(record, {
+				status: "stopped",
+				cause: "stopped",
+				flush: true,
+				kill: true,
+				notice: () => STOPPED_NOTICE,
+			});
 			return {
 				content: [{ type: "text" as const, text: `Stopped monitor ${params.id}.` }],
 				details: { stopped: true, id: params.id },
@@ -917,8 +966,12 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 							theme,
 						);
 					}
-					const d = (result.details ?? {}) as { stopped?: boolean; id?: string };
-					const summary = d.stopped ? `Stopped ${d.id ?? "?"}` : `No monitor ${d.id ?? "?"}`;
+					const d = (result.details ?? {}) as { stopped?: boolean; id?: string; status?: string };
+					const summary = d.stopped
+						? `Stopped ${d.id ?? "?"}`
+						: d.status
+							? `${d.id ?? "?"} already ${d.status}`
+							: `No monitor ${d.id ?? "?"}`;
 					return toolResult(
 						summary,
 						undefined,
@@ -998,8 +1051,11 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	// --------------------------------------------------------------- lifecycle
 
 	pi.on("session_shutdown", async () => {
+		// Set first: the processes killed below exit after Pi has invalidated
+		// this extension's API, and their callbacks must not touch it.
+		disposed = true;
 		for (const record of monitors.values()) {
-			stopMonitor(record, "stopped", false);
+			endMonitor(record, { status: "stopped", cause: "stopped", kill: true });
 		}
 		monitors.clear();
 	});
