@@ -22,12 +22,7 @@
 		"url": "https://github.com/tarnish233/pi-cc-monitor/issues"
 	},
 	"files": [
-		"index.ts",
-		"process.ts",
-		"stream.ts",
-		"shell.ts",
-		"render.ts",
-		"config.ts",
+		"*.ts",
 		"README.md",
 		"LICENSE"
 	],
