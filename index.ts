@@ -338,6 +338,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 						exitCode: record.exitCode,
 						outputPath: record.outputPath,
 						stderrPath: record.stderrPath,
+						// pi-cc-loop uses it to tell which loop a woken turn belongs to.
+						...(record.loopPrompt ? { loopPrompt: record.loopPrompt } : {}),
 					},
 				},
 				{ deliverAs: "steer", triggerTurn: true },

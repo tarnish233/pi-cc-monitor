@@ -657,3 +657,15 @@ test("the tool description carries Claude Code's usage guidance", async () => {
 		assert.ok(h.tools.get(name).promptSnippet, `${name} has a prompt snippet`);
 	}
 });
+
+test("a chained monitor's notifications name their loop", async () => {
+	const h = await start(makeHarness());
+	await h.tools
+		.get("Monitor")
+		.execute("c", { command: "printf 'x\\n'", description: "chained", loopPrompt: "check the deploy" }, undefined, undefined, h.ctx);
+	await waitFor(() => h.sent.some((entry) => entry.message.details.cause === "exit"));
+	assert.ok(h.sent.length >= 2);
+	for (const entry of h.sent) {
+		assert.equal(entry.message.details.loopPrompt, "check the deploy", "pi-cc-loop knows whose turn an event starts");
+	}
+});
