@@ -8,8 +8,9 @@
  * most 500 characters, a notification at most 3000, and a line that never
  * ends keeps only its last megabyte. Blank lines are not events.
  *
- * The flood guard stops a monitor whose output keeps arriving with less than
- * `quietGapMs` between lines for longer than `killAfterMs`.
+ * The rate limiter is Claude Code's: a burst of 10 notifications, then one
+ * every 2 seconds, and a monitor whose output stays over that budget for 30
+ * seconds is stopped.
  */
 
 import { StringDecoder } from "node:string_decoder";
@@ -113,41 +114,80 @@ export class LineBatcher {
 	}
 }
 
-export interface FloodGuardOptions {
-	/** A gap shorter than this counts as continuous output. */
-	quietGapMs: number;
-	/** Continuous output for this long is a firehose. */
-	killAfterMs: number;
-	/** Called once when the monitor is judged to be flooding. */
-	onFlood: () => void;
+/** Claude Code's notification budget: a burst of 10, then one every 2 seconds. */
+export const BUCKET_CAPACITY = 10;
+export const TOKEN_REFILL_MS = 2_000;
+/** Suppression that goes on for longer than this is a firehose: the monitor is stopped. */
+export const SUSTAINED_SUPPRESSION_KILL_MS = 30_000;
+/** A pause this long since the last suppressed batch starts a fresh suppression window. */
+export const QUIET_GAP_MS = TOKEN_REFILL_MS * 3;
+
+export interface RateLimiterOptions {
+	capacity?: number;
+	refillMs?: number;
+	killAfterMs?: number;
+	quietGapMs?: number;
+	now?: () => number;
 }
 
-export class FloodGuard {
-	private lastOutputAt = 0;
-	private burstStartedAt: number | undefined;
-	private flooded = false;
+export type RateVerdict =
+	| { deliver: true; suppressed: number }
+	| { deliver: false; flood: boolean; suppressedForMs: number };
 
-	constructor(private readonly options: FloodGuardOptions) {}
+/**
+ * Claude Code's monitor rate limit. Every batch costs one token from a bucket
+ * of 10 that refills one token every 2 seconds. A batch without a token is
+ * suppressed; the next batch that gets through reports how many events were
+ * suppressed in between. When suppression lasts longer than 30 seconds the
+ * monitor is a firehose and should be stopped.
+ */
+export class RateLimiter {
+	private tokens: number;
+	private refilledAt: number;
+	/** Events suppressed since the last batch that got through. */
+	private pending = 0;
+	private suppressionStart: number | undefined;
+	private lastSuppressedAt: number | undefined;
 
-	/** Record that output arrived. */
-	noteOutput(now = Date.now()): void {
-		if (now - this.lastOutputAt >= this.options.quietGapMs) {
-			this.burstStartedAt = now;
+	constructor(private readonly options: RateLimiterOptions = {}) {
+		this.tokens = options.capacity ?? BUCKET_CAPACITY;
+		this.refilledAt = this.now();
+	}
+
+	/** Ask to deliver a batch of `count` events. */
+	take(count: number): RateVerdict {
+		const now = this.now();
+		this.refill(now);
+		if (this.tokens > 0) {
+			this.tokens -= 1;
+			const suppressed = this.pending;
+			this.pending = 0;
+			const quietGap = this.options.quietGapMs ?? QUIET_GAP_MS;
+			if (this.lastSuppressedAt !== undefined && now - this.lastSuppressedAt > quietGap) {
+				this.suppressionStart = undefined;
+			}
+			return { deliver: true, suppressed };
 		}
-		this.lastOutputAt = now;
+		this.pending += count;
+		this.lastSuppressedAt = now;
+		this.suppressionStart ??= now;
+		const suppressedForMs = now - this.suppressionStart;
+		return {
+			deliver: false,
+			flood: suppressedForMs > (this.options.killAfterMs ?? SUSTAINED_SUPPRESSION_KILL_MS),
+			suppressedForMs,
+		};
 	}
 
-	/** True once the monitor has been flooding for too long. */
-	isFlooding(now = Date.now()): boolean {
-		if (this.flooded) return true;
-		if (this.burstStartedAt === undefined) return false;
-		if (now - this.burstStartedAt < this.options.killAfterMs) return false;
-		this.flooded = true;
-		this.options.onFlood();
-		return true;
+	private refill(now: number): void {
+		const refillMs = this.options.refillMs ?? TOKEN_REFILL_MS;
+		const earned = Math.floor((now - this.refilledAt) / refillMs);
+		if (earned <= 0) return;
+		this.tokens = Math.min(this.options.capacity ?? BUCKET_CAPACITY, this.tokens + earned);
+		this.refilledAt += earned * refillMs;
 	}
 
-	get startedAt(): number | undefined {
-		return this.burstStartedAt;
+	private now(): number {
+		return (this.options.now ?? Date.now)();
 	}
 }

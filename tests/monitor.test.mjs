@@ -234,7 +234,7 @@ test("each stdout line becomes one notification", async () => {
 	assert.ok(content.includes("one"));
 	assert.ok(content.includes("two"));
 	assert.ok(content.includes("three"));
-	assert.equal(h.sent[0].options.deliverAs, "followUp", "notifications use the low priority lane");
+	assert.equal(h.sent[0].options.deliverAs, "steer", "delivered mid-turn, like Claude Code's \"next\" priority");
 	assert.equal(h.sent[0].options.triggerTurn, true, "a notification wakes the agent");
 	assert.equal(h.sent[0].message.details.eventCount, 3);
 });
@@ -534,4 +534,126 @@ test("the armed message shows a short timeout in seconds", async () => {
 		.get("Monitor")
 		.execute("c", { command: "sleep 1", description: "short", timeout_ms: 20000 }, undefined, undefined, h.ctx);
 	assert.match(armed.content[0].text, /watching for 20s/, armed.content[0].text);
+});
+
+// -------------------------------------------------------------- rate limits
+
+test("the rate limiter follows Claude Code: 10 at once, then one every 2s", () => {
+	let now = 0;
+	const limiter = new stream.RateLimiter({ now: () => now });
+	for (let i = 0; i < 10; i++) assert.equal(limiter.take(1).deliver, true, `burst event ${i + 1}`);
+
+	const eleventh = limiter.take(3);
+	assert.equal(eleventh.deliver, false, "the 11th batch in the same instant is suppressed");
+	assert.equal(eleventh.flood, false);
+
+	now += 2000;
+	const next = limiter.take(1);
+	assert.equal(next.deliver, true, "a token comes back after 2s");
+	assert.equal(next.suppressed, 3, "and reports how many events were suppressed meanwhile");
+	assert.equal(limiter.take(1).deliver, false);
+});
+
+test("sustained suppression for more than 30s is a flood", () => {
+	let now = 0;
+	const limiter = new stream.RateLimiter({ now: () => now });
+	for (let i = 0; i < 10; i++) limiter.take(1);
+	let verdict;
+	// A firehose: a batch every 100ms. Each refill lets one batch through, the
+	// rest are suppressed, so suppression never stops.
+	for (now = 100; now <= 31_000; now += 100) {
+		verdict = limiter.take(1);
+		if (verdict.flood) break;
+	}
+	assert.equal(verdict.flood, true, "stopped after 30s of continuous suppression");
+	assert.ok(now > 30_000 && now <= 31_000, `flood at ${now}ms`);
+});
+
+test("a quiet gap resets the suppression window", () => {
+	let now = 0;
+	const limiter = new stream.RateLimiter({ now: () => now });
+	for (let i = 0; i < 11; i++) limiter.take(1); // the 11th is suppressed at t=0
+	now = 20_000; // quiet for 20s: the bucket is full again
+	assert.equal(limiter.take(1).deliver, true);
+	for (let i = 0; i < 10; i++) limiter.take(1);
+	now = 45_000; // 25s after the new suppression started, 45s after the first one
+	assert.equal(limiter.take(1).flood ?? false, false, "the old suppression does not count");
+});
+
+test("a chatty monitor is rate-limited and told how much was suppressed", async () => {
+	const h = await start(makeHarness());
+	await h.tools.get("Monitor").execute(
+		"c",
+		// 16 lines, one per batch window: more than the burst of 10.
+		{ command: "for i in $(seq 1 16); do echo tick $i; sleep 0.25; done", description: "chatty" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	await waitFor(() => h.sent.some((entry) => entry.message.details.cause === "exit"), 12000);
+
+	const outputs = h.sent.filter((entry) => entry.message.details.cause === "output");
+	assert.ok(outputs.length <= 13, `at most 10 + one per 2s get through, got ${outputs.length}`);
+	const exit = h.sent.find((entry) => entry.message.details.cause === "exit").message.content;
+	assert.match(exit, /suppressed/, `the exit notice reports suppressed events: ${exit}`);
+});
+
+// --------------------------------------------------------------- processes
+
+test("monitor processes are killed if Pi exits without a shutdown", async () => {
+	const h = await start(makeHarness());
+	const before = new Set(process.listeners("exit"));
+	const armed = await h.tools
+		.get("Monitor")
+		.execute("c", { command: "sleep 30", description: "orphan check", persistent: true }, undefined, undefined, h.ctx);
+	const hooks = process.listeners("exit").filter((listener) => !before.has(listener));
+	assert.equal(hooks.length, 1, "an exit hook is installed while monitors run");
+
+	const pid = (await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx)).details.monitors[0].pid;
+	assert.ok(pid, "the snapshot carries the process id");
+	hooks[0](); // what Node runs on process.exit(), e.g. after an uncaught exception
+	await sleep(300);
+	assert.throws(() => process.kill(pid, 0), "the monitor process is gone");
+
+	await h.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, h.ctx);
+	assert.ok(!process.listeners("exit").includes(hooks[0]), "the hook is removed at shutdown");
+	assert.ok(armed.details.taskId);
+});
+
+test("old monitor logs are cleaned up at session start", async () => {
+	const dir = path.join(os.tmpdir(), "pi-cc-monitor");
+	fs.mkdirSync(dir, { recursive: true });
+	const old = path.join(dir, "zzoldlog.out.log");
+	const fresh = path.join(dir, "zzfreshlog.out.log");
+	fs.writeFileSync(old, "old");
+	fs.writeFileSync(fresh, "fresh");
+	const fourDaysAgo = (Date.now() - 4 * 86_400_000) / 1000;
+	fs.utimesSync(old, fourDaysAgo, fourDaysAgo);
+
+	const h = await start(makeHarness());
+	await h.handlers.get("session_start")({ type: "session_start", reason: "startup" }, h.ctx);
+	assert.equal(fs.existsSync(old), false, "logs older than 3 days are removed");
+	assert.equal(fs.existsSync(fresh), true, "recent logs stay readable");
+	fs.rmSync(fresh, { force: true });
+});
+
+// ----------------------------------------------------------------- prompts
+
+test("the tool description carries Claude Code's usage guidance", async () => {
+	const h = await start(makeHarness());
+	const tool = h.tools.get("Monitor");
+	for (const phrase of [
+		"Each stdout line is an event",
+		"--line-buffered",
+		"silence is not success",
+		"2>&1",
+		"monitor_stop",
+		"not replies from the user",
+		"too many events are automatically stopped",
+	]) {
+		assert.ok(tool.description.includes(phrase), `description mentions ${phrase}`);
+	}
+	for (const name of ["Monitor", "monitor_stop", "monitor_list"]) {
+		assert.ok(h.tools.get(name).promptSnippet, `${name} has a prompt snippet`);
+	}
 });

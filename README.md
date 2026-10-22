@@ -20,11 +20,11 @@ pi install npm:pi-cc-monitor
 | --- | --- | --- |
 | 后台监视 | 命令 stdout 每行 = 一个事件；进程退出结束 | `Monitor` |
 | WebSocket | 每个 text frame = 一个事件，binary 记为占位行 | `Monitor` |
-| 事件唤醒 | 事件到达即开一轮 agent turn | 自动 |
+| 事件唤醒 | 空闲时开一轮 turn；忙时在当前工具调用结束后插入（CC 的 next 优先级） | 自动 |
 | 超时/常驻 | `timeout_ms` 默认 5 分钟；`persistent` 到会话结束 | `Monitor` |
 | 批量 | 200ms 内的行合并成一条通知 | 自动 |
 | 长度上限 | 单行 500 字符、单条通知 3000 字符，超出截断 | 自动 |
-| 洪水保护 | 输出过量自动停止 | 自动 |
+| 限流 | 突发 10 条、之后每 2 秒 1 条；超出的事件丢弃并提示，持续超量 30 秒自动停止 | 自动 |
 | 停止/列表 | 按 id 停止、列出状态与退出码 | `monitor_stop` / `monitor_list` |
 
 ## 工具
@@ -81,6 +81,7 @@ pi install npm:pi-cc-monitor
 - 只有 stdout 是事件流；stderr 写进文件，不触发唤醒
 - 退出、停止、超时都只发一条结束通知；停止之后的输出会被丢弃
 - 空行不算事件；超长内容以 `...(truncated)` 截断
+- 输出日志在 `$TMPDIR/pi-cc-monitor/`，保留 3 天
 - 管道要逐行 flush：`grep --line-buffered`；`head` 不行
 - 只匹配成功标记的脚本在 crash/hang 时会静默；把 `ERROR|FAILED|Killed` 也覆盖进去
 - `tail -f` / `while true` 不会自己退出；不需要时用 `monitor_stop` 或 `timeout_ms`
@@ -128,6 +129,7 @@ npx --yes typescript@5.9.3 tsc --noEmit -p tsconfig.json
 - `monitor_stop` / `monitor_list` 对应 CC 的 `TaskStop` / `TaskList`。
 - 事件来源用消息前缀 `[monitor · ...]` 标记，而不是 CC 的 `<task-notification>` 元数据。
 - 和 `pi-cc-loop` 一起用时，`/loop stop` 会停掉该 chain 绑定的 Monitor。
+- Pi 异常退出（没走 `session_shutdown`）时，也会在进程退出前杀掉 Monitor 的进程组。
 
 ## 许可证
 

@@ -2,12 +2,12 @@
  * pi-cc-monitor — Claude Code's `Monitor` tool for the Pi coding agent.
  *
  * A monitor runs a background command (or opens a WebSocket) and turns its
- * output into notifications that wake the agent. Claude Code v2.1.306:
+ * output into notifications that wake the agent. Claude Code:
  *
  *   "Your script's stdout is the event stream. Each line becomes a
  *    notification. Exit ends the watch."
  *
- * The tool schema mirrors Claude Code's exactly:
+ * The tool schema mirrors Claude Code's:
  *
  *   command     string?   shell command or script; each stdout line is an event
  *   ws          object?   { url, protocols? }; each text frame is an event
@@ -23,26 +23,22 @@
  * it belongs to: when pi-cc-loop ends that chain, the monitor is stopped with
  * it.
  *
- * Every monitor ends exactly once (exit, stop, timeout, flood, error, loop
- * end or session shutdown) and produces at most one closing notice, like
- * Claude Code. Output that arrives after the end is dropped.
+ * Runtime behaviour follows Claude Code too: lines within 200ms form one
+ * notification, notifications are capped (500 characters a line, 3000 a
+ * notification) and rate-limited (a burst of 10, then one every 2 seconds),
+ * they are delivered mid-turn (between tool calls), and every monitor ends
+ * exactly once with at most one closing notice.
  */
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ChildProcess } from "node:child_process";
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-	Theme,
-	ThemeColor,
-	ToolRenderers,
-} from "@earendil-works/pi-coding-agent";
-import { Container, Text } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext, ThemeColor, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { invalidateConfig, loadConfig, syncPiCcExtensionsExcludes } from "./config.ts";
 import { killTree, spawnMonitor } from "./process.ts";
+import { MONITOR_DESCRIPTION, MONITOR_LIST_SNIPPET, MONITOR_SNIPPET, MONITOR_STOP_SNIPPET } from "./prompts.ts";
 import {
 	bodyLines,
 	contentText,
@@ -53,7 +49,8 @@ import {
 	stripProvenance,
 } from "./render.ts";
 import { monitorEnv, monitorShell } from "./shell.ts";
-import { FloodGuard, LineBatcher } from "./stream.ts";
+import { LineBatcher, RateLimiter } from "./stream.ts";
+import { compactRenderers, formatDuration, truncate } from "./tool-rows.ts";
 
 /**
  * The event bus channel pi-cc-loop publishes when a chain ends. Monitors that
@@ -74,12 +71,8 @@ export const MIN_TIMEOUT_MS = 1_000;
 /** Claude Code batches stdout lines within 200ms into a single notification. */
 export const BATCH_WINDOW_MS = 200;
 
-/** Claude Code's flood thresholds for a monitor that will not stop talking. */
-export const QUIET_GAP_MS = 2_000;
-export const KILL_AFTER_MS = 600_000;
-
-/** A hard backstop so a runaway script cannot flood the transcript. */
-export const MAX_EVENTS = 2_000;
+/** Logs older than this are removed when a session starts. */
+const LOG_RETENTION_MS = 3 * 86_400_000;
 
 export type MonitorCause = "output" | "exit" | "timeout" | "error" | "closed" | "stopped" | "flooded";
 
@@ -97,7 +90,10 @@ export interface MonitorRecord {
 	timeoutMs: number;
 	persistent: boolean;
 	createdAt: number;
+	/** Events delivered to the agent. */
 	eventCount: number;
+	/** Events dropped by the rate limit. */
+	suppressedCount: number;
 	status: MonitorStatus;
 	/** Epoch ms when the monitor left the running state. */
 	endedAt?: number;
@@ -110,7 +106,7 @@ export interface MonitorRecord {
 	socket?: WebSocket;
 	timeoutTimer?: ReturnType<typeof setTimeout>;
 	batcher?: LineBatcher;
-	flood?: FloodGuard;
+	limiter: RateLimiter;
 }
 
 /** A serializable view of a monitor, safe to put in tool result details. */
@@ -124,10 +120,13 @@ export interface MonitorSnapshot {
 	persistent: boolean;
 	createdAt: number;
 	eventCount: number;
+	suppressedCount: number;
 	status: MonitorStatus;
 	endedAt?: number;
 	exitCode?: number | null;
 	loopPrompt?: string;
+	/** Process id of a command monitor's shell. */
+	pid?: number;
 	outputPath: string;
 	stderrPath: string;
 }
@@ -168,40 +167,22 @@ function outputDir(): string {
 	return dir;
 }
 
-/** "20s", "5m", "1m 30s", "1h". */
-function formatDuration(ms: number): string {
-	const seconds = Math.max(0, Math.round(ms / 1000));
-	if (seconds < 60) return `${seconds}s`;
-	const minutes = Math.floor(seconds / 60);
-	const restSeconds = seconds % 60;
-	if (minutes < 60) return restSeconds ? `${minutes}m ${restSeconds}s` : `${minutes}m`;
-	const hours = Math.floor(minutes / 60);
-	const restMinutes = minutes % 60;
-	return restMinutes ? `${hours}h ${restMinutes}m` : `${hours}h`;
-}
-
-function eventsText(count: number): string {
-	return count === 0 ? "no events" : `${count} event${count === 1 ? "" : "s"}`;
-}
-
-/** Claude Code's expiry notice. */
-function expiryNotice(record: MonitorRecord): string {
-	const after = formatDuration(record.timeoutMs);
-	if (record.eventCount === 0) {
-		return `[Monitor expired after ${after} with no events delivered. Re-arm it if you still need the watch \u2014 and widen the filter if silence was unexpected.]`;
+/** Remove monitor logs that have not been written for a few days. */
+function cleanOldLogs(now = Date.now()): void {
+	try {
+		const dir = outputDir();
+		for (const name of fs.readdirSync(dir)) {
+			if (!name.endsWith(".log")) continue;
+			const file = path.join(dir, name);
+			try {
+				if (now - fs.statSync(file).mtimeMs > LOG_RETENTION_MS) fs.rmSync(file, { force: true });
+			} catch {
+				// a file that vanished or cannot be read is not our problem
+			}
+		}
+	} catch {
+		// cleanup is best effort
 	}
-	return `[Monitor expired after ${after} with ${eventsText(record.eventCount)} delivered. Re-arm it if you still need the watch.]`;
-}
-
-function exitNotice(record: MonitorRecord, signal: NodeJS.Signals | null): string {
-	const code = record.exitCode;
-	const how =
-		code !== null && code !== undefined ? `exit code ${code}` : signal ? `killed by ${signal}` : "no exit code";
-	return `[Monitor ended \u2014 ${how}, ${eventsText(record.eventCount)} delivered]`;
-}
-
-function floodNotice(record: MonitorRecord): string {
-	return `[Monitor stopped \u2014 too much output (${eventsText(record.eventCount)} delivered). Restart it with a more selective filter.]`;
 }
 
 function generateId(): string {
@@ -211,45 +192,39 @@ function generateId(): string {
 	return out;
 }
 
-function truncate(text: string, max: number): string {
-	const clean = text.replace(/\s+/g, " ").trim();
-	return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+function eventsText(count: number): string {
+	return count === 0 ? "no events" : `${count} event${count === 1 ? "" : "s"}`;
 }
 
-/** A compact one-line call row for a tool. */
-function toolCall(label: string, detail: string, theme: Theme): Text {
-	const title = theme.fg("toolTitle", theme.bold(label));
-	return new Text(detail ? `${title} ${theme.fg("muted", detail)}` : title, 0, 0);
+/** " (12 suppressed)" when the rate limit dropped events, otherwise "". */
+function suppressedText(record: MonitorRecord): string {
+	return record.suppressedCount ? ` (${record.suppressedCount} suppressed)` : "";
 }
 
-/** A compact one-line result row for a tool. */
-function toolResult(
-	summary: string,
-	detail: string | undefined,
-	options: { expanded: boolean; isPartial: boolean; isError: boolean },
-	theme: Theme,
-): Text {
-	if (options.isPartial) return new Text(theme.fg("warning", "Working…"), 0, 0);
-	const prefix = options.isError ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
-	const body = options.isError ? theme.fg("error", summary) : theme.fg("toolOutput", summary);
-	const text = prefix + body;
-	if (options.expanded && detail) return new Text(`${text}\n${theme.fg("dim", detail)}`, 0, 0);
-	return new Text(text, 0, 0);
-}
-
-/** Hide the call row once the result has arrived, leaving one result line. */
-function completedCall(): Container {
-	return new Container();
-}
-
-/** The first text line of a tool result, used as a fallback summary. */
-function resultText(result: { content?: Array<{ type?: string; text?: string }> }): string {
-	for (const block of result.content ?? []) {
-		if (block?.type === "text" && typeof block.text === "string") {
-			return block.text.split("\n")[0] ?? "";
-		}
+/** Claude Code's expiry notice. */
+function expiryNotice(record: MonitorRecord): string {
+	const after = formatDuration(record.timeoutMs);
+	if (record.eventCount === 0) {
+		return `[Monitor expired after ${after} with no events delivered${suppressedText(record)}. Re-arm it if you still need the watch \u2014 and widen the filter if silence was unexpected.]`;
 	}
-	return "";
+	return `[Monitor expired after ${after} with ${eventsText(record.eventCount)} delivered${suppressedText(record)}. Re-arm it if you still need the watch.]`;
+}
+
+function exitNotice(record: MonitorRecord, signal: NodeJS.Signals | null): string {
+	const code = record.exitCode;
+	const how =
+		code !== null && code !== undefined ? `exit code ${code}` : signal ? `killed by ${signal}` : "no exit code";
+	const suppressed = record.suppressedCount ? `, ${record.suppressedCount} suppressed` : "";
+	return `[Monitor ended \u2014 ${how}, ${eventsText(record.eventCount)} delivered${suppressed}]`;
+}
+
+function floodNotice(record: MonitorRecord, suppressedForMs: number): string {
+	return `[Monitor stopped \u2014 too much output (${eventsText(record.suppressedCount)} suppressed over ${formatDuration(suppressedForMs)}). Restart it with a more selective filter.]`;
+}
+
+/** Claude Code's notice for events the rate limit dropped. */
+function suppressionNotice(count: number): string {
+	return `[${eventsText(count)} suppressed \u2014 output rate too high. Consider using monitor_stop to restart this monitor with a more selective filter.]`;
 }
 
 function snapshotMonitor(record: MonitorRecord): MonitorSnapshot {
@@ -263,22 +238,57 @@ function snapshotMonitor(record: MonitorRecord): MonitorSnapshot {
 		persistent: record.persistent,
 		createdAt: record.createdAt,
 		eventCount: record.eventCount,
+		suppressedCount: record.suppressedCount,
 		status: record.status,
 		...(record.endedAt !== undefined ? { endedAt: record.endedAt } : {}),
 		...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
 		...(record.loopPrompt !== undefined ? { loopPrompt: record.loopPrompt } : {}),
+		...(record.child?.pid !== undefined ? { pid: record.child.pid } : {}),
 		outputPath: record.outputPath,
 		stderrPath: record.stderrPath,
 	};
 }
 
 function monitorSummary(record: MonitorSnapshot): string {
-	const events = `${record.eventCount} event${record.eventCount === 1 ? "" : "s"}`;
 	const code =
 		record.status !== "running" && record.exitCode !== undefined && record.exitCode !== null
 			? `, code ${record.exitCode}`
 			: "";
-	return `${record.id} ${record.status}${code} (${events})`;
+	return `${record.id} ${record.status}${code} (${eventsText(record.eventCount)})`;
+}
+
+/** A short, human-readable label for a non-output cause. */
+function causeLabel(cause: MonitorCause, exitCode: number | null | undefined): string {
+	switch (cause) {
+		case "exit":
+			return exitCode === null || exitCode === undefined ? "exited" : `exited (code ${exitCode})`;
+		case "timeout":
+			return "timed out";
+		case "error":
+			return "failed";
+		case "closed":
+			return "closed";
+		case "stopped":
+			return "stopped";
+		case "flooded":
+			return "stopped (too much output)";
+		default:
+			return "";
+	}
+}
+
+function causeColor(cause: MonitorCause, exitCode: number | null | undefined): ThemeColor {
+	switch (cause) {
+		case "exit":
+			return exitCode === 0 ? "success" : "error";
+		case "timeout":
+		case "flooded":
+			return "warning";
+		case "error":
+			return "error";
+		default:
+			return "muted";
+	}
 }
 
 // ------------------------------------------------------------------ extension
@@ -306,8 +316,10 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	/**
 	 * Send one notification to the agent.
 	 *
-	 * `followUp` keeps the message in the low-priority lane: it waits for the
-	 * current turn to end instead of cutting into it.
+	 * `steer` is Claude Code's "next" priority: when the agent is busy the
+	 * notification lands after the current tool call, before the next model
+	 * request, instead of waiting for the whole turn to end. When the agent is
+	 * idle it starts a turn.
 	 */
 	function deliver(record: MonitorRecord, cause: MonitorCause, lines: string[]): void {
 		if (disposed) return;
@@ -328,7 +340,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 						stderrPath: record.stderrPath,
 					},
 				},
-				{ deliverAs: "followUp", triggerTurn: true },
+				{ deliverAs: "steer", triggerTurn: true },
 			);
 		} catch {
 			// the session is gone; there is nobody left to tell
@@ -354,7 +366,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	function endMonitor(record: MonitorRecord, ending: Ending): void {
 		if (record.status !== "running") return;
 		if (ending.flush) record.batcher?.flushRemainder();
-		// Flushing can itself end the monitor (event cap).
+		// Flushing can itself end the monitor (flood).
 		if (record.status !== "running") return;
 		record.batcher?.close();
 		record.status = ending.status;
@@ -372,30 +384,50 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			}
 		}
 		if (ending.notice) deliver(record, ending.cause, [ending.notice()]);
+		if (![...monitors.values()].some((other) => other.status === "running")) removeExitHook();
 	}
 
-	/** The batch handler shared by command and WebSocket monitors. */
+	/** Rate-limit a batch, then deliver it. */
 	function onBatch(record: MonitorRecord, lines: string[], count: number): void {
 		if (record.status !== "running") return;
-		record.eventCount += count;
-		deliver(record, "output", lines);
-		if (record.eventCount >= MAX_EVENTS) {
-			endMonitor(record, { status: "flooded", cause: "flooded", kill: true, notice: () => floodNotice(record) });
+		const verdict = record.limiter.take(count);
+		if (verdict.deliver) {
+			record.eventCount += count;
+			deliver(record, "output", verdict.suppressed ? [suppressionNotice(verdict.suppressed), ...lines] : lines);
+			return;
+		}
+		record.suppressedCount += count;
+		if (verdict.flood) {
+			endMonitor(record, {
+				status: "flooded",
+				cause: "flooded",
+				kill: true,
+				notice: () => floodNotice(record, verdict.suppressedForMs),
+			});
 		}
 	}
 
-	function startTimeout(record: MonitorRecord): void {
-		if (record.persistent || record.status !== "running") return;
-		record.timeoutTimer = setTimeout(() => {
-			endMonitor(record, {
-				status: "timed_out",
-				cause: "timeout",
-				flush: true,
-				kill: true,
-				notice: () => expiryNotice(record),
-			});
-		}, record.timeoutMs);
-		record.timeoutTimer.unref?.();
+	/**
+	 * Kill every running command monitor at once. Installed as a process exit
+	 * hook while monitors run: if Pi exits without a session_shutdown (for
+	 * example after an uncaught exception), the detached process groups would
+	 * otherwise keep running forever.
+	 */
+	function killAllNow(): void {
+		for (const record of monitors.values()) {
+			if (record.status === "running") killTree(record.child, "SIGKILL");
+		}
+	}
+	let exitHookInstalled = false;
+	function installExitHook(): void {
+		if (exitHookInstalled) return;
+		process.on("exit", killAllNow);
+		exitHookInstalled = true;
+	}
+	function removeExitHook(): void {
+		if (!exitHookInstalled) return;
+		process.off("exit", killAllNow);
+		exitHookInstalled = false;
 	}
 
 	/**
@@ -423,47 +455,61 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 
 	// ------------------------------------------------------------- arming
 
-	function armCommand(
-		input: {
-			command: string;
-			description: string;
-			timeoutMs: number;
-			persistent: boolean;
-			loopPrompt?: string;
-		},
-		ctx: ExtensionContext,
+	interface ArmInput {
+		description: string;
+		timeoutMs: number;
+		persistent: boolean;
+		loopPrompt?: string;
+	}
+
+	/** The parts every monitor shares: record, batcher, rate limit. */
+	function createRecord(
+		kind: MonitorRecord["kind"],
+		input: ArmInput,
+		target: { command?: string; wsUrl?: string },
 	): MonitorRecord {
 		const id = generateId();
 		const dir = outputDir();
 		const record: MonitorRecord = {
 			id,
-			kind: "command",
+			kind,
 			description: input.description,
-			command: input.command,
+			...target,
 			timeoutMs: input.persistent ? 0 : input.timeoutMs,
 			persistent: input.persistent,
 			createdAt: Date.now(),
 			eventCount: 0,
+			suppressedCount: 0,
 			status: "running",
 			loopPrompt: input.loopPrompt,
 			outputPath: path.join(dir, `${id}.out.log`),
 			stderrPath: path.join(dir, `${id}.err.log`),
+			limiter: new RateLimiter(),
 		};
-		monitors.set(id, record);
-
 		record.batcher = new LineBatcher({
 			windowMs: BATCH_WINDOW_MS,
 			onBatch: (lines, count) => onBatch(record, lines, count),
-			onLine: () => record.flood?.noteOutput(),
 		});
-		record.flood = new FloodGuard({
-			quietGapMs: QUIET_GAP_MS,
-			killAfterMs: KILL_AFTER_MS,
-			onFlood: () => {
-				endMonitor(record, { status: "flooded", cause: "flooded", kill: true, notice: () => floodNotice(record) });
-			},
-		});
+		monitors.set(id, record);
+		return record;
+	}
 
+	function startTimeout(record: MonitorRecord): void {
+		if (record.persistent || record.status !== "running") return;
+		record.timeoutTimer = setTimeout(() => {
+			endMonitor(record, {
+				status: "timed_out",
+				cause: "timeout",
+				flush: true,
+				kill: true,
+				notice: () => expiryNotice(record),
+			});
+		}, record.timeoutMs);
+		record.timeoutTimer.unref?.();
+	}
+
+	function armCommand(input: ArmInput & { command: string }, ctx: ExtensionContext): MonitorRecord {
+		const record = createRecord("command", input, { command: input.command });
 		const shell = monitorShell();
 		record.child = spawnMonitor({
 			command: input.command,
@@ -475,9 +521,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			stdoutPath: record.outputPath,
 			stderrPath: record.stderrPath,
 			onStdout: (chunk) => {
-				if (record.status !== "running") return;
-				record.batcher?.push(chunk);
-				record.flood?.isFlooding();
+				if (record.status === "running") record.batcher?.push(chunk);
 			},
 			onStderr: () => {
 				// stderr goes to the output file, it never triggers a notification
@@ -504,45 +548,13 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				});
 			},
 		});
-
+		installExitHook();
 		startTimeout(record);
 		return record;
 	}
 
-	function armWebSocket(
-		input: {
-			url: string;
-			protocols?: string[];
-			description: string;
-			timeoutMs: number;
-			persistent: boolean;
-			loopPrompt?: string;
-		},
-		ctx: ExtensionContext,
-	): MonitorRecord {
-		const id = generateId();
-		const dir = outputDir();
-		const record: MonitorRecord = {
-			id,
-			kind: "ws",
-			description: input.description,
-			wsUrl: input.url,
-			timeoutMs: input.persistent ? 0 : input.timeoutMs,
-			persistent: input.persistent,
-			createdAt: Date.now(),
-			eventCount: 0,
-			status: "running",
-			loopPrompt: input.loopPrompt,
-			outputPath: path.join(dir, `${id}.out.log`),
-			stderrPath: path.join(dir, `${id}.err.log`),
-		};
-		monitors.set(id, record);
-
-		record.batcher = new LineBatcher({
-			windowMs: BATCH_WINDOW_MS,
-			onBatch: (lines, count) => onBatch(record, lines, count),
-		});
-
+	function armWebSocket(input: ArmInput & { url: string; protocols?: string[] }): MonitorRecord {
+		const record = createRecord("ws", input, { wsUrl: input.url });
 		try {
 			const socket = input.protocols?.length
 				? new WebSocket(input.url, input.protocols)
@@ -553,12 +565,10 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				if (record.status !== "running") return;
 				const data = event.data;
 				if (typeof data === "string") {
-					// A multiline frame stays one event.
 					record.batcher?.push(`${data}\n`);
 					return;
 				}
-				const bytes = byteLengthOf(data);
-				record.batcher?.push(`[binary frame, ${bytes} bytes]\n`);
+				record.batcher?.push(`[binary frame, ${byteLengthOf(data)} bytes]\n`);
 			});
 			socket.addEventListener("error", () => {
 				// Errors are surfaced before the close.
@@ -582,46 +592,11 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			const message = error instanceof Error ? error.message : String(error);
 			endMonitor(record, { status: "failed", cause: "error", notice: () => `[Monitor failed \u2014 ${message}]` });
 		}
-
 		startTimeout(record);
 		return record;
 	}
 
 	// ---------------------------------------------------------------- tools
-
-	/** A short, human-readable label for a non-output cause. */
-	function causeLabel(cause: MonitorCause, exitCode: number | null | undefined): string {
-		switch (cause) {
-			case "exit":
-				return exitCode === null || exitCode === undefined ? "exited" : `exited (code ${exitCode})`;
-			case "timeout":
-				return "timed out";
-			case "error":
-				return "failed";
-			case "closed":
-				return "closed";
-			case "stopped":
-				return "stopped";
-			case "flooded":
-				return "stopped (too much output)";
-			default:
-				return "";
-		}
-	}
-
-	function causeColor(cause: MonitorCause, exitCode: number | null | undefined): ThemeColor {
-		switch (cause) {
-			case "exit":
-				return exitCode === 0 ? "success" : "error";
-			case "timeout":
-			case "flooded":
-				return "warning";
-			case "error":
-				return "error";
-			default:
-				return "muted";
-		}
-	}
 
 	/**
 	 * Draw the event as a quiet block instead of Pi's default
@@ -640,10 +615,10 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		const body = stripProvenance(text, /^\[monitor[^\]]*\]\n?/);
 		if (!loadConfig().compactMessages) {
 			const summary = firstLine(body);
-			const header = `monitor · ${details.description ?? "watch"}`;
+			const header = `monitor \u00b7 ${details.description ?? "watch"}`;
 			const suffix = cause === "output" ? "" : ` (${cause})`;
 			return renderCard({
-				header: `${header}${suffix}${summary && cause === "output" ? ` · ${summary}` : ""}`,
+				header: `${header}${suffix}${summary && cause === "output" ? ` \u00b7 ${summary}` : ""}`,
 				body,
 				expanded: options.expanded,
 				outputPad: options.outputPad,
@@ -657,13 +632,11 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		if (details.description) parts.push(theme.fg("customMessageText", details.description));
 		const causeText = causeLabel(cause, details.exitCode);
 		if (causeText) parts.push(theme.fg(causeColor(cause, details.exitCode), causeText));
-		const header = parts.join(theme.fg("dim", " · "));
+		const header = parts.join(theme.fg("dim", " \u00b7 "));
 
 		const meta: string[] = [];
 		if (details.monitorId) meta.push(`id ${details.monitorId}`);
-		if (details.eventCount !== undefined) {
-			meta.push(`${details.eventCount} event${details.eventCount === 1 ? "" : "s"}`);
-		}
+		if (details.eventCount !== undefined) meta.push(eventsText(details.eventCount));
 
 		return renderBlock({
 			header,
@@ -679,11 +652,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "Monitor",
 		label: "Monitor",
-		description:
-			"Start a background watch that turns output into notifications. Each stdout line (or each WebSocket " +
-			"text frame) is one event that wakes the agent. Exit ends the watch. Use it to be told the moment " +
-			"something happens instead of polling for it. Only stdout triggers notifications; stderr is written to " +
-			"the output file and can be read with the read tool.",
+		description: MONITOR_DESCRIPTION,
+		promptSnippet: MONITOR_SNIPPET,
 		parameters: Type.Object({
 			command: Type.Optional(
 				Type.String({
@@ -749,12 +719,13 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			const timeoutMs = params.timeout_ms ?? DEFAULT_TIMEOUT_MS;
 			if (!persistent) {
 				if (timeoutMs < MIN_TIMEOUT_MS) {
-					throw new Error(`timeout_ms must be ≥ ${MIN_TIMEOUT_MS}`);
+					throw new Error(`timeout_ms must be \u2265 ${MIN_TIMEOUT_MS}`);
 				}
 				if (timeoutMs > MAX_TIMEOUT_MS) {
-					throw new Error(`timeout_ms must be ≤ ${MAX_TIMEOUT_MS}`);
+					throw new Error(`timeout_ms must be \u2264 ${MAX_TIMEOUT_MS}`);
 				}
 			}
+			const input: ArmInput = { description: params.description, timeoutMs, persistent, loopPrompt: params.loopPrompt };
 
 			let record: MonitorRecord;
 			if (hasCommand) {
@@ -763,16 +734,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				if (hasControlChars(command)) {
 					throw new Error("command contains control characters that would be hidden in the approval dialog");
 				}
-				record = armCommand(
-					{
-						command,
-						description: params.description,
-						timeoutMs,
-						persistent,
-						loopPrompt: params.loopPrompt,
-					},
-					ctx,
-				);
+				record = armCommand({ ...input, command }, ctx);
 			} else {
 				const ws = params.ws as { url: string; protocols?: string[] };
 				if (!isValidWsUrl(ws.url)) {
@@ -783,17 +745,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				if (!isValidProtocols(ws.protocols)) {
 					throw new Error("protocols must be unique RFC 6455 tokens");
 				}
-				record = armWebSocket(
-					{
-						url: ws.url,
-						protocols: ws.protocols,
-						description: params.description,
-						timeoutMs,
-						persistent,
-						loopPrompt: params.loopPrompt,
-					},
-					ctx,
-				);
+				record = armWebSocket({ ...input, url: ws.url, protocols: ws.protocols });
 			}
 
 			const lifetime = record.persistent
@@ -804,7 +756,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					{
 						type: "text",
 						text:
-							`Monitor ${record.id} armed · ${record.description} · watching ${lifetime}. ` +
+							`Monitor ${record.id} armed \u00b7 ${record.description} \u00b7 watching ${lifetime}. ` +
 							`Stop it with monitor_stop { "id": "${record.id}" }.`,
 					},
 				],
@@ -823,7 +775,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "monitor_stop",
 		label: "Stop Monitor",
-		description: "Stop a running monitor by its id.",
+		description: "Stop a running monitor by its id. The monitor's process tree is killed and you get one [Monitor stopped] notice.",
+		promptSnippet: MONITOR_STOP_SNIPPET,
 		parameters: Type.Object({
 			id: Type.String({ description: "The monitor id returned by Monitor." }),
 		}),
@@ -862,7 +815,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "monitor_list",
 		label: "List Monitors",
-		description: "List the monitors of this session with their ids, state and event counts.",
+		description: "List the monitors of this session with their ids, state, event counts and exit codes.",
+		promptSnippet: MONITOR_LIST_SNIPPET,
 		parameters: Type.Object({}),
 		annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
@@ -881,8 +835,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 						record.status !== "running" && record.exitCode !== undefined && record.exitCode !== null
 							? `exit ${record.exitCode}  `
 							: "";
+					const suppressed = record.suppressedCount ? `  ${record.suppressedCount} suppressed` : "";
 					const target = record.kind === "ws" ? record.wsUrl : record.command;
-					return `${record.id}  ${record.status}  ${record.kind}  ${record.eventCount} events  ${age}s  ${code}${record.description}  ${target ?? ""}`;
+					return `${record.id}  ${record.status}  ${record.kind}  ${record.eventCount} events${suppressed}  ${age}s  ${code}${record.description}  ${target ?? ""}`;
 				})
 				.join("\n");
 			return {
@@ -895,134 +850,67 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	// -------------------------------------------------------------- rendering
 
 	/**
-	 * Compact one-line tool rows.
-	 *
-	 * The resolver is consulted every time a tool row renders, so setting
-	 * `compactToolRows` to false falls back to Pi's default rendering without
-	 * re-registering the tool or reloading the extension.
+	 * Compact one-line tool rows. The resolver is consulted every time a row
+	 * renders, so turning `compactToolRows` off falls back to Pi's default
+	 * rendering without reloading.
 	 */
-	function registerToolRenderers(): void {
-		if (typeof pi.registerToolRenderer !== "function") return;
-		const renderers: Record<string, ToolRenderers> = {
-			Monitor: {
-				renderCall(args: any, theme: Theme, context: any) {
-					if (!context.isPartial && context.executionStarted) return completedCall();
-					const description = truncate(args.description ?? "", 40);
-					const target = args.ws?.url ? `ws ${truncate(args.ws.url, 40)}` : truncate(args.command ?? "", 40);
-					return toolCall("Watch", [description, target].filter(Boolean).join(" · "), theme);
-				},
-				renderResult(result: any, options: any, theme: Theme, context: any) {
-					if (context.isError) {
-						return toolResult(
-							resultText(result) || "Failed",
-							undefined,
-							{ expanded: options.expanded, isPartial: options.isPartial, isError: true },
-							theme,
-						);
-					}
-					const d = (result.details ?? {}) as {
-						taskId?: string;
-						timeoutMs?: number;
-						persistent?: boolean;
-						outputPath?: string;
-						stderrPath?: string;
-					};
-					const lifetime = d.persistent
-						? "session lifetime"
-						: `${formatDuration(d.timeoutMs ?? 0)} timeout`;
-					const description = context.args.description
-						? ` · ${truncate(context.args.description, 40)}`
-						: "";
-					const summary = `Armed ${d.taskId ?? "?"} · ${lifetime}${description}`;
-					const detail = options.expanded
-						? [
-								context.args.command ? `command: ${context.args.command}` : undefined,
-								context.args.ws?.url ? `ws: ${context.args.ws.url}` : undefined,
-								d.outputPath ? `output: ${d.outputPath}` : undefined,
-								d.stderrPath ? `stderr: ${d.stderrPath}` : undefined,
-							]
-								.filter(Boolean)
-								.join("\n")
-						: undefined;
-					return toolResult(
-						summary,
-						detail || undefined,
-						{ expanded: options.expanded, isPartial: options.isPartial, isError: context.isError },
-						theme,
-					);
-				},
+	const renderers: Record<string, ToolRenderers> = {
+		Monitor: compactRenderers({
+			call: (args) => ({
+				label: "Watch",
+				detail: [
+					truncate(args.description ?? "", 40),
+					args.ws?.url ? `ws ${truncate(args.ws.url, 40)}` : truncate(args.command ?? "", 40),
+				]
+					.filter(Boolean)
+					.join(" \u00b7 "),
+			}),
+			summary: (d, args) => {
+				const lifetime = d.persistent ? "session lifetime" : `${formatDuration(d.timeoutMs ?? 0)} timeout`;
+				const description = args.description ? ` \u00b7 ${truncate(args.description, 40)}` : "";
+				return `Armed ${d.taskId ?? "?"} \u00b7 ${lifetime}${description}`;
 			},
-			monitor_stop: {
-				renderCall(args: any, theme: Theme, context: any) {
-					if (!context.isPartial && context.executionStarted) return completedCall();
-					return toolCall("Stop", args.id ?? "", theme);
-				},
-				renderResult(result: any, options: any, theme: Theme, context: any) {
-					if (context.isError) {
-						return toolResult(
-							resultText(result) || "Failed",
-							undefined,
-							{ expanded: options.expanded, isPartial: options.isPartial, isError: true },
-							theme,
-						);
-					}
-					const d = (result.details ?? {}) as { stopped?: boolean; id?: string; status?: string };
-					const summary = d.stopped
-						? `Stopped ${d.id ?? "?"}`
-						: d.status
-							? `${d.id ?? "?"} already ${d.status}`
-							: `No monitor ${d.id ?? "?"}`;
-					return toolResult(
-						summary,
-						undefined,
-						{ expanded: options.expanded, isPartial: options.isPartial, isError: context.isError },
-						theme,
-					);
-				},
+			detail: (d, args) =>
+				[
+					args.command ? `command: ${args.command}` : undefined,
+					args.ws?.url ? `ws: ${args.ws.url}` : undefined,
+					d.outputPath ? `output: ${d.outputPath}` : undefined,
+					d.stderrPath ? `stderr: ${d.stderrPath}` : undefined,
+				]
+					.filter(Boolean)
+					.join("\n") || undefined,
+		}),
+		monitor_stop: compactRenderers({
+			call: (args) => ({ label: "Stop", detail: args.id ?? "" }),
+			summary: (d) =>
+				d.stopped
+					? `Stopped ${d.id ?? "?"}`
+					: d.status
+						? `${d.id ?? "?"} already ${d.status}`
+						: `No monitor ${d.id ?? "?"}`,
+		}),
+		monitor_list: compactRenderers({
+			call: () => ({ label: "List monitors" }),
+			summary: (d) => {
+				const list: MonitorSnapshot[] = d.monitors ?? [];
+				if (!list.length) return "No monitors";
+				if (list.length === 1) return `1 monitor \u00b7 ${monitorSummary(list[0])}`;
+				const shown = list.slice(0, 2).map(monitorSummary).join(" \u00b7 ");
+				return `${list.length} monitors \u00b7 ${shown}${list.length > 2 ? " \u2026" : ""}`;
 			},
-			monitor_list: {
-				renderCall(_args: any, theme: Theme, context: any) {
-					if (!context.isPartial && context.executionStarted) return completedCall();
-					return toolCall("List monitors", "", theme);
-				},
-				renderResult(result: any, options: any, theme: Theme, context: any) {
-					if (context.isError) {
-						return toolResult(
-							resultText(result) || "Failed",
-							undefined,
-							{ expanded: options.expanded, isPartial: options.isPartial, isError: true },
-							theme,
-						);
-					}
-					const d = (result.details ?? {}) as { monitors?: MonitorSnapshot[] };
-					const list = d.monitors ?? [];
-					let summary: string;
-					if (!list.length) summary = "No monitors";
-					else if (list.length === 1) summary = `1 monitor · ${monitorSummary(list[0])}`;
-					else {
-						const shown = list.slice(0, 2).map(monitorSummary).join(" · ");
-						summary = `${list.length} monitors · ${shown}${list.length > 2 ? " …" : ""}`;
-					}
-					const detail = options.expanded
-						? list.map((record) => `${monitorSummary(record)} · ${record.description}`).join("\n")
-						: undefined;
-					return toolResult(
-						summary || resultText(result),
-						detail,
-						{ expanded: options.expanded, isPartial: options.isPartial, isError: context.isError },
-						theme,
-					);
-				},
-			},
-		};
+			detail: (d) =>
+				((d.monitors ?? []) as MonitorSnapshot[])
+					.map((record) => `${monitorSummary(record)} \u00b7 ${record.description}`)
+					.join("\n") || undefined,
+		}),
+	};
 
+	if (typeof pi.registerToolRenderer === "function") {
 		pi.registerToolRenderer((toolName, next) => {
 			if (!loadConfig().compactToolRows) return next();
 			return renderers[toolName] ?? next();
 		});
 	}
-
-	registerToolRenderers();
 
 	/** pi-cc-loop owns the shared exclusion list when it is installed. */
 	function loopToolAvailable(): boolean {
@@ -1043,8 +931,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		lastCtx = ctx;
+		cleanOldLogs();
 		if (!loopToolAvailable() && syncPiCcExtensionsExcludes(MONITOR_TOOL_NAMES, loadConfig().compactToolRows)) {
-			notify(ctx, "pi-cc-extensions excludeRenderers updated · /reload to apply", "info");
+			notify(ctx, "pi-cc-extensions excludeRenderers updated \u00b7 /reload to apply", "info");
 		}
 	});
 
@@ -1057,6 +946,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		for (const record of monitors.values()) {
 			endMonitor(record, { status: "stopped", cause: "stopped", kill: true });
 		}
+		removeExitHook();
 		monitors.clear();
 	});
 }
