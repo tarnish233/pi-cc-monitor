@@ -80,6 +80,8 @@ const CAUSE_LABEL: Record<MonitorCause, string> = {
 	flooded: "\u273b monitor stopped",
 };
 const CONFIG_CHANNEL = "pi-cc:config";
+/** This extension's slot in Pi's footer; pi-cc-loop uses "loop". */
+const STATUS_KEY = "monitor";
 
 /** Claude Code's defaults: 5 minutes, capped at 1 hour. */
 export const DEFAULT_TIMEOUT_MS = 300_000;
@@ -301,6 +303,35 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	 */
 	let disposed = false;
 
+	let lastStatusText: string | undefined;
+	let statusSet = false;
+
+	/**
+	 * One chip in Pi's footer while monitors run: `monitor 2`, in the format of
+	 * pi-cc-loop's chip (`loop 2 \u00b7 next 3m`). Claude Code shows the same count
+	 * in its footer pill ("2 monitors") and nothing when none is running. Called
+	 * when a monitor starts or ends and when the shared settings change; the
+	 * footer is UI only, the model never sees it.
+	 */
+	function refreshStatus(): void {
+		if (disposed) return;
+		const ctx = lastCtx;
+		if (!ctx || !ctx.hasUI) return;
+		try {
+			// Older Pi versions have no footer status API.
+			if (typeof ctx.ui.setStatus !== "function") return;
+			const running = [...monitors.values()].filter((record) => record.status === "running").length;
+			const text = loadConfig().footer && running > 0 ? `monitor ${running}` : undefined;
+			// Every call repaints, even with the same text, so speak only on change.
+			if (text === lastStatusText && (text !== undefined || !statusSet)) return;
+			lastStatusText = text;
+			statusSet = text !== undefined;
+			ctx.ui.setStatus(STATUS_KEY, text);
+		} catch {
+			// a stale context must never break the monitor
+		}
+	}
+
 	function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info"): void {
 		if (disposed) return;
 		try {
@@ -384,6 +415,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		}
 		if (ending.notice) deliver(record, ending.cause, [ending.notice()]);
 		if (![...monitors.values()].some((other) => other.status === "running")) removeExitHook();
+		refreshStatus();
 	}
 
 	/** Rate-limit a batch, then deliver it. */
@@ -759,6 +791,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				}
 				record = armWebSocket({ ...input, url: ws.url, protocols: ws.protocols });
 			}
+			refreshStatus();
 
 			// Claude Code's launch result: what was armed, when it expires, and the two
 			// things a model gets wrong about monitors - polling, and reading an event
@@ -870,6 +903,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	// The loop extension writes the shared config file and announces the change.
 	pi.events.on(CONFIG_CHANNEL, () => {
 		invalidateConfig();
+		// The footer may have been switched on or off.
+		refreshStatus();
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -890,6 +925,17 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		}
 		removeExitHook();
 		monitors.clear();
+		// Pi clears extension statuses when it unloads, but a reload should not
+		// leave a stale count behind until then.
+		if (statusSet) {
+			statusSet = false;
+			lastStatusText = undefined;
+			try {
+				lastCtx?.ui?.setStatus?.(STATUS_KEY, undefined);
+			} catch {
+				// the context may already be invalid
+			}
+		}
 	});
 }
 

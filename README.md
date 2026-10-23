@@ -26,6 +26,7 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 | 长度上限 | 单行 500 字符、单条通知 3000 字符，超出截断 | 自动 |
 | 限流 | 突发 10 条、之后每 2 秒 1 条；超出的事件丢弃并提示，持续超量 30 秒自动停止 | 自动 |
 | 停止/列表 | 按 id 停止、列出状态与退出码 | `monitor_stop` / `monitor_list` |
+| 底部状态 | 运行中的 monitor 数：`monitor 2`；没有运行中的就不占位 | 自动 |
 
 ## 工具
 
@@ -106,6 +107,16 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 样式开关是 `~/.pi/agent/pi-cc.json` 里的 `compactMessages`（和 pi-cc-loop 共用，用 `/loop settings messages on|off` 切换，
 或用环境变量 `PI_CC_COMPACT_MESSAGES=0|1` 覆盖）；关闭时回到旧的带底色卡片。
 
+## 底部状态
+
+有 monitor 在运行时，Pi 底部显示 `monitor 2`（运行中的个数），和 pi-cc-loop 的 `loop 2 · next 3m` 同一格式；
+全部结束后这一项消失。只在 monitor 启动或结束时更新，事件到达不会重绘底部。
+
+- 装了 `pi-cc-extensions`：作为一个芯片出现在第 2 行，可在它的配置面板里移动或隐藏
+- 没装：Pi 内置 footer 把它和其他扩展的状态按 key 排序、拼成一行，比如 `loop 1 · next 3m monitor 1`
+
+开关是两个扩展共用的 `footer`（`~/.pi/agent/pi-cc.json`，用 `/loop settings footer on|off` 切换，或用环境变量 `PI_CC_FOOTER=0|1` 覆盖）。
+
 ## 兼容性
 
 - Node.js `>=22.19.0`
@@ -132,6 +143,7 @@ npx --yes typescript@5.9.3 tsc --noEmit -p tsconfig.json
 行为对齐 Claude Code 2.1.308 的 `Monitor`，用 Pi 扩展 API 实现。有意不同的地方：
 
 - `monitor_stop` / `monitor_list` 对应 CC 的 `TaskStop` / `TaskList`。
+- 底部显示 `monitor 2`（和 pi-cc-loop 的芯片同一格式）；CC 底部的任务 pill 写作 `2 monitors`，还能选中后打开任务列表。
 - 事件是 Pi 的自定义消息（类型 `Monitor`，正文首行 `monitor <id> · <描述>`），不是 CC 的 `<task-notification>`。
 - `loopPrompt` 是额外加的：装了 pi-cc-loop 时，loop 结束会连带停掉绑定的 Monitor；CC 靠模型自己调用 `TaskStop`。
 - Pi 异常退出（没走 `session_shutdown`）时，也会在进程退出前杀掉 Monitor 的进程组。
