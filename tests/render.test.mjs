@@ -74,7 +74,8 @@ function eventMessage(content, details = {}) {
 		display: true,
 		content,
 		details: { description: "errors in deploy.log", cause: "output", eventCount: 2, monitorId: "mon1", ...details },
-		timestamp: new Date(2026, 9, 22, 22, 22).getTime(),
+		// Today, so the header shows the clock alone rather than "Oct 22 10:22pm".
+		timestamp: new Date().setHours(22, 22, 0, 0),
 	};
 }
 

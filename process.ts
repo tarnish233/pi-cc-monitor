@@ -32,19 +32,32 @@ const KILL_ESCALATION_MS = 2000;
 export function spawnMonitor(options: SpawnOptions): ChildProcess {
 	const stdoutStream = fs.createWriteStream(options.stdoutPath, { flags: "a" });
 	const stderrStream = fs.createWriteStream(options.stderrPath, { flags: "a" });
+	// The logs are a copy for the read tool; losing them (a full disk, a deleted
+	// temp dir, too many open files) must not end the watch. A stream "error"
+	// without a listener is an uncaught exception, and Pi exits on those.
+	stdoutStream.on("error", () => {});
+	stderrStream.on("error", () => {});
 
 	const useStdin = options.commandTransport === "stdin";
-	const child = spawn(options.shell, useStdin ? options.shellArgs : [...options.shellArgs, options.command], {
-		cwd: options.cwd,
-		env: options.env,
-		// detached gives the child its own process group, so the whole tree can
-		// be signalled with a negative pid.
-		detached: process.platform !== "win32",
-		// stdout and stderr stay piped: the caller needs the stdout events, and
-		// both streams are also copied to their output files.
-		stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
-		windowsHide: true,
-	});
+	let child: ChildProcess;
+	try {
+		child = spawn(options.shell, useStdin ? options.shellArgs : [...options.shellArgs, options.command], {
+			cwd: options.cwd,
+			env: options.env,
+			// detached gives the child its own process group, so the whole tree can
+			// be signalled with a negative pid.
+			detached: process.platform !== "win32",
+			// stdout and stderr stay piped: the caller needs the stdout events, and
+			// both streams are also copied to their output files.
+			stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
+			windowsHide: true,
+		});
+	} catch (error) {
+		// Nothing will ever close the logs if the process never started.
+		stdoutStream.end();
+		stderrStream.end();
+		throw error;
+	}
 
 	if (useStdin) {
 		child.stdin?.on("error", () => {});

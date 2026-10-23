@@ -40,7 +40,7 @@ import { Type } from "typebox";
 import { invalidateConfig, loadConfig } from "./config.ts";
 import { killTree, spawnMonitor } from "./process.ts";
 import { MONITOR_DESCRIPTION, MONITOR_LIST_SNIPPET, MONITOR_SNIPPET, MONITOR_STOP_SNIPPET } from "./prompts.ts";
-import { monitorEnv, monitorShell } from "./shell.ts";
+import { monitorEnv, monitorShell, type MonitorShell } from "./shell.ts";
 import { LineBatcher, RateLimiter } from "./stream.ts";
 import {
 	bodyLines,
@@ -221,6 +221,14 @@ function generateId(): string {
 	let out = "";
 	for (let i = 0; i < 8; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
 	return out;
+}
+
+/** "30 minutes" for the usual timeouts, "5 seconds" for the short ones. */
+function lifetimeText(ms: number): string {
+	const minutes = Math.round(ms / 60_000);
+	if (minutes >= 1) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+	const seconds = Math.max(1, Math.round(ms / 1000));
+	return `${seconds} second${seconds === 1 ? "" : "s"}`;
 }
 
 function eventsText(count: number): string {
@@ -501,9 +509,27 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 
 	function armCommand(input: ArmInput & { command: string }, ctx: ExtensionContext): MonitorRecord {
 		const record = createRecord("command", input, { command: input.command });
-		const shell = monitorShell();
-		record.child = spawnMonitor({
-			command: input.command,
+		try {
+			// getShellConfig() throws when no usable shell is found.
+			record.child = spawnCommand(record, input.command, monitorShell(), ctx);
+		} catch (error) {
+			// Nothing is running, so nothing may be listed as running.
+			endMonitor(record, { status: "failed", cause: "error" });
+			throw new Error(`Could not start the monitor: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		installExitHook();
+		startTimeout(record);
+		return record;
+	}
+
+	function spawnCommand(
+		record: MonitorRecord,
+		command: string,
+		shell: MonitorShell,
+		ctx: ExtensionContext,
+	) {
+		return spawnMonitor({
+			command,
 			cwd: ctx.cwd,
 			env: monitorEnv(),
 			shell: shell.shell,
@@ -539,9 +565,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				});
 			},
 		});
-		installExitHook();
-		startTimeout(record);
-		return record;
 	}
 
 	function armWebSocket(input: ArmInput & { url: string; protocols?: string[] }): MonitorRecord {
@@ -742,7 +765,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			// as the user's answer.
 			const lifetime = record.persistent
 				? "runs until you stop it or the session ends"
-				: `expires in ${Math.round(record.timeoutMs / 60_000)} minute${Math.round(record.timeoutMs / 60_000) === 1 ? "" : "s"} unless the source ends first; ` +
+				: `expires in ${lifetimeText(record.timeoutMs)} unless the source ends first; ` +
 					"you get one notice at expiry \u2014 re-arm if you still need the watch";
 			return {
 				content: [

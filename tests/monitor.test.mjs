@@ -582,6 +582,49 @@ test("a one minute timeout is not '1 minutes'", async () => {
 	assert.match(armed.content[0].text, /expires in 1 minute unless/);
 });
 
+test("a sub-minute timeout is not 'expires in 0 minutes'", async () => {
+	const h = await start(makeHarness());
+	const armed = await h.tools
+		.get("Monitor")
+		.execute("c", { command: "sleep 1", description: "quick", timeout_ms: 5_000 }, undefined, undefined, h.ctx);
+	assert.match(armed.content[0].text, /expires in 5 seconds unless/);
+});
+
+test("an unwritable output log does not crash Pi", async () => {
+	const { spawnMonitor } = await loadModule("process.ts");
+	const missing = path.join(os.tmpdir(), `pi-cc-monitor-missing-${process.pid}`, "nested");
+	// A stream "error" without a listener is thrown as an uncaught exception,
+	// and Pi exits on uncaught exceptions.
+	const exit = await new Promise((resolve) => {
+		spawnMonitor({
+			command: "echo hi",
+			cwd: os.tmpdir(),
+			env: process.env,
+			shell: "/bin/sh",
+			shellArgs: ["-c"],
+			commandTransport: "argv",
+			stdoutPath: path.join(missing, "out.log"),
+			stderrPath: path.join(missing, "err.log"),
+			onStdout: () => {},
+			onStderr: () => {},
+			onExit: (code) => resolve(code),
+			onError: () => resolve("error"),
+		});
+	});
+	assert.equal(exit, 0, "the command still runs and reports its exit");
+});
+
+test("a monitor that fails to start is not listed as running", async () => {
+	const h = await start(makeHarness());
+	h.ctx.cwd = 42; // makes spawn throw synchronously
+	await assert.rejects(
+		h.tools.get("Monitor").execute("c", { command: "echo hi", description: "never" }, undefined, undefined, h.ctx),
+		/Could not start the monitor/,
+	);
+	const listed = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
+	assert.ok(!/\brunning\b/.test(listed.content[0].text), listed.content[0].text);
+});
+
 // -------------------------------------------------------------- rate limits
 
 test("the rate limiter follows Claude Code: 10 at once, then one every 2s", () => {
