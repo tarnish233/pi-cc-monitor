@@ -38,6 +38,7 @@ import type { ChildProcess } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { invalidateConfig, loadConfig } from "./config.ts";
+import { CONFIG_CHANNEL, registerPiCcCommand } from "./settings.ts";
 import { killTree, spawnMonitor } from "./process.ts";
 import { MONITOR_DESCRIPTION, MONITOR_LIST_SNIPPET, MONITOR_SNIPPET, MONITOR_STOP_SNIPPET } from "./prompts.ts";
 import { monitorEnv, monitorShell, prefixedCommand, type MonitorShell, type ShellSettings } from "./shell.ts";
@@ -79,7 +80,6 @@ const CAUSE_LABEL: Record<MonitorCause, string> = {
 	stopped: "\u273b monitor stopped",
 	flooded: "\u273b monitor stopped",
 };
-const CONFIG_CHANNEL = "pi-cc:config";
 /** This extension's slot in Pi's footer; pi-cc-loop uses "loop". */
 const STATUS_KEY = "monitor";
 
@@ -915,7 +915,12 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// The loop extension writes the shared config file and announces the change.
+	// The shared pi-cc settings and their /pi_cc command. The first pi-cc
+	// package to load registers it; this one re-claims its own claim on /reload.
+	registerPiCcCommand(pi, "pi-cc-monitor");
+
+	// A pi-cc package changed the shared settings (loop, monitor or plugins
+	// all carry the command): the footer follows.
 	pi.events.on(CONFIG_CHANNEL, () => {
 		invalidateConfig();
 		// The footer may have been switched on or off.

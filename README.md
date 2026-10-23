@@ -105,7 +105,7 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 `monitor failed`（启动或连接失败）、`monitor closed`（WebSocket 关闭）、`monitor stopped`（手动停止或输出过多被停）。
 折叠时正文最多 3 行，Ctrl+O 展开后多一行元信息（id、事件数、退出码）。
 
-样式开关是 `~/.pi/agent/pi-cc.json` 里的 `compactMessages`（和 pi-cc-loop 共用，用 `/loop settings` 面板或 `/loop settings messages on|off` 切换，
+样式开关是 `~/.pi/agent/pi-cc.json` 里的 `compactMessages`（三个 pi-cc 扩展共用，用 `/pi_cc` 面板或 `/pi_cc messages on|off` 切换，
 或用环境变量 `PI_CC_COMPACT_MESSAGES=0|1` 覆盖）；关闭时回到旧的带底色卡片。
 
 ## 底部状态
@@ -116,7 +116,11 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 - 装了 `pi-cc-extensions`：作为一个芯片出现在第 2 行，可在它的配置面板里移动或隐藏
 - 没装：Pi 内置 footer 把它和其他扩展的状态按 key 排序、拼成一行，比如 `loop 1 · next 3m monitor 1`
 
-开关是两个扩展共用的 `footer`（`~/.pi/agent/pi-cc.json`，用 `/loop settings` 面板或 `/loop settings footer on|off` 切换，或用环境变量 `PI_CC_FOOTER=0|1` 覆盖）。
+开关是三个扩展共用的 `footer`（`~/.pi/agent/pi-cc.json`，用 `/pi_cc` 面板或 `/pi_cc footer on|off` 切换，或用环境变量 `PI_CC_FOOTER=0|1` 覆盖）。
+
+`/pi_cc` 由三个 pi-cc 包（loop、monitor、plugins）共同提供：装了其中任意一个，命令就在；装了多个，也只有一个 `/pi_cc`
+（同名命令会被 Pi 改名成 `/pi_cc:1`、`/pi_cc:2`，所以由最先加载的包认领注册）。本包从 0.6.0 起也提供它；
+之前设置要靠 pi-cc-loop 的 `/loop settings`，现在只装 monitor 也能调。
 
 ## 兼容性
 
