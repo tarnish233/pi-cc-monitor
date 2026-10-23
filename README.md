@@ -119,6 +119,12 @@ node --test tests/*.test.mjs
 npx --yes typescript@5.9.3 tsc --noEmit -p tsconfig.json
 ```
 
+### 缓存约束
+
+提示缓存按前缀匹配（工具 → system prompt → 消息）。本扩展只往对话末尾追加事件消息：不注册会改 prompt 或历史的钩子
+（`before_agent_start` / `context` / `context_with_system` / `before_provider_request`），工具在加载时注册且描述固定。
+`tests/cache.test.mjs` 守住这一点；真实 provider 的检查在 pi-cc-loop 的 `scripts/cache-check.mjs`，它会一起加载本扩展，覆盖 Monitor 事件。
+
 ## 说明
 
 - 行为对齐 Claude Code v2.1.306 的 `Monitor`，用 Pi 扩展 API 实现。
