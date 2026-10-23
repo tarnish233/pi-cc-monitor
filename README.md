@@ -79,6 +79,7 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 
 ## 规则
 
+- 命令和 Pi 的 bash 工具一样执行：用 Pi 设置里的 `shellPath`（支持开头的 `~`）和 `shellCommandPrefix`，PATH 最前面是 Pi 的 `bin` 目录
 - 只有 stdout 是事件流；stderr 写进文件，不触发唤醒
 - 退出、停止、超时都只发一条结束通知；停止之后的输出会被丢弃
 - 空行不算事件；超长内容以 `...(truncated)` 截断

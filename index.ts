@@ -40,7 +40,7 @@ import { Type } from "typebox";
 import { invalidateConfig, loadConfig } from "./config.ts";
 import { killTree, spawnMonitor } from "./process.ts";
 import { MONITOR_DESCRIPTION, MONITOR_LIST_SNIPPET, MONITOR_SNIPPET, MONITOR_STOP_SNIPPET } from "./prompts.ts";
-import { monitorEnv, monitorShell, type MonitorShell } from "./shell.ts";
+import { monitorEnv, monitorShell, prefixedCommand, type MonitorShell, type ShellSettings } from "./shell.ts";
 import { LineBatcher, RateLimiter } from "./stream.ts";
 import {
 	bodyLines,
@@ -539,11 +539,26 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		record.timeoutTimer.unref?.();
 	}
 
+	/**
+	 * `shellPath` and `shellCommandPrefix` from the session's effective settings,
+	 * the ones Pi's bash tool uses: global and project merged under Pi's trust
+	 * rules, so an untrusted project cannot pick the shell.
+	 */
+	function shellSettings(): ShellSettings {
+		try {
+			const settings = typeof pi.getSettings === "function" ? pi.getSettings() : undefined;
+			return { shellPath: settings?.shellPath, shellCommandPrefix: settings?.shellCommandPrefix };
+		} catch {
+			return {};
+		}
+	}
+
 	function armCommand(input: ArmInput & { command: string }, ctx: ExtensionContext): MonitorRecord {
 		const record = createRecord("command", input, { command: input.command });
 		try {
-			// getShellConfig() throws when no usable shell is found.
-			record.child = spawnCommand(record, input.command, monitorShell(), ctx);
+			const settings = shellSettings();
+			// getShellConfig() throws when shellPath does not exist or no usable shell is found.
+			record.child = spawnCommand(record, prefixedCommand(input.command, settings), monitorShell(settings), ctx);
 		} catch (error) {
 			// Nothing is running, so nothing may be listed as running.
 			endMonitor(record, { status: "failed", cause: "error" });
