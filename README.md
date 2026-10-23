@@ -2,17 +2,17 @@
 
 > 把 Claude Code 的 `Monitor` 搬到 Pi：后台命令或 WebSocket 的每一行输出都是一个事件，事件会唤醒 agent。
 
-## 快速开始
+## 安装
 
 ```bash
-# 本地开发：把仓库软链接到 Pi 扩展目录
-ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
-
-# 发布后
 pi install npm:pi-cc-monitor
 ```
 
-安装后执行 `/reload`。
+安装后执行 `/reload`。本地开发时把仓库软链接到扩展目录即可：
+
+```bash
+ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
+```
 
 ## 功能
 
@@ -44,7 +44,7 @@ pi install npm:pi-cc-monitor
 | `description` | string | 出现在每条通知里 |
 | `timeout_ms` | number? | 1000–3600000，默认 300000 |
 | `persistent` | boolean? | 会话级常驻，不超时 |
-| `loopPrompt` | string? | 所属 `/loop` 的 prompt（原样）；loop 结束时连带停止 |
+| `loopPrompt` | string? | 所属 `/loop` 的 prompt（原样），loop 结束时连带停止；只在装了 `pi-cc-loop` 时生效，否则忽略 |
 
 `command` 和 `ws` 二选一。
 
@@ -74,14 +74,14 @@ pi install npm:pi-cc-monitor
 /loop check whether the deploy finished
 ```
 
-模型会起一个带 `loopPrompt` 的 Monitor。事件到达即唤醒 agent；`schedule_wakeup` 的延迟是兜底心跳，事件不会取消它。loop 结束时，绑定的 Monitor 会被静默停止。
+下一步要等外部事件时，模型会起一个带 `loopPrompt` 的 Monitor。事件到达即唤醒 agent；`schedule_wakeup` 的延迟是兜底心跳，事件不会取消它。loop 结束时，绑定的 Monitor 会被静默停止。
 
 ## 规则
 
 - 只有 stdout 是事件流；stderr 写进文件，不触发唤醒
 - 退出、停止、超时都只发一条结束通知；停止之后的输出会被丢弃
 - 空行不算事件；超长内容以 `...(truncated)` 截断
-- 输出日志在 `$TMPDIR/pi-cc-monitor/`，保留 3 天
+- 输出日志在 `$TMPDIR/pi-cc-monitor/`，保留 3 天；日志写不进去（磁盘满、临时目录被删）不影响监视
 - 管道要逐行 flush：`grep --line-buffered`；`head` 不行
 - 只匹配成功标记的脚本在 crash/hang 时会静默；把 `ERROR|FAILED|Killed` 也覆盖进去
 - `tail -f` / `while true` 不会自己退出；不需要时用 `monitor_stop` 或 `timeout_ms`
@@ -99,18 +99,20 @@ pi install npm:pi-cc-monitor
    [Monitor ended — exit code 0, 3 events delivered]
 ```
 
-表头按原因分：`monitor`（有事件）、`monitor ended`（命令退出）、`monitor expired`
-（超时）、`monitor failed`（启动/连接失败）、`monitor closed`（WS 关闭）、
-`monitor stopped`（手动停止或洪泛）。折叠时正文最多 3 行，Ctrl+O 展开后多一行元信息
-（id、事件数、退出码）。`compactMessages` 为 off 时回到旧的带底色卡片。
+表头按原因分：`monitor`（有事件）、`monitor ended`（命令退出）、`monitor expired`（超时）、
+`monitor failed`（启动或连接失败）、`monitor closed`（WebSocket 关闭）、`monitor stopped`（手动停止或输出过多被停）。
+折叠时正文最多 3 行，Ctrl+O 展开后多一行元信息（id、事件数、退出码）。
 
-> 本扩展不写其他插件的配置文件。
+样式开关是 `~/.pi/agent/pi-cc.json` 里的 `compactMessages`（和 pi-cc-loop 共用，用 `/loop settings messages on|off` 切换，
+或用环境变量 `PI_CC_COMPACT_MESSAGES=0|1` 覆盖）；关闭时回到旧的带底色卡片。
 
 ## 兼容性
 
 - Node.js `>=22.19.0`
-- Pi `1.3.0`（开发环境）
+- Pi 1.3.0、1.4.0（测试通过）
 - `pi-cc-loop` 可选；两者通过 `pi.events` 通信
+- 与 `pi-cc-extensions` 共存。本扩展不写其他插件的配置文件；旧版本在 `pi-cc-extensions.json` 里加过的
+  `Monitor`、`monitor_stop`、`monitor_list` 这几条 `excludeRenderers` 可以删掉
 
 ## 本地开发
 
@@ -125,12 +127,13 @@ npx --yes typescript@5.9.3 tsc --noEmit -p tsconfig.json
 （`before_agent_start` / `context` / `context_with_system` / `before_provider_request`），工具在加载时注册且描述固定。
 `tests/cache.test.mjs` 守住这一点；真实 provider 的检查在 pi-cc-loop 的 `scripts/cache-check.mjs`，它会一起加载本扩展，覆盖 Monitor 事件。
 
-## 说明
+## 与 Claude Code 的差异
 
-- 行为对齐 Claude Code v2.1.306 的 `Monitor`，用 Pi 扩展 API 实现。
+行为对齐 Claude Code 2.1.308 的 `Monitor`，用 Pi 扩展 API 实现。有意不同的地方：
+
 - `monitor_stop` / `monitor_list` 对应 CC 的 `TaskStop` / `TaskList`。
-- 事件来源用消息前缀 `[monitor · ...]` 标记，而不是 CC 的 `<task-notification>` 元数据。
-- 和 `pi-cc-loop` 一起用时，`/loop stop` 会停掉该 chain 绑定的 Monitor。
+- 事件是 Pi 的自定义消息（类型 `Monitor`，正文首行 `monitor <id> · <描述>`），不是 CC 的 `<task-notification>`。
+- `loopPrompt` 是额外加的：装了 pi-cc-loop 时，loop 结束会连带停掉绑定的 Monitor；CC 靠模型自己调用 `TaskStop`。
 - Pi 异常退出（没走 `session_shutdown`）时，也会在进程退出前杀掉 Monitor 的进程组。
 
 ## 许可证
