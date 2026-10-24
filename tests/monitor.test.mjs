@@ -244,6 +244,64 @@ test("each stdout line becomes one notification", async () => {
 	assert.equal(h.sent[0].message.details.eventCount, 3);
 });
 
+/** A stand-in for WebSocket: records instances, sends frames, can fail to construct. */
+function fakeWebSocket({ constructError } = {}) {
+	const sockets = [];
+	class FakeWebSocket {
+		constructor(url, protocols) {
+			if (constructError) throw constructError;
+			this.url = url;
+			this.protocols = protocols;
+			this.listeners = new Map();
+			sockets.push(this);
+		}
+		addEventListener(name, fn) {
+			(this.listeners.get(name) ?? this.listeners.set(name, []).get(name)).push(fn);
+		}
+		emit(name, event) {
+			for (const fn of this.listeners.get(name) ?? []) fn(event);
+		}
+		close() {
+			this.emit("close", { code: 1000 });
+		}
+	}
+	return { sockets, WebSocket: FakeWebSocket };
+}
+
+test("a ws monitor writes the frames it receives to its log file, and reports it", async () => {
+	const saved = globalThis.WebSocket;
+	const fake = fakeWebSocket();
+	globalThis.WebSocket = fake.WebSocket;
+	try {
+		const h = await start(makeHarness());
+		const tool = h.tools.get("Monitor");
+		const armed = await tool.execute("c", { ws: { url: "ws://x.example/feed" }, description: "feed" }, undefined, undefined, h.ctx);
+		assert.ok(fs.existsSync(armed.details.outputPath), "the output path exists");
+		const socket = fake.sockets[0];
+		socket.emit("message", { data: "frame one" });
+		socket.emit("message", { data: "frame two" });
+		await waitFor(() => h.sent.length > 0, 5000);
+		assert.equal(fs.readFileSync(armed.details.outputPath, "utf8"), "frame one\nframe two\n", "the frames are in the log");
+	} finally {
+		globalThis.WebSocket = saved;
+	}
+});
+
+test("a ws monitor that cannot even open fails like a command monitor that cannot spawn", async () => {
+	const saved = globalThis.WebSocket;
+	globalThis.WebSocket = fakeWebSocket({ constructError: new Error("bad url") }).WebSocket;
+	try {
+		const h = await start(makeHarness());
+		await assert.rejects(
+			() => h.tools.get("Monitor").execute("c", { ws: { url: "ws://x.example/feed" }, description: "feed" }, undefined, undefined, h.ctx),
+			/bad url/,
+			`the launch itself fails, no Monitor started result`,
+		);
+	} finally {
+		globalThis.WebSocket = saved;
+	}
+});
+
 test("the exit ends the watch and is reported", async () => {
 	const h = await start(makeHarness());
 	const tool = h.tools.get("Monitor");

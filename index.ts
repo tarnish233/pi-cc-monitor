@@ -614,8 +614,21 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		});
 	}
 
+	/** The frames a ws monitor receives, copied to its output log like a command's stdout. */
+	function wsLog(record: MonitorRecord): (line: string) => void {
+		// The launch result names the file, and monitor_list reports it as the
+		// place to read the events from: create it now, not at the first frame.
+		const fd = fs.openSync(record.outputPath, "a");
+		const stream = fs.createWriteStream(record.outputPath, { fd, flags: "a" });
+		// A log write that fails (a full disk, a deleted temp dir) must not end the
+		// watch: a stream "error" without a listener is an uncaught exception.
+		stream.on("error", () => {});
+		return (line) => stream.write(`${line}\n`);
+	}
+
 	function armWebSocket(input: ArmInput & { url: string; protocols?: string[] }): MonitorRecord {
 		const record = createRecord("ws", input, { wsUrl: input.url });
+		const log = wsLog(record);
 		try {
 			const socket = input.protocols?.length
 				? new WebSocket(input.url, input.protocols)
@@ -625,11 +638,10 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			socket.addEventListener("message", (event: MessageEvent) => {
 				if (record.status !== "running") return;
 				const data = event.data;
-				if (typeof data === "string") {
-					record.batcher?.push(`${data}\n`);
-					return;
-				}
-				record.batcher?.push(`[binary frame, ${byteLengthOf(data)} bytes]\n`);
+				const line =
+					typeof data === "string" ? data : `[binary frame, ${byteLengthOf(data)} bytes]`;
+				log(line);
+				record.batcher?.push(`${line}\n`);
 			});
 			socket.addEventListener("error", () => {
 				// Errors are surfaced before the close.
@@ -650,8 +662,12 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				});
 			});
 		} catch (error) {
+			// A socket that never opened is a launch failure, like a command that
+			// could not spawn: the tool call fails instead of reporting a monitor
+			// that is already dead.
 			const message = error instanceof Error ? error.message : String(error);
-			endMonitor(record, { status: "failed", cause: "error", notice: () => `[Monitor failed \u2014 ${message}]` });
+			endMonitor(record, { status: "failed", cause: "error" });
+			throw new Error(`Could not start the monitor: ${message}`);
 		}
 		startTimeout(record);
 		return record;
