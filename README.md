@@ -116,10 +116,10 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 - 装了 `pi-cc-extensions`：作为一个芯片出现在第 2 行，可在它的配置面板里移动或隐藏
 - 没装：Pi 内置 footer 把它和其他扩展的状态按 key 排序、拼成一行，比如 `loop 1 · next 3m monitor 1`
 
-开关是三个扩展共用的 `footer`（`~/.pi/agent/pi-cc.json`，用 `/pi_cc` 面板或 `/pi_cc footer on|off` 切换，或用环境变量 `PI_CC_FOOTER=0|1` 覆盖）。
+开关是 pi-cc 扩展共用的 `footer`（`~/.pi/agent/pi-cc.json`，用 `/pi_cc` 面板或 `/pi_cc footer on|off` 切换，或用环境变量 `PI_CC_FOOTER=0|1` 覆盖）。
 
-`/pi_cc` 由三个 pi-cc 包（loop、monitor、plugins）共同提供：装了其中任意一个，命令就在；装了多个，也只有一个 `/pi_cc`
-（同名命令会被 Pi 改名成 `/pi_cc:1`、`/pi_cc:2`，所以由最先加载的包认领注册）。本包从 0.6.0 起也提供它；面板共四项，Draft recall 和 Turn summary 属于 pi-cc-plugins（装了才生效）；
+`/pi_cc` 由四个 pi-cc 包（loop、monitor、plugins、compact）共同提供：装了其中任意一个，命令就在；装了多个，也只有一个 `/pi_cc`
+（同名命令会被 Pi 改名成 `/pi_cc:1`、`/pi_cc:2`，所以由最先加载的包认领注册）。本包从 0.6.0 起也提供它；面板共六项，Draft recall 和 Turn summary 属于 pi-cc-plugins，CC compaction 和 Idle compaction 属于 pi-cc-compact（装了才生效）；
 之前设置要靠 pi-cc-loop 的 `/loop settings`，现在只装 monitor 也能调。
 
 ## 兼容性
