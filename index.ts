@@ -124,6 +124,8 @@ export interface MonitorRecord {
 	stderrPath: string;
 	child?: ChildProcess;
 	socket?: WebSocket;
+	/** Closes a ws monitor's log; a command monitor's logs close with its process. */
+	closeLog?: () => void;
 	timeoutTimer?: ReturnType<typeof setTimeout>;
 	batcher?: LineBatcher;
 	limiter: RateLimiter;
@@ -413,6 +415,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				// already closed
 			}
 		}
+		record.closeLog?.();
 		if (ending.notice) deliver(record, ending.cause, [ending.notice()]);
 		if (![...monitors.values()].some((other) => other.status === "running")) removeExitHook();
 		refreshStatus();
@@ -614,7 +617,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		});
 	}
 
-	/** The frames a ws monitor receives, copied to its output log like a command's stdout. */
+	/** The frames a ws monitor receives, copied to its output log like a command's stdout; closed when the monitor ends. */
 	function wsLog(record: MonitorRecord): (line: string) => void {
 		// The launch result names the file, and monitor_list reports it as the
 		// place to read the events from: create it now, not at the first frame.
@@ -623,6 +626,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		// A log write that fails (a full disk, a deleted temp dir) must not end the
 		// watch: a stream "error" without a listener is an uncaught exception.
 		stream.on("error", () => {});
+		record.closeLog = () => stream.end();
 		return (line) => stream.write(`${line}\n`);
 	}
 

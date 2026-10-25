@@ -302,6 +302,35 @@ test("a ws monitor that cannot even open fails like a command monitor that canno
 	}
 });
 
+test("a ws monitor's log is closed when the watch ends, or never starts", async () => {
+	const saved = globalThis.WebSocket;
+	const savedCreate = fs.createWriteStream;
+	const streams = [];
+	fs.createWriteStream = (...args) => {
+		const stream = savedCreate.apply(fs, args);
+		streams.push(stream);
+		return stream;
+	};
+	try {
+		const fake = fakeWebSocket();
+		globalThis.WebSocket = fake.WebSocket;
+		const h = await start(makeHarness());
+		await h.tools.get("Monitor").execute("c", { ws: { url: "ws://x.example/feed" }, description: "feed" }, undefined, undefined, h.ctx);
+		assert.equal(streams.length, 1);
+		assert.equal(streams[0].writableEnded, false, "open while the watch runs");
+		fake.sockets[0].close();
+		assert.equal(streams[0].writableEnded, true, "closed with the socket");
+
+		globalThis.WebSocket = fakeWebSocket({ constructError: new Error("bad url") }).WebSocket;
+		await assert.rejects(() => h.tools.get("Monitor").execute("c", { ws: { url: "ws://x.example/feed" }, description: "feed" }, undefined, undefined, h.ctx));
+		assert.equal(streams.length, 2);
+		assert.equal(streams[1].writableEnded, true, "a socket that never opened leaves no log open");
+	} finally {
+		fs.createWriteStream = savedCreate;
+		globalThis.WebSocket = saved;
+	}
+});
+
 test("the exit ends the watch and is reported", async () => {
 	const h = await start(makeHarness());
 	const tool = h.tools.get("Monitor");
