@@ -1,6 +1,6 @@
 {
 	"name": "pi-cc-monitor",
-	"version": "0.7.0",
+	"version": "0.7.1",
 	"description": "Claude Code compatible Monitor for the Pi coding agent: a background watch that turns stdout lines or WebSocket frames into notifications that wake the agent.",
 	"author": "tarnish233",
 	"type": "module",
