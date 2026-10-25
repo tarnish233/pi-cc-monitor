@@ -657,7 +657,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					notice: () => "[WebSocket error]",
 				});
 			});
-			socket.addEventListener("close", (event: CloseEvent) => {
+			socket.addEventListener("close", (event: { code: number }) => {
 				endMonitor(record, {
 					status: "exited",
 					cause: "closed",
