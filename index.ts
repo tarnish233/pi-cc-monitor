@@ -131,8 +131,8 @@ export interface MonitorRecord {
 	limiter: RateLimiter;
 }
 
-/** A serializable view of a monitor, safe to put in tool result details. */
-export interface MonitorSnapshot {
+/** A serializable view of a monitor, safe to put in tool result details (and in a codemode script). */
+export type MonitorSnapshot = {
 	id: string;
 	kind: "command" | "ws";
 	description: string;
@@ -151,7 +151,7 @@ export interface MonitorSnapshot {
 	pid?: number;
 	outputPath: string;
 	stderrPath: string;
-}
+};
 
 // ------------------------------------------------------------------ helpers
 
@@ -777,6 +777,15 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			),
 		}),
 		annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+		// What a codemode script gets: the task id and paths as values (Pi sends the shape, not this).
+		outputSchema: Type.Object({
+			taskId: Type.String(),
+			timeoutMs: Type.Number(),
+			persistent: Type.Boolean(),
+			kind: Type.Union([Type.Literal("command"), Type.Literal("ws")]),
+			outputPath: Type.String(),
+			stderrPath: Type.String(),
+		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			lastCtx = ctx;
 
@@ -835,6 +844,14 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				? "runs until you stop it or the session ends"
 				: `expires in ${lifetimeText(record.timeoutMs)} unless the source ends first; ` +
 					"you get one notice at expiry \u2014 re-arm if you still need the watch";
+			const value = {
+				taskId: record.id,
+				timeoutMs: record.timeoutMs,
+				persistent: record.persistent,
+				kind: record.kind,
+				outputPath: record.outputPath,
+				stderrPath: record.stderrPath,
+			};
 			return {
 				content: [
 					{
@@ -845,14 +862,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 							"Events may arrive while you are waiting for the user \u2014 an event is not their reply.",
 					},
 				],
-				details: {
-					taskId: record.id,
-					timeoutMs: record.timeoutMs,
-					persistent: record.persistent,
-					kind: record.kind,
-					outputPath: record.outputPath,
-					stderrPath: record.stderrPath,
-				},
+				details: value,
+				structuredContent: value,
 			};
 		},
 	});
@@ -866,21 +877,26 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			id: Type.String({ description: "The monitor id returned by Monitor." }),
 		}),
 		annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+		outputSchema: Type.Object({ stopped: Type.Boolean(), id: Type.String(), status: Type.Optional(Type.String()) }),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			lastCtx = ctx;
 			const record = monitors.get(params.id);
 			if (!record) {
+				const value = { stopped: false, id: params.id };
 				return {
 					content: [{ type: "text" as const, text: `No monitor found with ID: ${params.id}` }],
-					details: { stopped: false, id: params.id },
+					details: value,
+					structuredContent: value,
 				};
 			}
 			if (record.status !== "running") {
+				const value = { stopped: false, id: params.id, status: record.status };
 				return {
 					content: [
 						{ type: "text" as const, text: `Monitor ${params.id} is not running (${record.status}).` },
 					],
-					details: { stopped: false, id: params.id, status: record.status },
+					details: value,
+					structuredContent: value,
 				};
 			}
 			endMonitor(record, {
@@ -890,12 +906,14 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				kill: true,
 				notice: () => STOPPED_NOTICE,
 			});
+			const value = { stopped: true, id: params.id };
 			return {
 				// Claude Code's TaskStop result, with the description in place of the command.
 				content: [
 					{ type: "text" as const, text: `Successfully stopped monitor: ${params.id} (${record.description})` },
 				],
-				details: { stopped: true, id: params.id },
+				details: value,
+				structuredContent: value,
 			};
 		},
 	});
@@ -907,13 +925,37 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		promptSnippet: MONITOR_LIST_SNIPPET,
 		parameters: Type.Object({}),
 		annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+		outputSchema: Type.Object({
+			monitors: Type.Array(
+				Type.Object({
+					id: Type.String(),
+					kind: Type.Union([Type.Literal("command"), Type.Literal("ws")]),
+					description: Type.String(),
+					command: Type.Optional(Type.String()),
+					wsUrl: Type.Optional(Type.String()),
+					timeoutMs: Type.Number(),
+					persistent: Type.Boolean(),
+					createdAt: Type.Number(),
+					eventCount: Type.Number(),
+					suppressedCount: Type.Number(),
+					status: Type.String(),
+					endedAt: Type.Optional(Type.Number()),
+					exitCode: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
+					loopPrompt: Type.Optional(Type.String()),
+					pid: Type.Optional(Type.Number()),
+					outputPath: Type.String(),
+					stderrPath: Type.String(),
+				}),
+			),
+		}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			lastCtx = ctx;
 			const list = [...monitors.values()].map(snapshotMonitor);
 			if (!list.length) {
 				return {
 					content: [{ type: "text" as const, text: "No monitors." }],
-					details: { monitors: [] },
+					details: { monitors: list },
+					structuredContent: { monitors: list },
 				};
 			}
 			const text = list
@@ -931,6 +973,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			return {
 				content: [{ type: "text" as const, text }],
 				details: { monitors: list },
+				structuredContent: { monitors: list },
 			};
 		},
 	});

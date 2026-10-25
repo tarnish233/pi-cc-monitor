@@ -3,11 +3,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { loadModule } from "./helpers.mjs";
+import { pathToFileURL } from "node:url";
+import { findPiInstall, loadModule } from "./helpers.mjs";
 
 const mod = await loadModule("index.ts");
 const stream = await loadModule("stream.ts");
 const factory = mod.default;
+// TypeBox's own validator, from the Pi installation the extension runs on.
+const install = findPiInstall();
+const { Compile } = await import(pathToFileURL(path.join(install.root, "typebox", "build", "compile", "index.mjs")).href);
 
 function makeHarness() {
 	const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cc-monitor-t-"));
@@ -845,4 +849,46 @@ test("a chained monitor's notifications name their loop", async () => {
 	for (const entry of h.sent) {
 		assert.equal(entry.message.details.loopPrompt, "check the deploy", "pi-cc-loop knows whose turn an event starts");
 	}
+});
+
+test("every tool gives codemode scripts structuredContent that matches its outputSchema", async () => {
+	const check = (schema, value) => Compile(schema).Check(value);
+	const h = await start(makeHarness());
+	const mon = h.tools.get("Monitor");
+	assert.ok(mon.outputSchema, "Monitor declares an outputSchema");
+	const armed = await mon.execute("c", { command: "printf 'one\\n'", description: "test monitor" }, undefined, undefined, h.ctx);
+	assert.ok(armed.structuredContent, "Monitor returns structuredContent");
+	assert.equal(check(mon.outputSchema, armed.structuredContent), true, JSON.stringify(armed.structuredContent));
+
+	const list = h.tools.get("monitor_list");
+	assert.ok(list.outputSchema, "monitor_list declares an outputSchema");
+	const listed = await list.execute("c", {}, undefined, undefined, h.ctx);
+	assert.equal(check(list.outputSchema, listed.structuredContent), true, JSON.stringify(listed.structuredContent));
+
+	const stop = h.tools.get("monitor_stop");
+	assert.ok(stop.outputSchema, "monitor_stop declares an outputSchema");
+	const missed = await stop.execute("c", { id: "nope" }, undefined, undefined, h.ctx);
+	assert.equal(check(stop.outputSchema, missed.structuredContent), true);
+	const stopped = await stop.execute("c", { id: armed.details.taskId }, undefined, undefined, h.ctx);
+	assert.equal(check(stop.outputSchema, stopped.structuredContent), true);
+	await h.handlers.get("session_shutdown")?.({ reason: "quit" }, h.ctx);
+});
+
+test("a script gets the task id and the log paths as values", async () => {
+	const h = await start(makeHarness());
+	const armed = await h.tools.get("Monitor").execute("c", { command: "printf 'one\\n'", description: "test monitor" }, undefined, undefined, h.ctx);
+	assert.match(armed.structuredContent.taskId, /^\w+$/);
+	assert.equal(armed.structuredContent.taskId, armed.details.taskId);
+	assert.equal(armed.structuredContent.kind, "command");
+	assert.equal(typeof armed.structuredContent.outputPath, "string");
+
+	const listed = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
+	assert.deepEqual(listed.structuredContent.monitors.map((monitor) => monitor.id), [armed.details.taskId]);
+	assert.equal(listed.structuredContent.monitors[0].status, "running");
+
+	const stopped = await h.tools.get("monitor_stop").execute("c", { id: armed.details.taskId }, undefined, undefined, h.ctx);
+	assert.deepEqual(stopped.structuredContent, { stopped: true, id: armed.details.taskId });
+	const again = await h.tools.get("monitor_stop").execute("c", { id: armed.details.taskId }, undefined, undefined, h.ctx);
+	assert.equal(again.structuredContent.status, "stopped", "why it was not stopped");
+	await h.handlers.get("session_shutdown")?.({ reason: "quit" }, h.ctx);
 });

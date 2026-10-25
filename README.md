@@ -36,6 +36,8 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 | `monitor_stop` | 按 id 停止 |
 | `monitor_list` | 列出状态、事件数、退出码；退出后时长冻结 |
 
+三个工具都声明了 `outputSchema`：开了 codemode 时，脚本里 `tools.Monitor(...)` 返回 `{ taskId, kind, outputPath, stderrPath, … }`，`tools.monitor_list()` 返回 `{ monitors: [...] }`，批量起/停不用解析文本。没开 codemode 时没有影响。
+
 ### Monitor 参数
 
 | 参数 | 类型 | 说明 |
