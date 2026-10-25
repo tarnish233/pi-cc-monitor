@@ -105,7 +105,7 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 `monitor failed`（启动或连接失败）、`monitor closed`（WebSocket 关闭）、`monitor stopped`（手动停止或输出过多被停）。
 折叠时正文最多 3 行，Ctrl+O 展开后多一行元信息（id、事件数、退出码）。
 
-样式开关是 `~/.pi/agent/pi-cc.json` 里的 `compactMessages`（三个 pi-cc 扩展共用，用 `/pi_cc` 面板或 `/pi_cc messages on|off` 切换，
+样式开关是 `~/.pi/agent/pi-cc.json` 里的 `compactMessages`（和 pi-cc-loop 共用，用 `/pi_cc` 面板或 `/pi_cc messages on|off` 切换，
 或用环境变量 `PI_CC_COMPACT_MESSAGES=0|1` 覆盖）；关闭时回到旧的带底色卡片。
 
 ## 底部状态
@@ -118,9 +118,8 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 
 开关是 pi-cc 扩展共用的 `footer`（`~/.pi/agent/pi-cc.json`，用 `/pi_cc` 面板或 `/pi_cc footer on|off` 切换，或用环境变量 `PI_CC_FOOTER=0|1` 覆盖）。
 
-`/pi_cc` 由四个 pi-cc 包（loop、monitor、plugins、compact）共同提供：装了其中任意一个，命令就在；装了多个，也只有一个 `/pi_cc`
-（同名命令会被 Pi 改名成 `/pi_cc:1`、`/pi_cc:2`，所以由最先加载的包认领注册）。本包从 0.6.0 起也提供它；面板按插件分页（Tab / Shift+Tab 切换）：本包的两项和 pi-cc-loop 共用，在 Loop & Monitor 页；Plugins 页属于 pi-cc-plugins，Compact 页属于 pi-cc-compaction（装了才生效）；
-之前设置要靠 pi-cc-loop 的 `/loop settings`，现在只装 monitor 也能调。
+`/pi_cc` 由四个 pi-cc 包（loop、monitor、plugins、compaction）共同提供：装了其中任意一个，命令就在；装了多个，也只有一个 `/pi_cc`
+（同名命令会被 Pi 改名成 `/pi_cc:1`、`/pi_cc:2`，所以由最先加载的包认领注册）。面板按插件分页（Tab / Shift+Tab 切换）：本包的两项和 pi-cc-loop 共用，在 Loop & Monitor 页；Plugins 页属于 pi-cc-plugins，Compact 页属于 pi-cc-compaction（装了才生效）。
 
 ## 兼容性
 
@@ -134,7 +133,7 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 
 ```bash
 node --test tests/*.test.mjs
-npx --yes typescript@5.9.3 tsc --noEmit -p tsconfig.json
+npx --yes -p typescript@5.9.3 tsc --noEmit -p tsconfig.json
 ```
 
 ### 缓存约束
