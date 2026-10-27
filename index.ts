@@ -51,7 +51,6 @@ import {
 	renderBlock,
 	renderCard,
 	stripProvenance,
-	truncate,
 } from "./render.ts";
 
 /**
