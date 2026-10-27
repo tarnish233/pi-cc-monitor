@@ -464,6 +464,27 @@ test("a loop:stopped event stops the monitor that named the chain", async () => 
 	assert.ok(armed.details.taskId);
 });
 
+test("a loop:stopped event matches a loopPrompt quoted with its /loop prefix", async () => {
+	const h = await start(makeHarness());
+	h.registeredToolNames.push("cron_delete");
+	// pi-cc-loop keys a chain by its prompt without the prefix, the way
+	// schedule_wakeup stores it; the model may pass the request back verbatim.
+	await h.tools
+		.get("Monitor")
+		.execute(
+			"c",
+			{ command: "sleep 5", description: "chained", loopPrompt: "/loop check the deploy" },
+			undefined,
+			undefined,
+			h.ctx,
+		);
+
+	await h.handlers.get("bus:loop:stopped")({ prompt: "check the deploy", reason: "stopped by the user" }, h.ctx);
+
+	const list = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
+	assert.equal(list.details.monitors[0].status, "stopped");
+});
+
 test("a loop:stopped event for another chain leaves the monitor alone", async () => {
 	const h = await start(makeHarness());
 	await h.tools

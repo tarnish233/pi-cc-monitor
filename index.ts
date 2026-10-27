@@ -227,6 +227,14 @@ function generateId(): string {
 	return out;
 }
 
+/**
+ * A loop's prompt as pi-cc-loop keys it: a leading `/loop ` dropped (models
+ * quote the request back either way, and schedule_wakeup stores the bare form).
+ */
+function chainPrompt(prompt: string): string {
+	return prompt.trim().replace(/^\/loop\s+/i, "").trim();
+}
+
 /** "30 minutes" for the usual timeouts, "5 seconds" for the short ones. */
 function lifetimeText(ms: number): string {
 	const minutes = Math.round(ms / 60_000);
@@ -472,8 +480,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	pi.events.on(LOOP_STOPPED_CHANNEL, (data) => {
 		const payload = data as { prompt?: string; reason?: string } | undefined;
 		if (!payload?.prompt) return;
+		const ended = chainPrompt(payload.prompt);
 		for (const record of [...monitors.values()]) {
-			if (record.loopPrompt !== payload.prompt) continue;
+			if (record.loopPrompt === undefined || chainPrompt(record.loopPrompt) !== ended) continue;
 			if (record.status !== "running") continue;
 			endMonitor(record, { status: "stopped", cause: "stopped", kill: true });
 			const ctx = lastCtx;
