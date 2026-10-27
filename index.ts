@@ -744,8 +744,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				Type.Object(
 					{
 						url: Type.String({
-							description:
-								"WebSocket to open. Each text frame is an event; binary frames are reported as a placeholder line. Socket close ends the watch.",
+							description: "The socket to open: an ASCII ws:// or wss:// URL with no userinfo.",
 						}),
 						protocols: Type.Optional(
 							Type.Array(Type.String({ description: "WebSocket subprotocol names." }), {
