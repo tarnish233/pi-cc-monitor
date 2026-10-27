@@ -50,7 +50,6 @@ import {
 	formatStamp,
 	renderBlock,
 	renderCard,
-	stripProvenance,
 } from "./render.ts";
 
 /**
@@ -701,7 +700,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			exitCode?: number | null;
 		};
 		const cause = details.cause ?? "output";
-		const body = stripProvenance(contentText(message.content), /^monitor \S+ \u00b7[^\n]*\n?/);
+		const body = contentText(message.content).replace(/^monitor \S+ \u00b7[^\n]*\n?/, "");
 		const label = CAUSE_LABEL[cause] ?? CAUSE_LABEL.output;
 
 		if (!loadConfig().compactMessages) {
