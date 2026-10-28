@@ -291,6 +291,23 @@ test("a ws monitor writes the frames it receives to its log file, and reports it
 	}
 });
 
+test("one WebSocket text frame with newlines is one event", async () => {
+	const saved = globalThis.WebSocket;
+	const fake = fakeWebSocket();
+	globalThis.WebSocket = fake.WebSocket;
+	try {
+		const h = await start(makeHarness());
+		const armed = await h.tools.get("Monitor").execute("c", { ws: { url: "ws://x.example/feed" }, description: "feed" }, undefined, undefined, h.ctx);
+		fake.sockets[0].emit("message", { data: "first line\nsecond line" });
+		await waitFor(() => h.sent.length > 0);
+		assert.equal(h.sent[0].message.details.eventCount, 1, "a frame counts once, even with newlines");
+		assert.deepEqual(h.sent[0].message.details.lines, ["first line\nsecond line"]);
+		await h.tools.get("monitor_stop").execute("c", { id: armed.details.taskId }, undefined, undefined, h.ctx);
+	} finally {
+		globalThis.WebSocket = saved;
+	}
+});
+
 test("a ws monitor that cannot even open fails like a command monitor that cannot spawn", async () => {
 	const saved = globalThis.WebSocket;
 	globalThis.WebSocket = fakeWebSocket({ constructError: new Error("bad url") }).WebSocket;

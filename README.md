@@ -1,6 +1,6 @@
 # pi-cc-monitor
 
-> 把 Claude Code 的 `Monitor` 搬到 Pi：后台命令或 WebSocket 的每一行输出都是一个事件，事件会唤醒 agent。
+> 把 Claude Code 的 `Monitor` 搬到 Pi：后台命令的每行 stdout、WebSocket 的每个帧都是一个事件，事件会唤醒 agent。
 
 ## 安装
 
@@ -22,7 +22,7 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 | WebSocket | 每个 text frame = 一个事件，binary 记为占位行 | `Monitor` |
 | 事件唤醒 | 空闲时开一轮 turn；忙时在当前工具调用结束后插入（CC 的 next 优先级） | 自动 |
 | 超时/常驻 | `timeout_ms` 默认 5 分钟；`persistent` 到会话结束 | `Monitor` |
-| 批量 | 200ms 内的行合并成一条通知 | 自动 |
+| 批量 | 200ms 内的事件合并成一条通知 | 自动 |
 | 长度上限 | 单行 500 字符、单条通知 3000 字符，超出截断 | 自动 |
 | 限流 | 突发 10 条、之后每 2 秒 1 条；超出的事件丢弃并提示，持续超量 30 秒自动停止 | 自动 |
 | 停止/列表 | 按 id 停止、列出状态与退出码 | `monitor_stop` / `monitor_list` |

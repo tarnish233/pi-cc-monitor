@@ -60,16 +60,34 @@ export class LineBatcher {
 		if (this.buffer.length > cap) this.buffer = this.buffer.slice(-cap);
 	}
 
+	/** A WebSocket text frame is one event, even when it contains newlines. */
+	pushEvent(frame: string): void {
+		if (!this.closed) this.accept(frame, false);
+	}
+
 	/** Emit whatever is pending right away. */
 	flush(): void {
 		this.clearTimer();
 		if (!this.pending.length) return;
-		const count = this.pending.length;
-		let text = this.pending.join("\n");
+		const pending = this.pending;
+		const count = pending.length;
 		this.pending = [];
 		const cap = this.options.maxBatchChars ?? MAX_BATCH_CHARS;
-		if (text.length > cap) text = `${text.slice(0, cap)}\n${TRUNCATED}`;
-		this.options.onBatch(text.split("\n"), count);
+		if (pending.join("\n").length > cap) {
+			const clipped: string[] = [];
+			let size = 0;
+			for (const frame of pending) {
+				const separator = clipped.length ? 1 : 0;
+				const remaining = cap - size - separator;
+				if (remaining < 0) break;
+				clipped.push(frame.slice(0, remaining));
+				size += separator + Math.min(frame.length, remaining);
+				if (remaining < frame.length) break;
+			}
+			this.options.onBatch([...clipped, TRUNCATED], count);
+			return;
+		}
+		this.options.onBatch(pending, count);
 	}
 
 	/** Emit the trailing partial line too (the stream ended mid-line). */
@@ -89,9 +107,9 @@ export class LineBatcher {
 		this.buffer = "";
 	}
 
-	private accept(raw: string): void {
-		const line = raw.trimEnd();
-		if (!line) return;
+	private accept(raw: string, trim = true): void {
+		const line = trim ? raw.trimEnd() : raw;
+		if (trim && !line) return;
 		this.options.onLine?.(line);
 		const cap = this.options.maxLineChars ?? MAX_LINE_CHARS;
 		this.pending.push(line.length > cap ? `${line.slice(0, cap)}${TRUNCATED}` : line);

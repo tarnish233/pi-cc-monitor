@@ -652,7 +652,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				const line =
 					typeof data === "string" ? data : `[binary frame, ${byteLengthOf(data)} bytes]`;
 				log(line);
-				record.batcher?.push(`${line}\n`);
+				record.batcher?.pushEvent(line);
 			});
 			socket.addEventListener("error", () => {
 				// Errors are surfaced before the close.
