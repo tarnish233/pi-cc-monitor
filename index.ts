@@ -175,6 +175,8 @@ function isValidWsUrl(value: string): boolean {
 
 const RFC6455_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
+const WS_URL_ERROR = "url must be a valid ASCII ws:// or wss:// URL with no userinfo and no tabs or newlines";
+
 function isValidProtocols(protocols: string[] | undefined): boolean {
 	if (!protocols) return true;
 	if (new Set(protocols).size !== protocols.length) return false;
@@ -754,7 +756,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					},
 					{
 						description:
-							"WebSocket to open. Each text frame is an event; binary frames are reported as a placeholder line. Socket close ends the watch. Cannot be combined with command.",
+							"WebSocket to open. Each text frame is an event; binary frames are reported as a placeholder line. Socket close ends the watch. Cannot be combined with command; omit it entirely when using command.",
 					},
 				),
 			),
@@ -795,9 +797,23 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			lastCtx = ctx;
 
-			const hasCommand = params.command !== undefined;
-			const hasWs = params.ws !== undefined;
-			if (hasCommand === hasWs) {
+			// A model that fills every schema property (the GPT family sends
+			// `ws: { url: "", protocols: [] }` beside the command) leaves the
+			// source it did not mean to use blank: a blank source is no source,
+			// so only a non-blank one counts as given. Two real sources remain an
+			// error, and a lone blank one still says which field needs a value.
+			const command = typeof params.command === "string" ? params.command : undefined;
+			const commandText = command ?? "";
+			const ws = params.ws;
+			const wsUrl = typeof ws?.url === "string" ? ws.url.trim() : "";
+			const hasCommand = commandText.trim() !== "";
+			const hasWs = wsUrl !== "";
+			if (hasCommand && hasWs) {
+				throw new Error("exactly one of command or ws");
+			}
+			if (!hasCommand && !hasWs) {
+				if (command !== undefined) throw new Error("command must not be empty");
+				if (ws !== undefined) throw new Error(WS_URL_ERROR);
 				throw new Error("exactly one of command or ws");
 			}
 			if (!params.description?.trim()) {
@@ -823,23 +839,18 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 
 			let record: MonitorRecord;
 			if (hasCommand) {
-				const command = params.command as string;
-				if (!command.trim()) throw new Error("command must not be empty");
-				if (hasControlChars(command)) {
+				if (hasControlChars(commandText)) {
 					throw new Error("command contains control characters that would be hidden in the approval dialog");
 				}
-				record = armCommand({ ...input, command }, ctx);
+				record = armCommand({ ...input, command: commandText }, ctx);
 			} else {
-				const ws = params.ws as { url: string; protocols?: string[] };
-				if (!isValidWsUrl(ws.url)) {
-					throw new Error(
-						"url must be a valid ASCII ws:// or wss:// URL with no userinfo and no tabs or newlines",
-					);
+				if (!isValidWsUrl(wsUrl)) {
+					throw new Error(WS_URL_ERROR);
 				}
-				if (!isValidProtocols(ws.protocols)) {
+				if (!isValidProtocols(ws?.protocols)) {
 					throw new Error("protocols must be unique RFC 6455 tokens");
 				}
-				record = armWebSocket({ ...input, url: ws.url, protocols: ws.protocols });
+				record = armWebSocket({ ...input, url: wsUrl, protocols: ws?.protocols });
 			}
 			refreshStatus();
 

@@ -158,6 +158,46 @@ test("exactly one of command or ws is required", async () => {
 	);
 });
 
+test("a blank ws beside a command is not a second source", async () => {
+	const h = await start(makeHarness());
+	const tool = h.tools.get("Monitor");
+	// The GPT family fills every schema property: `ws: { url: "", protocols: [] }`
+	// arrives next to the command it actually meant, with the other optionals
+	// spelled out too. That used to fail with "exactly one of command or ws"
+	// and cost the monitor.
+	for (const ws of [{ url: "", protocols: [] }, { url: "   " }]) {
+		const armed = await tool.execute(
+			"c",
+			{
+				command: "printf 'ok\\n'",
+				ws,
+				description: "blank ws",
+				loopPrompt: "",
+				timeout_ms: 3600000,
+				persistent: true,
+			},
+			undefined,
+			undefined,
+			h.ctx,
+		);
+		assert.equal(armed.details.kind, "command");
+		assert.equal(armed.details.persistent, true);
+	}
+});
+
+test("a blank source alone names the field that needs a value", async () => {
+	const h = await start(makeHarness());
+	const tool = h.tools.get("Monitor");
+	await assert.rejects(
+		() => tool.execute("c", { command: "  ", description: "x" }, undefined, undefined, h.ctx),
+		/command must not be empty/,
+	);
+	await assert.rejects(
+		() => tool.execute("c", { ws: { url: " " }, description: "x" }, undefined, undefined, h.ctx),
+		/url must be a valid ASCII ws:\/\/ or wss:\/\/ URL/,
+	);
+});
+
 test("control characters in the command are refused", async () => {
 	const h = await start(makeHarness());
 	const tool = h.tools.get("Monitor");
