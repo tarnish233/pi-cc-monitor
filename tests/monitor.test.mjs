@@ -1,17 +1,17 @@
-import assert from "node:assert";
+import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
-import { findPiInstall, loadModule } from "./helpers.mjs";
+import { assertJsonRoundTrip, jsonSchemaProblems, loadModule, loadValidators, unsupportedTypeboxUsages } from "./helpers.mjs";
 
 const mod = await loadModule("index.ts");
 const stream = await loadModule("stream.ts");
 const factory = mod.default;
-// TypeBox's own validator, from the Pi installation the extension runs on.
-const install = findPiInstall();
-const { Compile } = await import(pathToFileURL(path.join(install.root, "typebox", "build", "compile", "index.mjs")).href);
+// Use the installation's engine: TypeBox before 1.5.0, pi-schema since 1.5.0.
+const { compile, validateToolArguments, engine } = await loadValidators();
+
+const check = (schema, value) => compile(schema).check(value);
 
 function makeHarness() {
 	const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cc-monitor-t-"));
@@ -930,7 +930,6 @@ test("a chained monitor's notifications name their loop", async () => {
 });
 
 test("every tool gives codemode scripts structuredContent that matches its outputSchema", async () => {
-	const check = (schema, value) => Compile(schema).Check(value);
 	const h = await start(makeHarness());
 	const mon = h.tools.get("Monitor");
 	assert.ok(mon.outputSchema, "Monitor declares an outputSchema");
@@ -969,4 +968,89 @@ test("a script gets the task id and the log paths as values", async () => {
 	const again = await h.tools.get("monitor_stop").execute("c", { id: armed.details.taskId }, undefined, undefined, h.ctx);
 	assert.equal(again.structuredContent.status, "stopped", "why it was not stopped");
 	await h.handlers.get("session_shutdown")?.({ reason: "quit" }, h.ctx);
+});
+
+// ---------------------------------------------------------------------------
+// Pi's validator decides what reaches execute(): since 1.5.0 that is
+// @earendil-works/pi-schema, not TypeBox. See tests/tool-schema.test.mjs in
+// pi-cc-loop for the same checks on the cron tools.
+// ---------------------------------------------------------------------------
+
+/** The arguments a model sends for one tool, and what coercion should make of them. */
+const ARGUMENT_CASES = {
+	Monitor: [
+		["a shell watch", { description: "errors in deploy.log", command: "tail -f deploy.log" }],
+		["a WebSocket watch", { description: "deploy events", ws: { url: "wss://events.example.com/stream", protocols: ["v1"] } }],
+		["one protocol for a list", { description: "deploy events", ws: { url: "wss://e.example.com", protocols: "v1" } }, { ws: { protocols: ["v1"] } }],
+		[
+			"a model's strings for numbers and booleans",
+			{ description: "CI run", command: "gh run watch", timeout_ms: "60000", persistent: "true" },
+			{ timeout_ms: 60000, persistent: true },
+		],
+	],
+	monitor_stop: [["plain", { id: "mon_1" }]],
+	monitor_list: [["no arguments", {}]],
+};
+
+/** Arguments that must not reach `execute()`, and the message the model sees. */
+const REJECTED = [
+	["Monitor", { command: "x" }, engine === "pi-schema" ? /- description: missing/ : /- description: must have required properties/],
+	["Monitor", { description: "d", command: "x", timeout_ms: 99999999 }, engine === "pi-schema" ? /- timeout_ms: expected <= 3600000/ : /- timeout_ms: must be <= 3600000/],
+	["monitor_stop", {}, engine === "pi-schema" ? /- id: missing/ : /- id: must have required properties/],
+];
+
+const call = (tool, args) =>
+	validateToolArguments(tool, { type: "toolCall", id: "t", name: tool.name, arguments: args });
+
+/** `base` with the coerced leaves of `patch` applied, including nested objects. */
+const merge = (base, patch) => {
+	const out = { ...base };
+	for (const [key, value] of Object.entries(patch)) {
+		out[key] =
+			value && typeof value === "object" && !Array.isArray(value) ? merge(base?.[key] ?? {}, value) : value;
+	}
+	return out;
+};
+
+test("every tool's parameters take the arguments a model sends, with Pi's coercion", async () => {
+	const h = await start(makeHarness());
+	assert.deepEqual(
+		[...h.tools.keys()].sort(),
+		Object.keys(ARGUMENT_CASES).sort(),
+		"each registered tool has argument cases",
+	);
+	for (const [name, cases] of Object.entries(ARGUMENT_CASES)) {
+		const tool = h.tools.get(name);
+		for (const [label, args, coerced] of cases) {
+			const parsed = call(tool, args);
+			if (coerced) {
+				assert.deepEqual(parsed, merge(args, coerced), `${name} [${label}]`);
+			} else {
+				assert.deepEqual(parsed, args, `${name} [${label}] is passed through unchanged`);
+			}
+		}
+	}
+});
+
+test("arguments Pi rejects never reach execute(), with Pi's error format", async () => {
+	const h = await start(makeHarness());
+	for (const [name, args, message] of REJECTED) {
+		assert.throws(() => call(h.tools.get(name), args), message, `${name}: ${JSON.stringify(args)}`);
+	}
+});
+
+test("tool schemas stay inside JSON Schema, which is all Pi validates", async () => {
+	const h = await start(makeHarness());
+	for (const [name, tool] of h.tools) {
+		for (const key of ["parameters", "outputSchema"]) {
+			const schema = tool[key];
+			if (!schema) continue;
+			assert.deepEqual(jsonSchemaProblems(schema), [], `${name}.${key}`);
+			assertJsonRoundTrip(schema, `${name}.${key}`);
+		}
+	}
+});
+
+test("the sources use no TypeBox feature Pi's validator ignores", () => {
+	assert.deepEqual(unsupportedTypeboxUsages(), [], "Type.Refine/BigInt/Undefined/Void/Codec, Format.Set");
 });
