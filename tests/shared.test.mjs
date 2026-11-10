@@ -17,6 +17,8 @@ const SHARED = {
 	"config.ts": SIBLINGS,
 	"settings.ts": SIBLINGS,
 	"render.ts": SIBLINGS.filter((name) => name !== "pi-cc-plugins" && name !== "pi-cc-compaction"),
+	// The /cc-tasks overlay is shared by exactly the two task-owning packages.
+	"tasks.ts": ["pi-cc-loop"].filter((name) => name !== self),
 };
 
 for (const [file, siblings] of Object.entries(SHARED)) {

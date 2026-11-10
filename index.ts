@@ -43,6 +43,7 @@ import { killTree, spawnMonitor } from "./process.ts";
 import { MONITOR_DESCRIPTION, MONITOR_LIST_SNIPPET, MONITOR_SNIPPET, MONITOR_STOP_SNIPPET } from "./prompts.ts";
 import { monitorEnv, monitorShell, prefixedCommand, type MonitorShell, type ShellSettings } from "./shell.ts";
 import { LineBatcher, RateLimiter } from "./stream.ts";
+import { registerTaskProvider, type TaskDetail, type TaskItem, type TaskStopResult } from "./tasks.ts";
 import {
 	bodyLines,
 	contentText,
@@ -325,6 +326,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	 */
 	function refreshStatus(): void {
 		if (disposed) return;
+		tasks.changed();
 		const ctx = lastCtx;
 		if (!ctx || !ctx.hasUI) return;
 		try {
@@ -447,6 +449,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				notice: () => floodNotice(record, verdict.suppressedForMs),
 			});
 		}
+		tasks.changed();
 	}
 
 	/**
@@ -995,6 +998,95 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	// The shared task overlay. A TaskProvider is a read-only view plus the
+	// one action that reuses this package's own lifecycle: endMonitor, which
+	// kills the process tree or closes the socket and sends the usual notice.
+	// The overlay never feeds the Monitor event stream: it reads the same
+	// records monitor_list does and tails the log files with a byte/line cap.
+	const tasks = registerTaskProvider(pi, {
+		id: "monitor",
+		label: "Monitor",
+		list(): TaskItem[] {
+			const now = Date.now();
+			return [...monitors.values()].map((record) => {
+				const end = record.endedAt ?? now;
+				const events = `${record.eventCount} ev${record.suppressedCount ? ` · ${record.suppressedCount} sup` : ""}`;
+				return {
+					id: record.id,
+					title: record.description,
+					state: record.status,
+					active: record.status === "running",
+					meta: `${events} · ${formatDuration(Math.max(0, end - record.createdAt))}`,
+					order: record.createdAt,
+				};
+			});
+		},
+		detail(item: TaskItem): TaskDetail {
+			const record = monitors.get(item.id);
+			if (!record) throw new Error("this monitor is no longer listed");
+			const now = Date.now();
+			const end = record.endedAt ?? now;
+			const elapsed = Math.max(0, end - record.createdAt);
+			const target = record.kind === "ws" ? record.wsUrl : record.command;
+			const remaining = record.persistent ? undefined : record.timeoutMs - elapsed;
+			const configured = formatDuration(record.timeoutMs);
+			const lifetime =
+				record.persistent
+					? record.status === "running"
+						? "persistent \u2014 until stopped or the session ends"
+						: "persistent \u2014 configured; monitor has ended"
+					: record.status === "running"
+						? `${configured} timeout \u00b7 ${remaining !== undefined && remaining > 0 ? `${formatDuration(remaining)} left` : "expired"}`
+						: record.status === "timed_out"
+							? `${configured} timeout \u00b7 expired`
+							: `${configured} configured timeout \u00b7 ended early`;
+			const rows = [
+				{ label: "Status", value: record.status },
+				{ label: "Kind", value: record.kind === "ws" ? "WebSocket" : "command" },
+				{ label: record.kind === "ws" ? "Socket" : "Command", value: target ?? "—" },
+				{
+					label: "Events",
+					value: `${record.eventCount} delivered${record.suppressedCount ? ` · ${record.suppressedCount} suppressed` : ""}`,
+				},
+				{ label: "Elapsed", value: `${formatDuration(elapsed)}${record.status === "running" ? " (running)" : ""}` },
+				{ label: "Lifetime", value: lifetime },
+				{
+					label: "Exit",
+					value:
+						record.status === "running"
+							? "—"
+							: record.exitCode !== undefined && record.exitCode !== null
+								? `code ${record.exitCode}`
+								: record.kind === "ws"
+									? "socket close"
+									: "no exit code",
+				},
+				...(record.loopPrompt ? [{ label: "Loop", value: record.loopPrompt }] : []),
+				...(record.child?.pid !== undefined ? [{ label: "PID", value: String(record.child.pid) }] : []),
+				{ label: "stdout", value: record.outputPath },
+				{ label: "stderr", value: record.stderrPath },
+			];
+			return {
+				rows,
+				logs: [
+					{ label: "stdout (events)", path: record.outputPath },
+					{ label: "stderr (not notifications)", path: record.stderrPath },
+				],
+				note:
+					record.status === "running"
+						? "x stops the monitor: process tree killed or socket closed, one [Monitor stopped] notice."
+						: "This monitor has ended; its actions are disabled.",
+			};
+		},
+		stop(id: string): TaskStopResult {
+			const record = monitors.get(id);
+			if (!record) return { stopped: false, message: `Monitor ${id} is no longer listed.` };
+			if (record.status !== "running") return { stopped: false, message: `Monitor ${id} is not running (${record.status}).` };
+			endMonitor(record, { status: "stopped", cause: "stopped", flush: true, kill: true, notice: () => STOPPED_NOTICE });
+			return { stopped: true, message: `Stopped monitor ${id} (${record.description}).` };
+		},
+	});
+
 	// The shared pi-cc settings and their /pi_cc command. The first pi-cc
 	// package to load registers it; this one re-claims its own claim on /reload.
 	registerPiCcCommand(pi, "pi-cc-monitor");
@@ -1020,6 +1112,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		// Set first: the processes killed below exit after Pi has invalidated
 		// this extension's API, and their callbacks must not touch it.
 		disposed = true;
+		// Close an open task overlay before the context and logs go away.
+		tasks.close();
 		for (const record of monitors.values()) {
 			endMonitor(record, { status: "stopped", cause: "stopped", kill: true });
 		}

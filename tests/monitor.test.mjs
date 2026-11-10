@@ -466,7 +466,11 @@ test("loopPrompt is kept when pi-cc-loop is loaded", async () => {
 		);
 	const list = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
 	assert.equal(list.details.monitors[0].loopPrompt, "check the deploy");
-	assert.equal(h.events.length, 0, "no monitor:wake bus event any more");
+	assert.deepEqual(
+		h.events.filter((event) => !event.channel.startsWith("pi-cc:tasks:")),
+		[],
+		"no monitor:wake bus event any more",
+	);
 });
 
 test("loopPrompt is ignored when pi-cc-loop is not loaded", async () => {
