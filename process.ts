@@ -25,11 +25,15 @@ export interface SpawnOptions {
 	onStderr: (chunk: Buffer) => void;
 	onExit: (code: number | null, signal: NodeJS.Signals | null) => void;
 	onError: (error: Error) => void;
+	/** Bound a stuck stdio close after the process exit; tests may shorten it. */
+	exitGraceMs?: number;
 }
 
 /** Keep the existing polite-stop grace; confirmation has its own short bound. */
 export const KILL_ESCALATION_MS = 2000;
 export const KILL_CONFIRMATION_MS = 1000;
+/** A descendant can hold the parent's pipes after the parent itself exited. */
+export const EXIT_STDIO_GRACE_MS = 5000;
 
 export function spawnMonitor(options: SpawnOptions): ChildProcess {
 	const stdoutStream = fs.createWriteStream(options.stdoutPath, { flags: "a", mode: 0o600 });
@@ -71,22 +75,40 @@ export function spawnMonitor(options: SpawnOptions): ChildProcess {
 	child.stdout?.on("data", options.onStdout);
 	child.stderr?.on("data", options.onStderr);
 	child.on("error", (error) => options.onError(error));
-	// "close" fires after the process exited *and* its stdio streams are
-	// closed. "exit" can fire while stdout is still buffered, which would report
-	// the end of the watch before the last lines were delivered. But "close" is
-	// still not the end of the copy: the piped WriteStreams can hold queued
-	// writes, and a tail read at that moment would present mid-stream output as
-	// final. End both log streams first, then report the exit only once each has
-	// finished flushing. `finished` settles however a stream ends — flushed,
-	// errored (the error listeners above keep that from crashing Pi) or
-	// destroyed — so a write error cannot crash Pi or suppress the result by
-	// itself, and the callback still fires exactly once after both streams settle.
-	child.on("close", (code, signal) => {
+	// "close" is the preferred path: the process exited and its stdio closed,
+	// so ending and flushing both logs preserves every final line. A descendant
+	// can inherit those pipes and prevent "close" forever, however. In that case
+	// the earlier "exit" starts a bounded fallback: detach the inherited pipes,
+	// flush writes already queued, and let the owner clean up its process group.
+	let finalizing = false;
+	let exitTimer: ReturnType<typeof setTimeout> | undefined;
+	const finish = (code: number | null, signal: NodeJS.Signals | null, stuckPipes: boolean) => {
+		if (finalizing) return;
+		finalizing = true;
+		if (exitTimer) clearTimeout(exitTimer);
+		exitTimer = undefined;
+		if (stuckPipes) {
+			child.stdout?.unpipe(stdoutStream);
+			child.stderr?.unpipe(stderrStream);
+		}
 		stdoutStream.end();
 		stderrStream.end();
-		Promise.allSettled([finished(stdoutStream), finished(stderrStream)]).then(() => {
+		// `finished` settles on flush, error or destroy; log failures still cannot
+		// crash Pi or suppress the process result by themselves.
+		void Promise.allSettled([finished(stdoutStream), finished(stderrStream)]).then(() => {
 			options.onExit(code, signal);
 		});
+	};
+	child.on("close", (code, signal) => finish(code, signal, false));
+	child.on("exit", (code, signal) => {
+		if (finalizing) return;
+		const grace = options.exitGraceMs ?? EXIT_STDIO_GRACE_MS;
+		if (grace <= 0) {
+			finish(code, signal, true);
+			return;
+		}
+		exitTimer = setTimeout(() => finish(code, signal, true), grace);
+		exitTimer.unref?.();
 	});
 
 	return child;

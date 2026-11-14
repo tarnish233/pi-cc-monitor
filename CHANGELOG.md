@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-14
+
+### Added
+- Retain at most 50 delivered, resource-released terminal Monitor records. Active work, pending outcomes, cleanup and referenced sources are never evicted.
+
+### Changed
+- Shorten the Monitor tool description while preserving mode selection, waiting discipline and observer ownership. Omitted mode remains `events` for backward compatibility.
+- Simplify shared task/settings UI: a sole provider gets one named tab, settings show only loaded-package pages, unchanged logs are cached across clock refreshes, and long log lines wrap for scrolling.
+- Scope `/pi_cc` ownership and capabilities to each Pi runtime so independent sessions no longer suppress one another; retain text-command preconfiguration and mixed-version compatibility.
+
+### Fixed
+- Keep blank WebSocket text frames in raw logs without turning them into events or consuming notification budgets.
+- Cap completion notification headers, including long Unicode descriptions, without changing raw metadata or the independent completion log-tail budget.
+- Add a bounded fallback when a descendant holds stdout/stderr after its parent exits: prefer normal close/flush, then detach stale pipes after five seconds, flush queued writes once and continue process-group cleanup.
+
 ## [0.9.0] - 2026-11-14
 
 ### Added

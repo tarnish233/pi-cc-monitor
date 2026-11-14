@@ -583,6 +583,30 @@ test("one WebSocket text frame with newlines is one event", async () => {
 	}
 });
 
+test("blank WebSocket text frames stay in the raw log but produce no events", async () => {
+	const saved = globalThis.WebSocket;
+	const fake = fakeWebSocket();
+	globalThis.WebSocket = fake.WebSocket;
+	try {
+		const h = await start(makeHarness());
+		const armed = await h.tools.get("Monitor").execute("c", { ws: { url: "ws://x.example/feed" }, description: "feed" }, undefined, undefined, h.ctx);
+		const socket = fake.sockets[0];
+		socket.emit("message", { data: "" });
+		socket.emit("message", { data: "  \t  " });
+		await sleep(300);
+		assert.equal(h.sent.length, 0, "blank heartbeats do not wake the agent or consume notification budget");
+
+		socket.emit("message", { data: "real frame" });
+		await waitFor(() => h.sent.length === 1);
+		assert.equal(h.sent[0].message.details.eventCount, 1);
+		assert.deepEqual(h.sent[0].message.details.lines, ["real frame"]);
+		assert.equal(fs.readFileSync(armed.details.outputPath, "utf8"), "\n  \t  \nreal frame\n", "the raw log still contains the blank frames");
+		await h.tools.get("monitor_stop").execute("c", { id: armed.details.taskId }, undefined, undefined, h.ctx);
+	} finally {
+		globalThis.WebSocket = saved;
+	}
+});
+
 test("a ws monitor that cannot even open fails like a command monitor that cannot spawn", async () => {
 	const saved = globalThis.WebSocket;
 	globalThis.WebSocket = fakeWebSocket({ constructError: new Error("bad url") }).WebSocket;
@@ -756,7 +780,7 @@ test("loopPrompt is kept when pi-cc-loop is loaded", async () => {
 	const list = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
 	assert.equal(list.details.monitors[0].loopPrompt, "check the deploy");
 	assert.deepEqual(
-		h.events.filter((event) => !event.channel.startsWith("pi-cc:tasks:")),
+		h.events.filter((event) => event.channel.startsWith("monitor:")),
 		[],
 		"no monitor:wake bus event any more",
 	);
@@ -1074,6 +1098,33 @@ test("an unwritable output log does not crash Pi", async () => {
 	assert.equal(exit, 0, "the command still runs and reports its exit");
 });
 
+test("a parent exit reports after a bounded stdio grace when a descendant holds the pipes", { skip: process.platform === "win32" }, async () => {
+	const { spawnMonitor, stopProcessGroup } = await loadModule("process.ts");
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cc-monitor-exit-grace-"));
+	const child = spawnMonitor({
+		command: `${JSON.stringify(process.execPath)} -e 'setInterval(()=>{},1000)' &`,
+		cwd: dir,
+		env: process.env,
+		shell: "/bin/sh",
+		shellArgs: ["-c"],
+		commandTransport: "argv",
+		stdoutPath: path.join(dir, "out.log"),
+		stderrPath: path.join(dir, "err.log"),
+		onStdout: () => {},
+		onStderr: () => {},
+		onError: (error) => { throw error; },
+		onExit: (code) => { child.reportedExit = code; },
+		exitGraceMs: 50,
+	});
+	try {
+		assert.ok(await waitFor(() => child.reportedExit === 0, 2000), "exit is reported even though the descendant keeps stdout/stderr open");
+		assert.equal(child.exitCode, 0, "the shell itself really exited");
+	} finally {
+		assert.equal(await stopProcessGroup(child, { force: true }), true, "the process group, including the descendant, is cleaned up");
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("a monitor that fails to start is not listed as running", async () => {
 	const h = await start(makeHarness());
 	h.ctx.cwd = 42; // makes spawn throw synchronously
@@ -1209,7 +1260,7 @@ test("the tool description carries Claude Code's usage guidance", async () => {
 		"2>&1",
 		"monitor_stop",
 		"an event is not their reply",
-		"a command events source whose output stays suppressed for 30 seconds is stopped",
+		"output stays suppressed for 30 seconds is stopped",
 		"action: \"update\"",
 	]) {
 		assert.ok(tool.description.includes(phrase), `description mentions ${phrase}`);

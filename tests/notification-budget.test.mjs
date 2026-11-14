@@ -94,6 +94,22 @@ test("a huge Unicode/control-bearing description cannot exhaust the events envel
 	assert.equal(fs.readFileSync(receipt.details.outputPath, "utf8"), raw);
 });
 
+test("completion caps a huge Unicode description without capping its separate log tail", async t => {
+	const h = harness(t);
+	const description = "😀".repeat(5000) + "\n\x1b[31mEND";
+	const receipt = await run(h, { mode: "completion", description });
+	assert.equal(h.sent.length, 1);
+	const message = h.sent[0].message;
+	assert.ok(message.content.split("\n")[0].length <= MAX_LINE_CHARS);
+	assert.match(message.content.split("\n")[0], /\.\.\.\(truncated\)$/);
+	assert.equal(message.details.description, description, "metadata keeps the original description");
+	assert.ok(!message.content.includes("\x1b"));
+	assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(message.content));
+	assert.ok(message.details.stdoutTail.includes("RAW_FINAL_MARKER"));
+	assert.ok(message.content.length > MAX_BATCH_CHARS, "the header cap does not impose the events envelope on completion logs");
+	assert.equal(fs.readFileSync(receipt.details.outputPath, "utf8"), raw);
+});
+
 test("completion keeps its separate log-tail budget and quiet delivery", async t => {
 	const h = harness(t);
 	const description = "quiet\n\x1b[31mred";

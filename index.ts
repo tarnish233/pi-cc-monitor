@@ -84,6 +84,8 @@ export const MAX_TIMEOUT_MS = MONITOR_TIMEOUTS.events.maxMs;
 export const DEFAULT_COMPLETION_TIMEOUT_MS = MONITOR_TIMEOUTS.completion.defaultMs;
 export const MAX_COMPLETION_TIMEOUT_MS = MONITOR_TIMEOUTS.completion.maxMs;
 export const MIN_TIMEOUT_MS = 1_000;
+/** Terminal records retained after delivery and resource cleanup; active/pending records never count. */
+export const ENDED_MONITOR_HISTORY_LIMIT = 50;
 
 /** Claude Code batches stdout lines within 200ms into a single notification. */
 export const BATCH_WINDOW_MS = 200;
@@ -371,6 +373,38 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	 * exception, and Pi exits on uncaught exceptions.
 	 */
 	let disposed = false;
+	let pruneQueued = false;
+
+	/**
+	 * Bound model-list output, panel history and retained tails without dropping
+	 * an outcome or a resource that still needs its record. Sources with live
+	 * observers also stay available for identity and log sharing.
+	 */
+	function pruneEndedMonitors(): void {
+		const eligible = [...monitors.values()].filter((record) =>
+			record.finalized === true &&
+			!isActive(record) &&
+			!record.pendingStop &&
+			!pendingCompletions.has(record.id) &&
+			!pendingEndings.has(record.id) &&
+			!(observers.get(record.id)?.size),
+		);
+		if (eligible.length <= ENDED_MONITOR_HISTORY_LIMIT) return;
+		eligible.sort((a, b) => (a.endedAt ?? a.createdAt) - (b.endedAt ?? b.createdAt));
+		const removeCount = eligible.length - ENDED_MONITOR_HISTORY_LIMIT;
+		for (const record of eligible.slice(0, removeCount)) monitors.delete(record.id);
+		tasks.changed();
+	}
+
+	/** Never prune re-entrantly inside finalizeEnd -> deliver -> flushCompletions. */
+	function scheduleMonitorPrune(): void {
+		if (disposed || pruneQueued) return;
+		pruneQueued = true;
+		queueMicrotask(() => {
+			pruneQueued = false;
+			if (!disposed) pruneEndedMonitors();
+		});
+	}
 
 	let lastStatusText: string | undefined;
 	let statusSet = false;
@@ -430,6 +464,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				terminalLevels.delete(id);
 			}
 		}
+		scheduleMonitorPrune();
 	}
 
 	function summaryLine(): string | undefined {
@@ -477,7 +512,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		// The model-facing header is always one sanitized line; metadata keeps the original.
 		const description = sanitizeDisplay(record.description).replace(/\s+/g, " ").trim();
 		const rawHeader = `monitor ${record.id} \u00b7 ${description}`;
-		const header = events ? capEventLines([rawHeader], MAX_LINE_CHARS).join(" ") : rawHeader;
+		const header = capEventLines([rawHeader], MAX_LINE_CHARS).join(" ");
 		// The final budget includes the envelope and every post-batch notice.
 		const body = events ? capEventLines(lines, MAX_BATCH_CHARS - header.length - 1) : lines;
 		const message = {
@@ -674,6 +709,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		}
 		releaseResource(record);
 		refreshStatus();
+		scheduleMonitorPrune();
 	}
 
 	function endMonitor(record: MonitorRecord, ending: Ending): Promise<boolean> {
@@ -1058,6 +1094,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				const line =
 					typeof data === "string" ? data : `[binary frame, ${byteLengthOf(data)} bytes]`;
 				log(line);
+				// Raw logs retain heartbeats, but blank text frames are not events,
+				// matching blank stdout lines and avoiding notification-only floods.
+				if (typeof data === "string" && !data.trim()) return;
 				record.batcher?.pushEvent(line);
 			});
 			socket.addEventListener("error", () => {
@@ -1442,7 +1481,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					stopConfirmation: stopScope(view),
 					active: isActive(record),
 					meta: badges.join(" · "),
-					order: record.createdAt,
 				};
 			});
 		},

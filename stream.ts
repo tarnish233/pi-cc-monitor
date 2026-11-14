@@ -114,12 +114,6 @@ export class LineBatcher {
 		return pending.length ? { lines: capEventLines(pending, this.options.maxBatchChars ?? MAX_BATCH_CHARS), count: pending.length } : undefined;
 	}
 
-	/** Emit the trailing partial line too (the stream ended mid-line). */
-	flushRemainder(): void {
-		const batch = this.drain();
-		if (batch) this.options.onBatch(batch.lines, batch.count);
-	}
-
 	/** An explicit policy update discards unpublished old output, not the raw log. */
 	discard(): void {
 		this.clearTimer();

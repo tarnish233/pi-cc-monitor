@@ -152,14 +152,14 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 ```
 
 - **范围**：只列本会话的 Monitor；装了 pi-cc-loop 时，Loop 页显示该会话的定时任务和它可见的 durable 任务。别的会话执行的 durable 任务会标成 foreign，不会显示成“正在这里运行”。不做跨会话的全局面板。
-- **Tab / Shift+Tab**：All 加已加载的 provider 页；只装本包时是 All / Monitor，同时装了 pi-cc-loop 才有 Loop，不显示未安装包的空页。上下键走 Pi 的 `tui.select.up/down` 命名动作，会跟随你的 keybindings；PgUp/PgDn 翻页。选中项用 `provider + id` 记录，列表更新后不会跳到别的任务。
+- **Tab / Shift+Tab**：两个及以上 provider 时显示 All 加各 provider 页；只装本包时只显示 Monitor，同时装 pi-cc-loop 才增加 Loop，不显示重复 All 或未安装包的空页。上下键走 Pi 的 `tui.select.up/down` 命名动作，会跟随你的 keybindings；PgUp/PgDn 翻页。选中项用 `provider + id` 记录，列表更新后不会跳到别的任务。
 - **Enter**：详情。Esc 先回列表，再按一次才关面板；关面板只关 UI，不取消任何任务，也不会把 Esc 传给 app.interrupt。
 - **分组**：仅依据同一 provider 内真实的 source id 把 subscription 放在源命令下；不根据标题猜关系，不跨会话或跨 provider 关联。不存在的父项保留为根项；分组/刷新不改变选中对象身份。静音、规则耗尽是附加标记，不是 stopped 状态。
 - **Monitor 详情**：按 State → Observation（events）→ Delivery → Lifetime → Logs 分区，显示真实状态、资源归属、source 关系、规则状态、通知策略、期限及日志。once 命中标为 consumed，repeat 命中仍 active；subscription 不显示自己拥有 PID，继承的退出码明确叫 Source exit。stdout/stderr 只读**有上限的尾部**（约最后 8KB / 60 行），ANSI 和控制字符会被剥掉。订阅看到的是完整源日志，不只是命中行；读取不会喂给事件流。
 - **刷新**：任务变化会通知面板，但按 250ms 合并；时间显示每秒走一次。不会每来一行 stdout 就重绘。窄窗口、调整终端大小、宽字符（中文/emoji）、主题切换都有处理，正文高度有上限并可滚动。
 - **`x` 停止**：先本地确认（`y` / `n`），确认页显示对象类型、id 和影响范围，长文字自动换行；不经过模型。command/WebSocket 走 `endMonitor`：请求并确认资源清理后照常发一条 `[Monitor stopped]`；source observer 只结束订阅，不停工作。如果选中的是 Loop 页里的任务，则复用 pi-cc-loop 的停止逻辑（`retireChain` / `removeJob` / durable store），自定步调 loop 结束时会连带停止绑定的 Monitor。
 - **停止的是计划，不是主 agent**：不会 abort 当前回复，也不会结束正在运行的 turn；要中断模型请照常按 Esc 或用 Pi 的 abort。
-- 已结束的 Monitor 记录仍会列出，但停止动作禁用。v1 不做暂停/恢复、不改 cron、不做每个 loop 的独立 transcript，也不保留已结束 loop 的历史。
+- 已结束的 Monitor 记录在终态通知投递且资源释放后保留最近 50 条，停止动作禁用；活跃、待通知、清理中或仍被订阅引用的记录不会因数量上限被淘汰。v1 不做暂停/恢复、不改 cron、不做每个 loop 的独立 transcript，也不保留已结束 loop 的历史。
 
 两个包共用一套命令注册：只装 pi-cc-monitor 或只装 pi-cc-loop 都能使用；两个都装时也只注册一个面板入口。所有 `session_start` 处理完成、构建补全列表之前，会检查当时已加载的扩展命令和 prompt 模板（包括已重名的 `/tasks:1` 等入口）：名称空闲时只注册 `/tasks`；已占用时不抢占、不新增 `/tasks:1`，只注册 `/cc-tasks`。无法安全查询命令列表的旧版宿主也只提供 `/cc-tasks`。同一运行时不因再次资源发现而切换或补注册别名；`/reload` 会为新的扩展实例重新检查。检查不覆盖其他插件之后动态新增的命令。任务面板入口不是 `/pi_cc`（pi-cc 设置面板），也不改变 `Monitor` 工具或 `/loop` 的语义。
 
@@ -178,6 +178,7 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 - `tail -f` / `while true` 不会自己退出；不需要时用 `monitor_stop` 或 `timeout_ms`
 - events 模式每行都是一条消息；测试时别一次打印几十行
 - `command` 直接运行主命令，后台化由 Monitor 负责；不要再套 `nohup` / `&`。stdin/PTY 交互、daemon 化或远程进程托管不属于本工具的生命周期保证
+- 父进程已退出但后台子进程继承 stdout/stderr 管道时，会优先等待正常 `close`；若管道在父进程 `exit` 后 5 秒仍未关闭，则脱离管道、flush 已排队日志并上报退出，让上层继续清理进程组。兜底之后到达的输出不保证写入日志
 - Monitor 是真实 Shell 入口，不是沙箱；只匹配 `bash` 工具名的权限插件需要同时覆盖 Monitor。通知和日志是外部数据，不是用户指令或对问题的回答
 
 ## 渲染
@@ -217,7 +218,7 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 开关是 pi-cc 扩展共用的 `footer`（`~/.pi/agent/pi-cc.json`，用 `/pi_cc` 面板或 `/pi_cc footer on|off` 切换，或用环境变量 `PI_CC_FOOTER=0|1` 覆盖）。
 
 `/pi_cc` 由四个 pi-cc 包（loop、monitor、plugins、compaction）共同提供：装了其中任意一个，命令就在；装了多个，也只有一个 `/pi_cc`
-（同名命令会被 Pi 改名成 `/pi_cc:1`、`/pi_cc:2`，所以由最先加载的包认领注册）。面板按插件分页（Tab / Shift+Tab 切换）：本包的两项和 pi-cc-loop 共用，在 Loop & Monitor 页；Plugins 页属于 pi-cc-plugins，Compact 页属于 pi-cc-compaction（装了才生效）。
+（同名命令会被 Pi 改名成 `/pi_cc:1`、`/pi_cc:2`，所以由最先加载的包认领注册）。面板和非 TUI 摘要只显示已加载包的页面：本包的两项和 pi-cc-loop 共用在 Loop & Monitor 页，Plugins 页属于 pi-cc-plugins，Compact 页属于 pi-cc-compaction；多个页面时用 Tab / Shift+Tab 切换。未安装包的配置值仍保留，可用文字命令预配置。
 
 ## 兼容性
 
