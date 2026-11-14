@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-14
+
+### Added
+- TUI role vocabulary (`task` / `watcher` / `socket` / `subscription`), factual start/update/stop receipts, and compact role/source snapshots; all existing structured output fields are preserved.
+- Transparent `✻ monitor` asynchronous cards with visible identity/source relation, two physical output rows, semantic outcome colors, real stderr-first failure previews and complete expansion; raw logs and model-facing asynchronous content are unchanged.
+- Real-source task/subscription grouping, semantic Monitor detail sections, and wrapped resource-specific local stop confirmation in the shared task overlay. Flat Loop providers, selection identity, runtime isolation, existing panel theme/limits and no-turn UI behavior are preserved.
+- `Monitor.mode`: `completion` runs a command in the background, keeps stdout/stderr in log files and sends one terminal result (exit 0 → completed, nonzero/signal → failed) with a bounded output tail and full log paths; `events` preserves the per-line/WebSocket notification stream. Omitted mode remains `events` for backward compatibility.
+- `Monitor({ source: { monitorId } })`: an events observer subscribes to an existing running command's future stdout/stderr without another process. Stopping, expiring, flooding or muting the observer never stops or restarts the work; the source result remains authoritative.
+- Literal `watches` for source observers: stable ids, stream selection, once/repeat, independent turn/context levels, atomic updates, and unchanged-rule trigger state on `action=update`. `watches: []` mutes; omitted rules observe stdout.
+- `notify.output` (turn/context/none) and `notify.terminal` (turn/context), defaults `turn`. A watch may lower output within the Monitor ceiling, never raise or bypass a `context`/`none` policy or hide failures. Explicit user stops are context-only.
+- Completion gets its own deadlines: `timeout_ms` defaults to 1800000ms (30 minutes) with a 7200000ms (2 hours) maximum, and its timeout notice names the background time limit instead of `monitor expired`. Events keeps 300000ms/3600000ms. `persistent` remains an intentional session-lifetime flag, not cross-process preservation.
+- Route long commands and one-shot waits away from foreground Bash through explicit model-facing selection guidance and static tool `promptGuidelines`; no dynamic prompt hook is registered. Completion results follow the active turn; event notifications retain immediate steer delivery.
+- Expose the selected mode in launch results, `monitor_list`, notification metadata and `/tasks`, with codemode schemas and real-process coverage for quiet logging, exit codes and timeouts.
+
+### Fixed
+- Preserve the not-yet-sent final batch and combine it with the exit/timeout/stop result, instead of losing up to one 200ms batch when a monitor ends.
+- Stop now reports `stopping`, then attempts bounded SIGTERM→SIGKILL cleanup and only reports `stopped` after the owned process group disappears. An unconfirmed stop remains `stop_timeout`, listed and retryable; natural `exited` is a logical outcome while real resources remain tracked until gone.
+- Orderly shutdown and abrupt Pi exit synchronously SIGKILL all still-live owned groups; the exit hook stays installed until every resource is released, so a TERM-ignoring child cannot outlive the session.
+- Critical events-mode terminal notices use the protected completion outbox, so Esc/queue clearing cannot discard the sole outcome; they are context-only when the interrupted turn must not restart.
+
+### Changed
+- Preserve a complete flat task-detail fallback for older Loop-owned panels; newer panels prefer semantic sections without duplicating the fallback rows.
+- Highlight normal manual stops and ordinary source endings with the theme accent color in asynchronous cards and the task panel, instead of low-contrast muted/dim text. Success, failure and abnormal-ending colors keep their existing priority.
+- Tool calls and results are rendered by Pi or `pi-cc-extensions`; this package does not register tool renderers, require `excludeRenderers`, or ask users to turn ccstyle off. Only asynchronous Monitor notifications use the custom `✻ monitor` event cards.
+- Add a session-wide fixed output window (20 messages/minute). Excess output is counted, visible in `monitor_list`, summarized without starting a turn, and never stops work; terminal results do not consume it, and the accounting summary does not need an output slot. Per-Monitor source rate limiting remains.
+- `action=update` amends only notification policy on a running Monitor and watches on an attached source observer; command/source/lifetime fields are refused, an unknown id never falls back to starting work, and changing policy discards only unpublished buffered notification data, not raw logs.
+- Preserve the ending of huge newline-terminated log lines, report per-line clipping truthfully, and keep model-facing tails free of TUI ANSI sequences.
+- Isolate logs in private runtime directories and clean only validated closed/dead owners after three days of last activity; never delete quiet live-owner or unowned legacy logs.
+- Unwind WebSocket log initialization failures to a failed record, and close an allocated descriptor on synchronous stream-construction errors.
+- Include truncation markers inside event line/batch length budgets without splitting surrogate pairs.
+- Bound the final events message after composing its header and rate-suppression notice, so the entire content stays within 3000 characters. Keep content and output metadata on the same clipped lines; completion tails and raw logs are unchanged.
+- Sanitize and flatten every model-facing notification header, including completion descriptions, while keeping the original description in metadata.
+
+- Keep the retired Background integration out of shared settings and task panels; task code covers Monitor/Loop only.
+- Share a small Node-only log-tail helper between the task overlay and completion notices.
+- Use portable Pi/TypeScript discovery for type checking and give each test worker an isolated temp/log namespace.
+- Trimmed the Monitor tool description to a concise mode-selection contract (one completion vs. one notification per occurrence, per-mode timeouts, waiting discipline, events filter/batching rules): the CC-style scripting essay and duplicated examples are gone. `promptGuidelines` stays three static mode-selection/waiting/update entries; deadline numbers are shared with the runtime rather than duplicated there.
+- Generate task-panel tabs from loaded providers so Monitor and Loop share one overlay without empty tabs for packages that are not installed.
+- Use CC-style count-first footer labels: `1 monitor` / `2 monitors`, aligned with `1 loop` / `2 loops`.
+
 ## [0.8.0] - 2026-11-10
 
 ### Added

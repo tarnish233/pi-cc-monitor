@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Writable } from "node:stream";
 import test from "node:test";
 import { assertJsonRoundTrip, jsonSchemaProblems, loadModule, loadValidators, unsupportedTypeboxUsages } from "./helpers.mjs";
 
@@ -121,20 +122,29 @@ test("registers the Monitor, monitor_stop and monitor_list tools", async () => {
 	assert.ok(h.handlers.has("session_shutdown"));
 });
 
-test("the schema mirrors Claude Code's Monitor", async () => {
+test("the schema extends Claude Code's Monitor with notification modes", async () => {
 	const h = await start(makeHarness());
 	const params = h.tools.get("Monitor").parameters;
 	const props = params.properties ?? {};
 	assert.deepEqual(Object.keys(props).sort(), [
+		"action",
 		"command",
 		"description",
+		"id",
 		"loopPrompt",
+		"mode",
+		"notify",
 		"persistent",
+		"source",
 		"timeout_ms",
+		"watches",
 		"ws",
 	]);
 	assert.equal(props.timeout_ms.minimum, 1000);
-	assert.equal(props.timeout_ms.maximum, 3600000);
+	// The schema carries the widest bound (completion's 2h); the runtime
+	// check enforces each mode's own limit once mode is known.
+	assert.equal(props.timeout_ms.maximum, 7200000);
+	assert.ok(props.timeout_ms.description.includes("1800000"), "the completion default is documented");
 	assert.ok(props.description.description.includes("shown in notifications"));
 });
 
@@ -248,7 +258,7 @@ test("ws protocols must be unique RFC 6455 tokens", async () => {
 	);
 });
 
-test("timeout_ms must be within Claude Code's bounds", async () => {
+test("timeout_ms bounds follow the mode: events 1h, completion 2h", async () => {
 	const h = await start(makeHarness());
 	const tool = h.tools.get("Monitor");
 	await assert.rejects(
@@ -256,9 +266,22 @@ test("timeout_ms must be within Claude Code's bounds", async () => {
 		/timeout_ms must be ≥/,
 	);
 	await assert.rejects(
-		() =>
-			tool.execute("c", { command: "ls", description: "x", timeout_ms: 7_200_000 }, undefined, undefined, h.ctx),
-		/timeout_ms must be ≤/,
+		() => tool.execute("c", { command: "ls", description: "x", timeout_ms: 3_700_000 }, undefined, undefined, h.ctx),
+		/timeout_ms must be ≤ 3600000/,
+		"an events watch is still capped at Claude Code's 1h",
+	);
+	const twoHours = await tool.execute(
+		"c",
+		{ command: "sleep 30", description: "x", mode: "completion", timeout_ms: 7_200_000 },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.equal(twoHours.details.timeoutMs, 7_200_000, "a 2h completion deadline is accepted, and the receipt shows it");
+	await h.tools.get("monitor_stop").execute("c", { id: twoHours.details.taskId }, undefined, undefined, h.ctx);
+	await assert.rejects(
+		() => tool.execute("c", { command: "ls", description: "x", mode: "completion", timeout_ms: 7_200_001 }, undefined, undefined, h.ctx),
+		/timeout_ms must be ≤ 7200000/,
 	);
 });
 
@@ -267,13 +290,14 @@ test("each stdout line becomes one notification", async () => {
 	const tool = h.tools.get("Monitor");
 	const armed = await tool.execute(
 		"c",
-		{ command: "printf 'one\\ntwo\\nthree\\n'", description: "test monitor" },
+		{ command: "printf 'one\\ntwo\\nthree\\n'; sleep 0.4", description: "test monitor" },
 		undefined,
 		undefined,
 		h.ctx,
 	);
 	assert.ok(armed.details.taskId);
 	assert.equal(armed.details.timeoutMs, 300000, "default timeout is 5 minutes");
+	assert.equal(armed.details.mode, "events", "existing calls keep streaming events by default");
 
 	await waitFor(() => h.sent.length >= 1);
 	// Lines written within the batch window are merged into one notification.
@@ -286,6 +310,217 @@ test("each stdout line becomes one notification", async () => {
 	assert.equal(h.sent[0].options.deliverAs, "steer", "delivered mid-turn, like Claude Code's \"next\" priority");
 	assert.equal(h.sent[0].options.triggerTurn, true, "a notification wakes the agent");
 	assert.equal(h.sent[0].message.details.eventCount, 3);
+});
+
+test("completion mode logs without output events and reports one terminal result", async () => {
+	const h = await start(makeHarness());
+	const release = path.join(h.ctx.cwd, "release-command");
+	const armed = await h.tools.get("Monitor").execute(
+		"c",
+		{
+			command: `printf 'begin\\n'; printf 'problem\\n' >&2; while [ ! -f ${JSON.stringify(release)} ]; do sleep 0.05; done; printf 'end\\n'; exit 7`,
+			description: "background command",
+			mode: "completion",
+		},
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.equal(armed.details.mode, "completion");
+	assert.equal(check(h.tools.get("Monitor").outputSchema, armed.structuredContent), true);
+	assert.match(armed.content[0].text, /^Started task #\w+ · background command\ncompletion · time limit 30m/);
+	assert.ok(armed.content[0].text.includes(armed.details.outputPath));
+	assert.ok(armed.content[0].text.includes(armed.details.stderrPath));
+	assert.match(armed.content[0].text, /notified once/);
+	assert.match(armed.content[0].text, /do not poll or sleep/);
+
+	assert.ok(await waitFor(() =>
+		fs.existsSync(armed.details.outputPath) && fs.readFileSync(armed.details.outputPath, "utf8").includes("begin") &&
+		fs.existsSync(armed.details.stderrPath) && fs.readFileSync(armed.details.stderrPath, "utf8").includes("problem"),
+	));
+	assert.equal(h.sent.length, 0, "stdout and stderr stay in logs while the command runs");
+
+	fs.writeFileSync(release, "go");
+	assert.ok(await waitFor(() => h.sent.some((entry) => entry.message.details.cause === "exit")));
+	assert.equal(h.sent.length, 1, `one terminal notification only:\n${summarize(h.sent)}`);
+	const finished = h.sent[0];
+	assert.equal(finished.options.deliverAs, "followUp", "completion follows the active turn instead of steering it");
+	assert.equal(finished.options.triggerTurn, true);
+	assert.equal(finished.message.details.mode, "completion");
+	assert.equal(finished.message.details.status, "failed", "a nonzero exit is a failed completion");
+	assert.equal(finished.message.details.eventCount, 0);
+	assert.equal(finished.message.details.exitCode, 7);
+	assert.deepEqual(finished.message.details.lines, []);
+	assert.match(finished.message.content, /\[Monitor failed \u2014 exit code 7\./);
+	assert.ok(finished.message.content.includes(armed.details.outputPath));
+	assert.ok(finished.message.content.includes(armed.details.stderrPath));
+	// The bounded tails usually spare the model a second read.
+	assert.ok(finished.message.details.stdoutTail.includes("begin"));
+	assert.ok(finished.message.details.stdoutTail.includes("end"));
+	assert.ok(finished.message.details.stderrTail.includes("problem"));
+	assert.equal(finished.message.details.stdoutTailTruncated, false);
+	assert.ok(finished.message.content.includes("stdout tail:"));
+	assert.ok(finished.message.content.includes("stderr tail:"));
+	assert.equal(fs.readFileSync(armed.details.outputPath, "utf8"), "begin\nend\n", "close drains the final output before notifying");
+	assert.equal(fs.readFileSync(armed.details.stderrPath, "utf8"), "problem\n");
+
+	const listed = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
+	assert.equal(listed.details.monitors[0].mode, "completion");
+	assert.equal(listed.details.monitors[0].status, "failed");
+	assert.equal(listed.details.monitors[0].eventCount, 0);
+	assert.equal(listed.details.monitors[0].exitCode, 7);
+	assert.equal(check(h.tools.get("monitor_list").outputSchema, listed.structuredContent), true);
+});
+
+test("a successful completion is completed, with its tails", async () => {
+	const h = await start(makeHarness());
+	const armed = await h.tools.get("Monitor").execute(
+		"c",
+		{ command: "printf 'built ok\n'", description: "build", mode: "completion" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.equal(armed.details.timeoutMs, 1_800_000, "completion defaults to a 30m deadline");
+	assert.match(armed.content[0].text.split("\n")[1], /^completion · time limit 30m$/);
+	assert.match(armed.content[0].text, /notified once/);
+	assert.ok(await waitFor(() => h.sent.some((entry) => entry.message.details.cause === "exit")));
+	assert.equal(h.sent.length, 1, summarize(h.sent));
+	const finished = h.sent[0];
+	assert.equal(finished.message.details.status, "completed", "exit code 0 is a completed completion");
+	assert.equal(finished.message.details.exitCode, 0);
+	assert.match(finished.message.content, /\[Monitor completed \u2014 exit code 0\./);
+	assert.ok(finished.message.content.includes("built ok"), "the stdout tail rides along");
+	assert.ok(finished.message.details.stdoutTail.includes("built ok"));
+	assert.equal(finished.message.details.stdoutTailTruncated, false);
+	assert.equal(finished.message.details.stderrTail, "");
+	assert.ok(
+		!finished.message.content.includes("stderr: ("),
+		"an empty stderr has no tail section; the banner already names its path",
+	);
+	assert.ok(finished.message.content.includes("stdout tail:"), "a nonempty stdout tail still rides along");
+	const listed = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
+	assert.equal(listed.details.monitors[0].status, "completed");
+});
+
+test("a completion notice carries a bounded tail while the full logs stay on disk", async () => {
+	const h = await start(makeHarness());
+	const armed = await h.tools.get("Monitor").execute(
+		"c",
+		{ command: "seq 1 5000; printf 'boom\n' >&2; exit 3", description: "verbose failure", mode: "completion" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.ok(await waitFor(() => h.sent.some((entry) => entry.message.details.cause === "exit")));
+	assert.equal(h.sent.length, 1, summarize(h.sent));
+	const finished = h.sent[0];
+	const tail = finished.message.details.stdoutTail;
+	assert.ok(tail.split("\n").length <= 60, "about 60 lines, not the whole log");
+	assert.match(tail, /5000$/);
+	assert.ok(!tail.includes("4940"), "only the last lines");
+	assert.equal(finished.message.details.stdoutTailTruncated, true, "truncation is flagged in the details");
+	assert.match(finished.message.content, /stdout tail \(/, "and marked in the text");
+	assert.ok(finished.message.details.stderrTail.includes("boom"), "a nonempty stderr tail rides along");
+	assert.equal(finished.message.details.stderrTailTruncated, false);
+	assert.equal(finished.message.details.status, "failed");
+	assert.deepEqual(finished.message.details.lines, [], "the tail is not an event stream");
+	// The full logs are untouched.
+	assert.ok(fs.statSync(armed.details.outputPath).size > 8192);
+	assert.equal(fs.readFileSync(armed.details.outputPath, "utf8").trim().split("\n").length, 5000);
+	assert.equal(fs.readFileSync(armed.details.stderrPath, "utf8"), "boom\n");
+});
+
+test("a completion's terminal tail waits for log writes that lag behind the child's close", async () => {
+	const h = await start(makeHarness());
+	// Make both log copies slow, so the child closes while output is still
+	// queued in its log streams. The old code called onExit synchronously on
+	// `close` and read a mid-stream file as the final tail, losing the last
+	// lines; the fix waits for both streams to finish before reporting.
+	const savedCreate = fs.createWriteStream;
+	fs.createWriteStream = (...args) => {
+		const real = savedCreate.apply(fs, args);
+		real.on("error", () => {});
+		const slow = new Writable({
+			write(chunk, _encoding, callback) {
+				setTimeout(() => {
+					real.write(chunk, () => {});
+					callback();
+				}, 5);
+			},
+			final(callback) {
+				real.end(() => callback());
+			},
+		});
+		slow.on("error", () => {});
+		return slow;
+	};
+	try {
+		const armed = await h.tools.get("Monitor").execute(
+			"c",
+			{ command: "seq 1 20000; echo the-real-final-line", description: "lagging logs", mode: "completion" },
+			undefined,
+			undefined,
+			h.ctx,
+		);
+		assert.ok(await waitFor(() => h.sent.some((entry) => entry.message.details.cause === "exit")));
+		assert.equal(h.sent.length, 1, summarize(h.sent));
+		const finished = h.sent[0];
+		assert.equal(finished.message.details.status, "completed");
+		assert.match(
+			finished.message.details.stdoutTail,
+			/the-real-final-line$/,
+			"the tail has the actual final line, not a mid-stream snapshot",
+		);
+		assert.equal(
+			fs.readFileSync(armed.details.outputPath, "utf8").trim().split("\n").pop(),
+			"the-real-final-line",
+			"the exit was reported only after the log was fully written",
+		);
+	} finally {
+		fs.createWriteStream = savedCreate;
+	}
+});
+
+test("completion mode times out in the background with one notice and no output events", async () => {
+	const h = await start(makeHarness());
+	const armed = await h.tools.get("Monitor").execute(
+		"c",
+		{ command: "printf 'tick\\n'; sleep 30", description: "deadline", mode: "completion", timeout_ms: 2000 },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.ok(await waitFor(() => h.sent.some((entry) => entry.message.details.cause === "timeout"), 5000));
+	assert.equal(h.sent.length, 1, summarize(h.sent));
+	assert.equal(h.sent[0].message.details.mode, "completion");
+	assert.equal(h.sent[0].message.details.status, "timed_out");
+	assert.equal(h.sent[0].message.details.eventCount, 0);
+	assert.equal(h.sent[0].options.deliverAs, "followUp");
+	const notice = h.sent[0].message.content;
+	assert.match(
+		notice,
+		/\[Monitor stopped \u2014 background time limit of 2s: the command was killed before it finished, so its logs may be incomplete\./,
+	);
+	assert.ok(!notice.includes("Re-arm"), "no blind restart encouragement at a deadline stop");
+	assert.ok(notice.includes(armed.details.outputPath));
+	assert.ok(notice.includes("stdout tail:"), "the tail flushed when the deadline hit rides along");
+	assert.ok(h.sent[0].message.details.stdoutTail.includes("tick"));
+	assert.equal(fs.readFileSync(armed.details.outputPath, "utf8"), "tick\n");
+});
+
+test("WebSocket sources require events mode", async () => {
+	const h = await start(makeHarness());
+	await assert.rejects(
+		() => h.tools.get("Monitor").execute(
+			"c",
+			{ ws: { url: "wss://x.example" }, description: "feed", mode: "completion" },
+			undefined,
+			undefined,
+			h.ctx,
+		),
+		/mode=completion requires command; ws\/source uses mode=events/,
+	);
 });
 
 /** A stand-in for WebSocket: records instances, sends frames, can fail to construct. */
@@ -363,6 +598,32 @@ test("a ws monitor that cannot even open fails like a command monitor that canno
 	}
 });
 
+test("a WebSocket log-open failure is failed, never a zombie running record", async (t) => {
+	const saved = globalThis.WebSocket;
+	const savedOpen = fs.openSync;
+	const fake = fakeWebSocket();
+	globalThis.WebSocket = fake.WebSocket;
+	const h = await start(makeHarness());
+	t.after(() => h.handlers.get("session_shutdown")({ reason: "quit" }, h.ctx));
+	fs.openSync = (file, ...args) => {
+		if (String(file).endsWith(".out.log")) throw Object.assign(new Error("log denied"), { code: "EACCES" });
+		return savedOpen.call(fs, file, ...args);
+	};
+	try {
+		await assert.rejects(() => h.tools.get("Monitor").execute("c", {
+			ws: { url: "ws://x.example/feed" }, description: "bad log",
+		}, undefined, undefined, h.ctx), /log denied/);
+		assert.equal(fake.sockets.length, 0, "no socket was constructed");
+		const list = await h.tools.get("monitor_list").execute("list", {}, undefined, undefined, h.ctx);
+		assert.equal(list.details.monitors.length, 1);
+		assert.equal(list.details.monitors[0].status, "failed");
+		assert.equal(h.sent.length, 0, "a failed launch does not claim it started");
+	} finally {
+		fs.openSync = savedOpen;
+		globalThis.WebSocket = saved;
+	}
+});
+
 test("a ws monitor's log is closed when the watch ends, or never starts", async () => {
 	const saved = globalThis.WebSocket;
 	const savedCreate = fs.createWriteStream;
@@ -403,6 +664,32 @@ test("the exit ends the watch and is reported", async () => {
 	assert.ok(/ended|exit/i.test(last), `expected an exit report, got: ${last}`);
 });
 
+test("completion stop is a single follow-up notice and kills the process", async () => {
+	const h = await start(makeHarness());
+	const armed = await h.tools.get("Monitor").execute(
+		"c",
+		{ command: "printf 'running\\n'; while true; do sleep 0.05; done", description: "stop completion", mode: "completion", persistent: true },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.ok(await waitFor(() => fs.existsSync(armed.details.outputPath) && fs.readFileSync(armed.details.outputPath, "utf8").includes("running")));
+	const listed = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
+	const pid = listed.details.monitors[0].pid;
+	assert.ok(pid);
+	const stopped = await h.tools.get("monitor_stop").execute("c", { id: armed.details.taskId }, undefined, undefined, h.ctx);
+	assert.equal(stopped.details.stopped, true);
+	assert.ok(await waitFor(() => {
+		try { process.kill(pid, 0); return false; } catch { return true; }
+	}));
+	await sleep(100);
+	assert.equal(h.sent.length, 1, summarize(h.sent));
+	assert.equal(h.sent[0].message.details.cause, "stopped");
+	assert.equal(h.sent[0].message.details.mode, "completion");
+	assert.equal(h.sent[0].options.deliverAs, "followUp");
+	assert.match(h.sent[0].message.content, /\[Monitor stopped\]/);
+});
+
 test("monitor_stop stops a running monitor", async () => {
 	const h = await start(makeHarness());
 	const tool = h.tools.get("Monitor");
@@ -438,13 +725,15 @@ test("monitor_list freezes the duration and includes the exit code", async () =>
 	const text = first.content[0].text;
 	assert.match(text, /exited/);
 	assert.match(text, /exit 0/);
-	const age = /events\s+(\d+)s/.exec(text)?.[1];
-	assert.ok(age !== undefined, text);
+	assert.match(text, /^exited\s+watcher/);
+	assert.match(text, /· \d+(?:ms|s|m(?: \d+s)?) · exit 0$/);
+	const firstSnapshot = first.details.monitors[0];
+	assert.equal(typeof firstSnapshot.endedAt, "number");
 
 	await new Promise((resolve) => setTimeout(resolve, 1100));
 	const second = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
-	const frozenAge = /events\s+(\d+)s/.exec(second.content[0].text)?.[1];
-	assert.equal(frozenAge, age, "the duration stops growing after exit");
+	assert.equal(second.content[0].text, text, "the rendered snapshot and duration stop growing after exit");
+	assert.equal(second.details.monitors[0].endedAt, firstSnapshot.endedAt);
 
 	const snapshot = second.details.monitors[0];
 	assert.equal(typeof snapshot.endedAt, "number");
@@ -681,7 +970,7 @@ test("output printed after a stop is dropped", async () => {
 
 // ------------------------------------------------------------------- output
 
-test("long lines and large batches are capped like Claude Code", async () => {
+test("long lines and merged final batches obey our complete envelope budget", async () => {
 	const h = await start(makeHarness());
 	await h.tools
 		.get("Monitor")
@@ -694,20 +983,15 @@ test("long lines and large batches are capped like Claude Code", async () => {
 		);
 	await waitFor(() => h.sent.some((entry) => entry.message.details.cause === "exit"), 8000);
 
-	const outputs = h.sent.filter((entry) => entry.message.details.cause === "output");
-	assert.ok(outputs.length >= 1, summarize(h.sent));
-	for (const entry of outputs) {
-		const body = entry.message.content.split("\n").slice(1).join("\n");
-		assert.ok(body.length <= 3000 + "\n...(truncated)".length, `notification body is ${body.length} chars`);
-		for (const line of body.split("\n")) {
-			assert.ok(line.length <= 500 + "...(truncated)".length, `line is ${line.length} chars`);
-		}
+	assert.ok(h.sent.length >= 1, summarize(h.sent));
+	for (const entry of h.sent) {
+		assert.ok(entry.message.content.length <= 3000, "the whole notification, not merely the body, is bounded");
+		for (const line of entry.message.content.split("\n")) assert.ok(line.length <= 500, `line is ${line.length} chars`);
 	}
-	assert.ok(
-		outputs.some((entry) => entry.message.content.includes("...(truncated)")),
-		"the long line is marked as truncated",
-	);
-	assert.equal(outputs.at(-1).message.details.eventCount, 1501, "every line still counts as an event");
+	assert.ok(h.sent.some((entry) => entry.message.content.includes("...(truncated)")), "the long line is marked as truncated");
+	const final = h.sent.find((entry) => entry.message.details.cause === "exit");
+	assert.equal(final.message.details.eventCount, 1501, "every admitted line still counts, including the merged final batch");
+	assert.ok(fs.readFileSync(final.message.details.outputPath, "utf8").endsWith("1500\n"), "clipping never cuts the raw log");
 });
 
 test("a UTF-8 character split across chunks stays intact", () => {
@@ -734,8 +1018,9 @@ test("the launch result is Claude Code's: expiry, keep working, an event is not 
 		.get("Monitor")
 		.execute("c", { command: "sleep 1", description: "short", timeout_ms: 1_800_000 }, undefined, undefined, h.ctx);
 	const text = armed.content[0].text;
-	assert.match(text, /^Monitor started \(task \w+, expires in 30 minutes unless the source ends first/);
-	assert.match(text, /You will be notified on each event\. Keep working \u2014 do not poll or sleep\./);
+	assert.match(text, /^Started watcher #\w+ · short\nevents · time limit 30m/);
+	assert.match(text, /The watch ends at its time limit unless the source ends first; re-arm/);
+	assert.match(text, /Keep working \u2014 do not poll or sleep\./);
 	assert.match(text, /an event is not their reply/);
 });
 
@@ -752,7 +1037,8 @@ test("a one minute timeout is not '1 minutes'", async () => {
 	const armed = await h.tools
 		.get("Monitor")
 		.execute("c", { command: "sleep 1", description: "short", timeout_ms: 60_000 }, undefined, undefined, h.ctx);
-	assert.match(armed.content[0].text, /expires in 1 minute unless/);
+	assert.match(armed.content[0].text.split("\n")[1], /^events · time limit 1m$/);
+	assert.equal(armed.details.timeoutMs, 60000);
 });
 
 test("a sub-minute timeout is not 'expires in 0 minutes'", async () => {
@@ -760,7 +1046,8 @@ test("a sub-minute timeout is not 'expires in 0 minutes'", async () => {
 	const armed = await h.tools
 		.get("Monitor")
 		.execute("c", { command: "sleep 1", description: "quick", timeout_ms: 5_000 }, undefined, undefined, h.ctx);
-	assert.match(armed.content[0].text, /expires in 5 seconds unless/);
+	assert.match(armed.content[0].text.split("\n")[1], /^events · time limit 5s$/);
+	assert.equal(armed.details.timeoutMs, 5000);
 });
 
 test("an unwritable output log does not crash Pi", async () => {
@@ -882,21 +1169,27 @@ test("monitor processes are killed if Pi exits without a shutdown", async () => 
 	assert.ok(armed.details.taskId);
 });
 
-test("old monitor logs are cleaned up at session start", async () => {
-	const dir = path.join(os.tmpdir(), "pi-cc-monitor");
-	fs.mkdirSync(dir, { recursive: true });
-	const old = path.join(dir, "zzoldlog.out.log");
-	const fresh = path.join(dir, "zzfreshlog.out.log");
-	fs.writeFileSync(old, "old");
-	fs.writeFileSync(fresh, "fresh");
-	const fourDaysAgo = (Date.now() - 4 * 86_400_000) / 1000;
-	fs.utimesSync(old, fourDaysAgo, fourDaysAgo);
-
+test("another runtime never cleans up old-looking logs of a live persistent monitor", async (t) => {
 	const h = await start(makeHarness());
-	await h.handlers.get("session_start")({ type: "session_start", reason: "startup" }, h.ctx);
-	assert.equal(fs.existsSync(old), false, "logs older than 3 days are removed");
-	assert.equal(fs.existsSync(fresh), true, "recent logs stay readable");
-	fs.rmSync(fresh, { force: true });
+	t.after(() => h.handlers.get("session_shutdown")({ reason: "quit" }, h.ctx));
+	const armed = await h.tools.get("Monitor").execute("c", {
+		command: "echo early; sleep 30", description: "quiet live owner", mode: "completion", persistent: true,
+	}, undefined, undefined, h.ctx);
+	assert.ok(await waitFor(() => fs.existsSync(armed.details.outputPath) && fs.readFileSync(armed.details.outputPath, "utf8").includes("early")));
+	const dir = path.dirname(armed.details.outputPath);
+	const old = new Date(Date.now() - 4 * 86_400_000);
+	const ownerPath = path.join(dir, "owner.json");
+	const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+	owner.createdAt = old.getTime();
+	fs.writeFileSync(ownerPath, JSON.stringify(owner));
+	for (const name of fs.readdirSync(dir)) fs.utimesSync(path.join(dir, name), old, old);
+	fs.utimesSync(dir, old, old);
+	const other = await start(makeHarness());
+	t.after(() => other.handlers.get("session_shutdown")({ reason: "quit" }, other.ctx));
+	await other.handlers.get("session_start")({ reason: "startup" }, other.ctx);
+	assert.equal(fs.existsSync(armed.details.outputPath), true, "quiet is not proof that the owner ended");
+	assert.equal(fs.existsSync(armed.details.stderrPath), true);
+	assert.equal(h.sent.length, 0, "completion logs do not generate events");
 });
 
 // ----------------------------------------------------------------- prompts
@@ -906,18 +1199,30 @@ test("the tool description carries Claude Code's usage guidance", async () => {
 	const tool = h.tools.get("Monitor");
 	for (const phrase of [
 		"Each stdout line is an event",
+		"mode: \"completion\"",
+		"instead of foreground bash",
+		"stdout and stderr are only written",
+		"cover the expected runtime",
+		"observer owns no process",
 		"--line-buffered",
-		"silence is not success",
+		"stopping, expiring or flooding it never stops the work",
 		"2>&1",
 		"monitor_stop",
-		"not replies from the user",
-		"too many events are automatically stopped",
+		"an event is not their reply",
+		"a command events source whose output stays suppressed for 30 seconds is stopped",
+		"action: \"update\"",
 	]) {
 		assert.ok(tool.description.includes(phrase), `description mentions ${phrase}`);
 	}
 	for (const name of ["Monitor", "monitor_stop", "monitor_list"]) {
 		assert.ok(h.tools.get(name).promptSnippet, `${name} has a prompt snippet`);
 	}
+	assert.equal(tool.promptGuidelines.length, 3);
+	assert.ok(tool.promptGuidelines[0].includes("instead of foreground bash"));
+	assert.ok(tool.description.includes("cover the expected runtime"), "deadline guidance belongs to the tool contract");
+	assert.ok(!tool.promptGuidelines.join(" ").includes("1800000"), "the deadline is not duplicated in selection guidelines");
+	assert.ok(tool.promptGuidelines[1].includes("end your turn now"));
+	assert.ok(!h.handlers.has("before_agent_start"), "guidelines are static tool metadata, not a dynamic prompt hook");
 });
 
 test("a chained monitor's notifications name their loop", async () => {
@@ -927,7 +1232,8 @@ test("a chained monitor's notifications name their loop", async () => {
 		.get("Monitor")
 		.execute("c", { command: "printf 'x\\n'", description: "chained", loopPrompt: "check the deploy" }, undefined, undefined, h.ctx);
 	await waitFor(() => h.sent.some((entry) => entry.message.details.cause === "exit"));
-	assert.ok(h.sent.length >= 2);
+	assert.equal(h.sent.length, 1, "the final output and exit are one notification");
+	assert.ok(h.sent[0].message.details.finalLines.includes("x"));
 	for (const entry of h.sent) {
 		assert.equal(entry.message.details.loopPrompt, "check the deploy", "pi-cc-loop knows whose turn an event starts");
 	}
@@ -939,6 +1245,7 @@ test("every tool gives codemode scripts structuredContent that matches its outpu
 	assert.ok(mon.outputSchema, "Monitor declares an outputSchema");
 	const armed = await mon.execute("c", { command: "printf 'one\\n'", description: "test monitor" }, undefined, undefined, h.ctx);
 	assert.ok(armed.structuredContent, "Monitor returns structuredContent");
+	assert.equal(armed.structuredContent.mode, "events");
 	assert.equal(check(mon.outputSchema, armed.structuredContent), true, JSON.stringify(armed.structuredContent));
 
 	const list = h.tools.get("monitor_list");
@@ -961,6 +1268,7 @@ test("a script gets the task id and the log paths as values", async () => {
 	assert.match(armed.structuredContent.taskId, /^\w+$/);
 	assert.equal(armed.structuredContent.taskId, armed.details.taskId);
 	assert.equal(armed.structuredContent.kind, "command");
+	assert.equal(armed.structuredContent.mode, "events");
 	assert.equal(typeof armed.structuredContent.outputPath, "string");
 
 	const listed = await h.tools.get("monitor_list").execute("c", {}, undefined, undefined, h.ctx);
@@ -984,6 +1292,8 @@ test("a script gets the task id and the log paths as values", async () => {
 const ARGUMENT_CASES = {
 	Monitor: [
 		["a shell watch", { description: "errors in deploy.log", command: "tail -f deploy.log" }],
+		["a background command", { description: "test suite", command: "npm test", mode: "completion" }],
+		["a two-hour background command", { description: "slow build", command: "make", mode: "completion", timeout_ms: 7200000 }],
 		["a WebSocket watch", { description: "deploy events", ws: { url: "wss://events.example.com/stream", protocols: ["v1"] } }],
 		["one protocol for a list", { description: "deploy events", ws: { url: "wss://e.example.com", protocols: "v1" } }, { ws: { protocols: ["v1"] } }],
 		[
@@ -999,7 +1309,8 @@ const ARGUMENT_CASES = {
 /** Arguments that must not reach `execute()`, and the message the model sees. */
 const REJECTED = [
 	["Monitor", { command: "x" }, engine === "pi-schema" ? /- description: missing/ : /- description: must have required properties/],
-	["Monitor", { description: "d", command: "x", timeout_ms: 99999999 }, engine === "pi-schema" ? /- timeout_ms: expected <= 3600000/ : /- timeout_ms: must be <= 3600000/],
+	["Monitor", { description: "d", command: "x", mode: "sometimes" }, /mode/],
+	["Monitor", { description: "d", command: "x", timeout_ms: 99999999 }, engine === "pi-schema" ? /- timeout_ms: expected <= 7200000/ : /- timeout_ms: must be <= 7200000/],
 	["monitor_stop", {}, engine === "pi-schema" ? /- id: missing/ : /- id: must have required properties/],
 ];
 

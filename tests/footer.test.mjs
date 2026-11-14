@@ -1,6 +1,6 @@
 /**
- * The footer chip: `monitor N` while monitors run, in the format of
- * pi-cc-loop's chip (`loop 2 · next 3m`). Claude Code shows the same count in
+ * The footer chip: `N monitor(s)` while monitors run, in the format of
+ * pi-cc-loop's chip (`2 loops · next 3m`). Claude Code shows the same count in
  * its footer pill ("2 monitors") and nothing when none is running. It shares
  * one line with every other extension's status, so it is plain text and only
  * repainted when the count changes.
@@ -85,22 +85,22 @@ async function waitFor(predicate, timeoutMs = 5000) {
 
 const forever = (description) => ({ command: "sleep 30", description, persistent: true });
 
-test("the footer counts running monitors as `monitor N` and disappears at zero", async () => {
+test("the footer counts running monitors with CC-style pluralization and disappears at zero", async () => {
 	const h = makeHarness();
 	await h.start();
 	try {
 		assert.equal(h.monitorCalls().length, 0, "nothing running, nothing shown");
 		const first = await h.exec("Monitor", forever("first"));
-		assert.equal(h.status(), "monitor 1");
+		assert.equal(h.status(), "1 monitor");
 		const second = await h.exec("Monitor", forever("second"));
-		assert.equal(h.status(), "monitor 2");
+		assert.equal(h.status(), "2 monitors");
 		await h.exec("monitor_stop", { id: first.details.taskId });
-		assert.equal(h.status(), "monitor 1");
+		assert.equal(h.status(), "1 monitor");
 		await h.exec("monitor_stop", { id: second.details.taskId });
 		assert.equal(h.status(), undefined, "cleared when the last one stops");
 
 		await h.exec("Monitor", { command: "printf 'done\\n'", description: "short" });
-		assert.equal(h.status(), "monitor 1");
+		assert.equal(h.status(), "1 monitor");
 		assert.ok(await waitFor(() => h.status() === undefined), "a monitor that exits on its own drops out");
 	} finally {
 		await h.shutdown();
@@ -130,7 +130,7 @@ test("the chip follows the shared footer setting", async () => {
 	await h.start();
 	try {
 		await h.exec("Monitor", forever("first"));
-		assert.equal(h.status(), "monitor 1");
+		assert.equal(h.status(), "1 monitor");
 		// /loop settings footer off writes the shared file and announces it.
 		process.env.PI_CC_FOOTER = "0";
 		h.bus.get("pi-cc:config")();
@@ -139,7 +139,7 @@ test("the chip follows the shared footer setting", async () => {
 		assert.equal(h.status(), undefined, "and keeps it hidden");
 		process.env.PI_CC_FOOTER = "1";
 		h.bus.get("pi-cc:config")();
-		assert.equal(h.status(), "monitor 2", "back on, with the current count");
+		assert.equal(h.status(), "2 monitors", "back on, with the current count");
 	} finally {
 		delete process.env.PI_CC_FOOTER;
 		await h.shutdown();
@@ -150,7 +150,7 @@ test("shutdown clears the chip, so a reload leaves no stale count", async () => 
 	const h = makeHarness();
 	await h.start();
 	await h.exec("Monitor", forever("first"));
-	assert.equal(h.status(), "monitor 1");
+	assert.equal(h.status(), "1 monitor");
 	await h.shutdown();
 	assert.equal(h.status(), undefined);
 });

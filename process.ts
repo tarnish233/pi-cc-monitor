@@ -8,6 +8,7 @@
  */
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { finished } from "node:stream/promises";
 import fs from "node:fs";
 
 export interface SpawnOptions {
@@ -26,12 +27,13 @@ export interface SpawnOptions {
 	onError: (error: Error) => void;
 }
 
-/** How long a process group gets to exit politely before it is killed. */
-const KILL_ESCALATION_MS = 2000;
+/** Keep the existing polite-stop grace; confirmation has its own short bound. */
+export const KILL_ESCALATION_MS = 2000;
+export const KILL_CONFIRMATION_MS = 1000;
 
 export function spawnMonitor(options: SpawnOptions): ChildProcess {
-	const stdoutStream = fs.createWriteStream(options.stdoutPath, { flags: "a" });
-	const stderrStream = fs.createWriteStream(options.stderrPath, { flags: "a" });
+	const stdoutStream = fs.createWriteStream(options.stdoutPath, { flags: "a", mode: 0o600 });
+	const stderrStream = fs.createWriteStream(options.stderrPath, { flags: "a", mode: 0o600 });
 	// The logs are a copy for the read tool; losing them (a full disk, a deleted
 	// temp dir, too many open files) must not end the watch. A stream "error"
 	// without a listener is an uncaught exception, and Pi exits on those.
@@ -47,8 +49,8 @@ export function spawnMonitor(options: SpawnOptions): ChildProcess {
 			// detached gives the child its own process group, so the whole tree can
 			// be signalled with a negative pid.
 			detached: process.platform !== "win32",
-			// stdout and stderr stay piped: the caller needs the stdout events, and
-			// both streams are also copied to their output files.
+			// stdout and stderr stay piped: event watches consume stdout, and
+			// both streams are always copied to their output files.
 			stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
 			windowsHide: true,
 		});
@@ -69,66 +71,75 @@ export function spawnMonitor(options: SpawnOptions): ChildProcess {
 	child.stdout?.on("data", options.onStdout);
 	child.stderr?.on("data", options.onStderr);
 	child.on("error", (error) => options.onError(error));
-	// "close" fires after the process exited *and* its stdio streams are closed.
-	// "exit" can fire while stdout is still buffered, which would report the
-	// end of the watch before the last lines were delivered.
+	// "close" fires after the process exited *and* its stdio streams are
+	// closed. "exit" can fire while stdout is still buffered, which would report
+	// the end of the watch before the last lines were delivered. But "close" is
+	// still not the end of the copy: the piped WriteStreams can hold queued
+	// writes, and a tail read at that moment would present mid-stream output as
+	// final. End both log streams first, then report the exit only once each has
+	// finished flushing. `finished` settles however a stream ends — flushed,
+	// errored (the error listeners above keep that from crashing Pi) or
+	// destroyed — so a write error cannot crash Pi or suppress the result by
+	// itself, and the callback still fires exactly once after both streams settle.
 	child.on("close", (code, signal) => {
 		stdoutStream.end();
 		stderrStream.end();
-		options.onExit(code, signal);
+		Promise.allSettled([finished(stdoutStream), finished(stderrStream)]).then(() => {
+			options.onExit(code, signal);
+		});
 	});
 
 	return child;
 }
 
-/**
- * Kill an entire process tree.
- *
- * Because children are spawned detached, their pid is the process group id on
- * POSIX, so a negative pid signals the whole group, including children the
- * script put in the background. Used when a monitor is stopped, times out,
- * floods or the session shuts down. Escalates to SIGKILL if the group is still
- * alive shortly after SIGTERM.
- */
+/** Signal the owned process group synchronously; callers retain the cleanup handle. */
 export function killTree(child: ChildProcess | undefined, signal: NodeJS.Signals = "SIGTERM"): void {
 	if (!child || child.pid === undefined) return;
-	const pid = child.pid;
-
 	if (process.platform === "win32") {
 		try {
-			spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
-		} catch {
-			try {
-				child.kill(signal);
-			} catch {
-				// already gone
-			}
-		}
-		return;
-	}
-
-	const signalGroup = (sig: NodeJS.Signals): void => {
+			const result = spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+			if (!result.error && result.status === 0) return;
+		} catch { /* fall back to the child handle */ }
+	} else {
 		try {
-			process.kill(-pid, sig);
-		} catch {
-			try {
-				child.kill(sig);
-			} catch {
-				// already gone
-			}
-		}
-	};
-
-	signalGroup(signal);
-	if (signal !== "SIGKILL") {
-		const escalate = setTimeout(() => {
-			try {
-				process.kill(-pid, 0); // probe: still alive?
-				signalGroup("SIGKILL");
-			} catch {
-				// gone
-			}
-		}, KILL_ESCALATION_MS);
-		escalate.unref?.();
+			process.kill(-child.pid, signal);
+			return;
+		} catch { /* already gone, or try the direct child */ }
 	}
+	try { child.kill(signal); } catch { /* best effort; confirmation decides the outcome */ }
+}
+
+/** Only ESRCH proves a POSIX group gone; permission/probe failures are not success. */
+export function processGroupAlive(child: ChildProcess | undefined): boolean {
+	if (!child || child.pid === undefined) return false;
+	if (process.platform === "win32") return child.exitCode === null && child.signalCode === null;
+	try {
+		process.kill(-child.pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	}
+}
+
+async function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (processGroupAlive(child)) {
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) return false;
+		// Internal OS cleanup confirmation, not model polling. Ref'd while a stop is awaited.
+		await new Promise<void>((resolve) => setTimeout(resolve, Math.min(25, remaining)));
+	}
+	return true;
+}
+
+/** Bound a stop attempt, then keep unconfirmed resources with the runtime's exit backstop. */
+export async function stopProcessGroup(
+	child: ChildProcess | undefined,
+	options: { force?: boolean; graceMs?: number; confirmationMs?: number } = {},
+): Promise<boolean> {
+	if (!child || !processGroupAlive(child)) return true;
+	killTree(child, options.force ? "SIGKILL" : "SIGTERM");
+	if (!options.force && await waitForExit(child, options.graceMs ?? KILL_ESCALATION_MS)) return true;
+	killTree(child, "SIGKILL");
+	return waitForExit(child, options.confirmationMs ?? KILL_CONFIRMATION_MS);
 }

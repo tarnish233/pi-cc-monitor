@@ -97,9 +97,12 @@ test("a monitor command runs in Pi's shellPath, after shellCommandPrefix, like t
 			await waitFor(() => h.events.some((event) => event.includes("shell=custom prefix=on"))),
 			`events: ${JSON.stringify(h.events)}`,
 		);
-		const list = textOf(await h.exec("monitor_list", {}));
-		assert.ok(list.includes(command), "the list shows the command as written");
-		assert.doesNotMatch(list, /PI_CC_PREFIX=on/, "without the prefix");
+		const result = await h.exec("monitor_list", {});
+		const list = textOf(result);
+		assert.equal(result.details.monitors[0].command, command, "the complete snapshot keeps the exact unprefixed command");
+		assert.equal(result.structuredContent.monitors[0].command, command);
+		assert.match(list, /watcher\s+shell check #\w+/);
+		assert.doesNotMatch(result.details.monitors[0].command, /PI_CC_PREFIX=on/, "without the prefix");
 	} finally {
 		await h.shutdown();
 	}
@@ -132,9 +135,12 @@ test("a shellPath that does not exist fails the start, and nothing is left runni
 			h.exec("Monitor", { command: "echo hi", description: "missing shell" }),
 			/Could not start the monitor: Custom shell path not found: \/nonexistent\/pi-cc-bash/,
 		);
-		const list = textOf(await h.exec("monitor_list", {}));
-		assert.match(list, / failed /);
-		assert.doesNotMatch(list, / running /);
+		const result = await h.exec("monitor_list", {});
+		const list = textOf(result);
+		assert.match(list, /^failed\s+watcher/);
+		assert.doesNotMatch(list, /^running\s/m);
+		assert.equal(result.details.monitors[0].status, "failed");
+		assert.equal(result.details.monitors[0].resourceActive, undefined);
 	} finally {
 		await h.shutdown();
 	}

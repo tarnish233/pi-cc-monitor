@@ -36,6 +36,33 @@ export interface BatcherOptions {
 	maxPartialLineChars?: number;
 }
 
+/** Keep clipping from leaving an unmatched UTF-16 surrogate. */
+function safePrefix(text: string, chars: number): string {
+	let end = Math.max(0, Math.floor(chars));
+	const last = text.charCodeAt(end - 1);
+	if (last >= 0xd800 && last <= 0xdbff) end--;
+	return text.slice(0, end);
+}
+
+/** Bound composed event lines, including separators and the truncation marker. */
+export function capEventLines(lines: string[], maxChars = MAX_BATCH_CHARS): string[] {
+	const cap = Math.max(0, Math.floor(maxChars));
+	if (lines.join("\n").length <= cap) return lines;
+	const clipped: string[] = [];
+	const budget = Math.max(0, cap - TRUNCATED.length - 1);
+	let size = 0;
+	for (const line of lines) {
+		const separator = clipped.length ? 1 : 0;
+		const remaining = budget - size - separator;
+		if (remaining <= 0) break;
+		const text = safePrefix(line, remaining);
+		clipped.push(text);
+		size += separator + text.length;
+		if (text.length < line.length) break;
+	}
+	return clipped.length ? [...clipped, TRUNCATED] : [TRUNCATED.slice(0, cap)];
+}
+
 export class LineBatcher {
 	private buffer = "";
 	private pending: string[] = [];
@@ -72,31 +99,33 @@ export class LineBatcher {
 		const pending = this.pending;
 		const count = pending.length;
 		this.pending = [];
-		const cap = this.options.maxBatchChars ?? MAX_BATCH_CHARS;
-		if (pending.join("\n").length > cap) {
-			const clipped: string[] = [];
-			let size = 0;
-			for (const frame of pending) {
-				const separator = clipped.length ? 1 : 0;
-				const remaining = cap - size - separator;
-				if (remaining < 0) break;
-				clipped.push(frame.slice(0, remaining));
-				size += separator + Math.min(frame.length, remaining);
-				if (remaining < frame.length) break;
-			}
-			this.options.onBatch([...clipped, TRUNCATED], count);
-			return;
-		}
-		this.options.onBatch(pending, count);
+		this.options.onBatch(capEventLines(pending, this.options.maxBatchChars ?? MAX_BATCH_CHARS), count);
+	}
+
+	/** Take the pending final batch without publishing it before the terminal result. */
+	drain(): { lines: string[]; count: number } | undefined {
+		if (this.closed) return undefined;
+		const rest = this.buffer + this.decoder.end();
+		this.buffer = "";
+		if (rest) this.accept(rest);
+		this.clearTimer();
+		const pending = this.pending;
+		this.pending = [];
+		return pending.length ? { lines: capEventLines(pending, this.options.maxBatchChars ?? MAX_BATCH_CHARS), count: pending.length } : undefined;
 	}
 
 	/** Emit the trailing partial line too (the stream ended mid-line). */
 	flushRemainder(): void {
-		if (this.closed) return;
-		const rest = this.buffer + this.decoder.end();
+		const batch = this.drain();
+		if (batch) this.options.onBatch(batch.lines, batch.count);
+	}
+
+	/** An explicit policy update discards unpublished old output, not the raw log. */
+	discard(): void {
+		this.clearTimer();
+		this.pending = [];
 		this.buffer = "";
-		if (rest) this.accept(rest);
-		this.flush();
+		this.decoder = new StringDecoder("utf8");
 	}
 
 	/** Drop anything pending and ignore all later output. */
@@ -112,7 +141,7 @@ export class LineBatcher {
 		if (trim && !line) return;
 		this.options.onLine?.(line);
 		const cap = this.options.maxLineChars ?? MAX_LINE_CHARS;
-		this.pending.push(line.length > cap ? `${line.slice(0, cap)}${TRUNCATED}` : line);
+		this.pending.push(line.length > cap ? `${safePrefix(line, cap - TRUNCATED.length)}${TRUNCATED.slice(0, Math.max(0, cap))}` : line);
 		this.schedule();
 	}
 

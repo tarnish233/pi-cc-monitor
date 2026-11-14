@@ -85,11 +85,14 @@ async function waitFor(predicate, timeoutMs = 5000) {
 
 test("monitors only append: no prompt hooks, no tool changes, events are messages", async () => {
 	const h = makeHarness();
-	const declared = () => [...h.tools.values()].map((tool) => JSON.stringify([tool.name, tool.description, tool.parameters]));
+	const declared = () => [...h.tools.values()].map((tool) => JSON.stringify([tool.name, tool.description, tool.promptGuidelines, tool.parameters]));
 	const atLoad = declared();
 	const exec = (name, params) => h.tools.get(name).execute("c", params, undefined, undefined, h.ctx);
 
 	await h.handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, h.ctx);
+	const completed = await exec("Monitor", { command: "printf 'quiet\\n'", description: "background", mode: "completion" });
+	assert.equal(completed.details.mode, "completion");
+	assert.ok(await waitFor(() => h.sent.some((entry) => entry.message.details?.mode === "completion" && entry.message.details?.cause === "exit")));
 	await exec("Monitor", { command: "printf 'one\\ntwo\\n'", description: "short" });
 	assert.ok(await waitFor(() => h.sent.some((entry) => entry.message.details?.cause === "exit")), "the monitor ran to its end");
 	const bound = await exec("Monitor", { command: "sleep 30", description: "bound", persistent: true, loopPrompt: "watch CI" });

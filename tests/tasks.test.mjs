@@ -200,6 +200,7 @@ function makeRuntime() {
 			return client;
 		},
 		start: () => dispatch("session_start", { reason: "startup" }),
+		dispatch,
 		async shutdown(reason = "quit") {
 			await dispatch("session_shutdown", { reason });
 			for (const client of clients) client.dispose();
@@ -227,6 +228,23 @@ function openTasks(runtime) {
 	const promise = command.handler("", runtime.ctx);
 	assert.ok(runtime.state.component, "factory ran synchronously");
 	return promise;
+}
+
+/** Traverse the real viewport to its bottom; sectioned details may need more than two pages. */
+function detailText(runtime) {
+	const pages = [];
+	runtime.render();
+	const limit = runtime.state.component.detailLineCount + 1;
+	for (let i = 0; i < limit; i++) {
+		pages.push(runtime.text());
+		const before = runtime.state.component.detailScroll;
+		runtime.input("pageDown");
+		if (runtime.state.component.detailScroll === before) {
+			assert.equal(before, Math.max(0, runtime.state.component.detailLineCount - runtime.state.component.detailViewport), "all detail rows are reachable");
+			return pages.join("\n");
+		}
+	}
+	assert.fail("detail paging did not reach the final viewport");
 }
 
 async function arm(runtime, params) {
@@ -258,15 +276,23 @@ test("standalone monitor: one native /cc-tasks, opened while busy, stops via end
 	const all = runtime.text();
 	assert.match(all, /standalone monitor/);
 	assert.match(all, /Monitor 1/);
-	assert.match(all, /Loop 0/);
+	assert.doesNotMatch(all, /Loop 0/, "a provider that is not loaded has no tab");
 	runtime.input("tab");
 	assert.match(runtime.text(), /standalone monitor/);
 	runtime.input("x");
 	runtime.input("y");
-	await sleep(30);
-	const list = await runtime.tools.get("monitor_list").execute("l", {}, undefined, undefined, runtime.ctx);
+	// The overlay awaits real exit confirmation, not only a local status flip.
+	const settled = Date.now() + 5000;
+	let list;
+	while (Date.now() < settled) {
+		list = await runtime.tools.get("monitor_list").execute("l", {}, undefined, undefined, runtime.ctx);
+		if (list.details.monitors[0].status === "stopped") break;
+		await sleep(20);
+	}
 	assert.equal(list.details.monitors[0].id, armed.details.taskId);
 	assert.equal(list.details.monitors[0].status, "stopped");
+	assert.equal(runtime.sent.filter((entry) => entry.kind === "custom").length, 0, "a busy turn keeps its outcome out of the clearable queue");
+	await runtime.dispatch("agent_settled", { aborted: false });
 	assert.ok(
 		runtime.sent.some((entry) => entry.message?.customType === "Monitor" && entry.message.content.includes("[Monitor stopped]")),
 		"monitor_stop's terminal notice",
@@ -289,14 +315,17 @@ test("standalone monitor: details show exit data and bounded, sanitized logs", a
 	});
 	assert.ok(await waitFor(() => fs.existsSync(armed.details.outputPath) && fs.statSync(armed.details.outputPath).size > 0));
 	assert.ok(await waitFor(() => fs.existsSync(armed.details.stderrPath) && fs.statSync(armed.details.stderrPath).size > 0));
+	// Wait for the bytes this assertion inspects; size > 0 can precede both writes under load.
+	assert.ok(await waitFor(() => fs.readFileSync(armed.details.outputPath, "utf8").includes("RED") && fs.readFileSync(armed.details.stderrPath, "utf8").includes("GREEN")));
 	const overlay = openTasks(runtime);
 	runtime.input("tab");
 	runtime.input("enter");
-	runtime.render();
-	runtime.input("pageDown");
-	const detail = runtime.text();
+	const detail = detailText(runtime);
 	assert.match(detail, /stdout|stderr/);
-	assert.ok(detail.includes("RED") && detail.includes("GREEN"));
+	// Both log tails may span pages at this width; the UI contract is that both are reachable.
+	assert.ok(detail.includes("RED") && detail.includes("GREEN"), detail);
+	assert.match(detail, /RED CLEAR/, "actual sanitized stdout, not just the Command field");
+	assert.match(detail, /ERR GREEN/, "actual sanitized stderr is reachable too");
 	assert.ok(!stripTerminalSequences(detail).includes("\x1b"));
 	assert.ok(!stripTerminalSequences(detail).includes("\x01"));
 	runtime.input("escape");
@@ -306,6 +335,57 @@ test("standalone monitor: details show exit data and bounded, sanitized logs", a
 	const tail = tasksMod.readLogTail(armed.details.outputPath, 64, 2);
 	assert.ok(tail.text.split("\n").length <= 2);
 	assert.ok(!tail.text.includes("\x1b"));
+});
+
+test("standalone completion command: details show its mode and quiet log semantics", async (t) => {
+	const runtime = makeRuntime();
+	t.after(() => stop(runtime));
+	runtime.load();
+	await runtime.start();
+	const armed = await arm(runtime, {
+		command: "printf 'quiet\\n'; sleep 30",
+		description: "background test suite",
+		mode: "completion",
+		persistent: true,
+	});
+	assert.ok(await waitFor(() => fs.existsSync(armed.details.outputPath) && fs.statSync(armed.details.outputPath).size > 0));
+	assert.equal(runtime.sent.length, 0, "ordinary output does not wake the agent in completion mode");
+
+	const overlay = openTasks(runtime);
+	runtime.input("tab");
+	assert.match(runtime.text(), /background test suite · task/);
+	assert.doesNotMatch(runtime.text(), /completion/, "the list uses the role, technical mode is detail data");
+	runtime.input("enter");
+	const detail = detailText(runtime);
+	assert.match(detail, /Mode\s+completion · one terminal notification/);
+	assert.match(detail, /Output\s+turn · runtime output is log-only/);
+	assert.match(detail, /stdout \(log\)/);
+	assert.doesNotMatch(detail, /0 delivered/);
+	assert.match(detail, /quiet/);
+	runtime.input("escape");
+	runtime.input("escape");
+	await overlay;
+});
+
+test("standalone completion command: a finished command reports its terminal status", async (t) => {
+	const runtime = makeRuntime();
+	t.after(() => stop(runtime));
+	runtime.load();
+	await runtime.start();
+	await arm(runtime, { command: "printf 'done\n'", description: "finishing build", mode: "completion" });
+	assert.ok(
+		await waitFor(() => runtime.sent.some((entry) => entry.message?.details?.status === "completed")),
+		"exit code 0 is a completed completion, not exited",
+	);
+	const overlay = openTasks(runtime);
+	assert.match(runtime.text(), /completed/);
+	runtime.input("enter");
+	const detail = runtime.text();
+	assert.match(detail, /Status\s+completed/);
+	assert.match(detail, /Exit\s+code 0/);
+	runtime.input("escape");
+	runtime.input("escape");
+	await overlay;
 });
 
 test("detail state wording: a running WebSocket is not closed, and an early exit has no live countdown", async (t) => {
@@ -361,7 +441,7 @@ test("detail state wording: a running WebSocket is not closed, and an early exit
 	const ended = openTasks(runtime);
 	runtime.input("down"); // the running socket is first; select the ended command
 	runtime.input("enter");
-	const endedDetail = runtime.text();
+	const endedDetail = detailText(runtime);
 	assert.match(endedDetail, /Lifetime\s+10m configured timeout · ended early/);
 	assert.match(endedDetail, /Exit\s+code 0/);
 	assert.doesNotMatch(endedDetail, /Lifetime[^\n]*left/, "no remaining timer on an ended record");
@@ -481,4 +561,122 @@ test("two runtimes keep separate Monitor task state and commands", async (t) => 
 	b.input("escape");
 	await overlayA;
 	await overlayB;
+});
+
+test("task tree groups real source subscriptions and local stop confirms subscription-only scope", async (t) => {
+  const runtime = makeRuntime();
+  t.after(() => stop(runtime));
+  runtime.load();
+  await runtime.start();
+  const work = await arm(runtime, { command: "sleep 30", description: "build", mode: "completion", persistent: true });
+  const independent = await arm(runtime, { command: "sleep 30", description: "independent watcher", mode: "events", persistent: true });
+  const observer = await arm(runtime, { source: { monitorId: work.details.taskId }, description: "build errors", mode: "events", persistent: true, watches: [{ id: "errors", text: "ERROR", stream: "both", once: false }] });
+  const muted = await arm(runtime, { source: { monitorId: work.details.taskId }, description: "build progress", mode: "events", persistent: true, watches: [] });
+  const overlay = openTasks(runtime);
+  const order = runtime.state.component.entries.map((item) => [item.id, item.depth]);
+  assert.deepEqual(order, [[work.details.taskId, 0], [observer.details.taskId, 1], [muted.details.taskId, 1], [independent.details.taskId, 0]]);
+  assert.match(runtime.text(), /▾ running/);
+  assert.match(runtime.text(), /↳ running/);
+  assert.match(runtime.text(), /build progress · subscription · output muted/, "muting is visible even at the default width");
+  runtime.state.columns = 100;
+  assert.match(runtime.text(), /build progress · subscription · output muted · 0 events/);
+  runtime.state.columns = 80;
+  runtime.input("down");
+  assert.equal(runtime.state.component.selected().id, observer.details.taskId);
+  runtime.input("enter");
+  const details = detailText(runtime);
+  assert.match(details, new RegExp("subscription #" + observer.details.taskId));
+  assert.match(details, new RegExp("Source\\s+build #" + work.details.taskId + " · running"));
+  assert.match(details, /subscription only; no process owned/);
+  assert.match(details, /Watch errors\s+both · repeat · turn · waiting · ERROR/);
+  assert.match(details, /full source logs, not only matched events/);
+  assert.ok(details.indexOf("State") < details.indexOf("Observation"));
+  assert.ok(details.indexOf("Observation") < details.indexOf("Delivery"));
+  assert.ok(details.indexOf("Delivery") < details.indexOf("Lifetime"));
+  assert.doesNotMatch(details, /PID\s+\d+/, "subscription owns no process");
+  runtime.input("escape");
+  runtime.input("x");
+  const confirmation = runtime.text();
+  assert.match(confirmation, /Stop subscription/);
+  assert.match(confirmation, new RegExp("source command #" + work.details.taskId));
+  const confirmationBody = stripTerminalSequences(confirmation).split("\n").map((line) => line.replace(/^│\s*|\s*│$/g, "").trim()).join(" ");
+  assert.match(confirmationBody, /not stopped by this operation/, "wrapped confirmation still shows the entire stop scope");
+  assert.match(confirmation, /y stop · n\/Esc cancel/);
+  runtime.input("escape");
+  assert.equal(runtime.sent.length, 0, "cancelling confirmation is UI-only");
+  runtime.input("x");
+  runtime.input("y");
+  assert.ok(await waitFor(() => runtime.sent.some((entry) => entry.message?.details?.monitorId === observer.details.taskId && entry.message.details.cause === "stopped")));
+  const list = (await runtime.tools.get("monitor_list").execute("l", {}, undefined, undefined, runtime.ctx)).details.monitors;
+  assert.equal(list.find((item) => item.id === observer.details.taskId).status, "stopped");
+  assert.equal(list.find((item) => item.id === work.details.taskId).status, "running");
+  assert.equal(list.find((item) => item.id === muted.details.taskId).status, "running");
+  assert.equal(list.find((item) => item.id === independent.details.taskId).status, "running");
+  assert.equal(runtime.sent.length, 1, "no extra source terminal card is introduced");
+  assert.equal(runtime.sent[0].options.triggerTurn, false, "local stop must not start a model reply");
+  assert.equal(runtime.state.aborts, 0);
+  runtime.input("escape");
+  await overlay;
+});
+
+test("task panel makes ordinary endings prominent without recoloring success or abnormal endings", async (t) => {
+  const runtime = makeRuntime();
+  t.after(() => stop(runtime));
+  const client = runtime.load();
+  await runtime.start();
+  const states = ["stopped", "exited", "closed", "completed", "failed", "timed_out", "stop_timeout", "flooded"];
+  const registration = tasksMod.registerTaskProvider(client.pi, {
+    id: "palette", label: "Palette",
+    list: () => states.map((state) => ({ id: state, title: `color ${state}`, state, role: "task", active: false })),
+  });
+  const overlay = openTasks(runtime);
+  const calls = [];
+  runtime.state.component.options.theme.fg = (color, text) => { calls.push({ color, text }); return text; };
+  runtime.render();
+  const expected = { stopped: "accent", exited: "accent", closed: "accent", completed: "success", failed: "error", timed_out: "warning", stop_timeout: "warning", flooded: "warning" };
+  for (const [state, color] of Object.entries(expected)) {
+    assert.ok(calls.some((call) => call.text.trim() === state && call.color === color), `${state} uses ${color}`);
+  }
+  assert.equal(runtime.sent.length, 0, "palette rendering never starts a model turn");
+  runtime.input("escape");
+  await overlay;
+  registration.close();
+});
+
+test("sectioned Monitor details keep complete old-panel rows without duplicate modern rendering", async (t) => {
+  const runtime = makeRuntime();
+  t.after(() => stop(runtime));
+  runtime.load();
+  await runtime.start();
+  const work = await arm(runtime, { command: "sleep 30", description: "legacy-compatible work", mode: "completion", persistent: true });
+  const observer = await arm(runtime, { source: { monitorId: work.details.taskId }, description: "legacy-compatible observer", mode: "events", persistent: true, watches: [{ id: "errors", text: "ERROR", stream: "stderr" }], notify: { output: "context", terminal: "context" } });
+  const overlay = openTasks(runtime);
+  const panel = runtime.state.component;
+  const provider = panel.options.registry.providers.get("monitor");
+  for (const id of [work.details.taskId, observer.details.taskId]) {
+    const detail = provider.detail(provider.list().find((item) => item.id === id));
+    assert.ok(detail.rows.length > 0, "an old Loop panel must not receive empty details");
+    assert.deepEqual(detail.rows, detail.sections.flatMap((section) => section.rows));
+    const flat = detail.rows.map((row) => `${row.label}: ${row.value}`).join("\n");
+    assert.match(flat, /Status: running/);
+    assert.match(flat, /Mode: (completion|events)/);
+    assert.match(flat, /Lifetime: persistent/);
+    assert.ok(flat.includes(work.details.outputPath) && flat.includes(work.details.stderrPath));
+    if (id === observer.details.taskId) {
+      assert.match(flat, /Resource: subscription only; no process owned/);
+      assert.match(flat, /Watch errors: stderr · repeat/);
+      assert.match(flat, /Output: context/);
+      assert.ok(flat.includes(work.details.taskId));
+    }
+  }
+  runtime.input("down");
+  runtime.input("enter");
+  const modern = panel.detailLines(90).map((line) => stripTerminalSequences(line).trimEnd());
+  assert.equal(modern.filter((line) => /^Status\s+/.test(line)).length, 1, "modern section body must not duplicate flat fallback");
+  assert.equal(modern.filter((line) => /^Mode\s+/.test(line)).length, 1);
+  assert.ok(modern.includes("State") && modern.includes("Observation") && modern.includes("Delivery"));
+  assert.equal(runtime.sent.length, 0, "compatibility is display-only");
+  runtime.input("escape");
+  runtime.input("escape");
+  await overlay;
 });
