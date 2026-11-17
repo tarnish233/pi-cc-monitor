@@ -15,6 +15,30 @@ test("actual parent links group subscriptions immediately after their source, pr
   assert.equal(JSON.stringify(input), original, "grouping must not mutate provider data");
 });
 
+test("roots and siblings are newest-first across providers without detaching subscriptions", () => {
+  const input = [
+    entry("work", { createdAt: 10 }),
+    entry("independent", { createdAt: 40 }),
+    entry("errors", { createdAt: 20, parentId: "work" }),
+    entry("progress", { createdAt: 30, parentId: "work" }),
+    entry("loop", { createdAt: 50, provider: "loop", providerLabel: "Loop" }),
+  ];
+  const original = JSON.stringify(input);
+  const output = groupTaskEntries(input);
+  assert.deepEqual(output.map((item) => item.id), ["loop", "independent", "work", "progress", "errors"]);
+  assert.deepEqual(output.map((item) => item.depth), [0, 0, 0, 1, 1]);
+  assert.equal(JSON.stringify(input), original, "sorting must not mutate provider snapshots");
+});
+
+test("equal times are stable and missing or invalid times fall back to provider order", () => {
+  const input = [
+    entry("undated"), entry("tie-a", { createdAt: 100 }), entry("zero", { createdAt: 0 }),
+    entry("nan", { createdAt: NaN }), entry("newest", { createdAt: 200 }),
+    entry("tie-b", { createdAt: 100 }), entry("infinity", { createdAt: Infinity }),
+  ];
+  assert.deepEqual(groupTaskEntries(input).map((item) => item.id), ["newest", "tie-a", "tie-b", "zero", "undated", "nan", "infinity"]);
+});
+
 test("provider namespace is part of a relation; identical titles never create a parent", () => {
   const input = [entry("work", { provider: "loop", title: "same" }), entry("observer", { parentId: "work", title: "same" }), entry("unrelated", { title: "same" })];
   const output = groupTaskEntries(input);

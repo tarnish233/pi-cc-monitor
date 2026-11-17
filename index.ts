@@ -1475,6 +1475,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				return {
 					id: record.id,
 					title: record.description,
+					createdAt: record.createdAt,
 					state: record.status,
 					role: monitorRole(view),
 					...(record.sourceId ? { parentId: record.sourceId } : {}),

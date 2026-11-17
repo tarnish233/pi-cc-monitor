@@ -439,7 +439,7 @@ test("detail state wording: a running WebSocket is not closed, and an early exit
 		"the command ended",
 	);
 	const ended = openTasks(runtime);
-	runtime.input("down"); // the running socket is first; select the ended command
+	assert.equal(runtime.state.component.selected().title, "ends early", "the newest command is first");
 	runtime.input("enter");
 	const endedDetail = detailText(runtime);
 	assert.match(endedDetail, /Lifetime\s+10m configured timeout · ended early/);
@@ -568,20 +568,23 @@ test("task tree groups real source subscriptions and local stop confirms subscri
   t.after(() => stop(runtime));
   runtime.load();
   await runtime.start();
+  let creationTime = Date.now();
+  const clock = t.mock.method(Date, "now", () => ++creationTime);
   const work = await arm(runtime, { command: "sleep 30", description: "build", mode: "completion", persistent: true });
   const independent = await arm(runtime, { command: "sleep 30", description: "independent watcher", mode: "events", persistent: true });
   const observer = await arm(runtime, { source: { monitorId: work.details.taskId }, description: "build errors", mode: "events", persistent: true, watches: [{ id: "errors", text: "ERROR", stream: "both", once: false }] });
   const muted = await arm(runtime, { source: { monitorId: work.details.taskId }, description: "build progress", mode: "events", persistent: true, watches: [] });
+  clock.mock.restore();
   const overlay = openTasks(runtime);
   const order = runtime.state.component.entries.map((item) => [item.id, item.depth]);
-  assert.deepEqual(order, [[work.details.taskId, 0], [observer.details.taskId, 1], [muted.details.taskId, 1], [independent.details.taskId, 0]]);
+  assert.deepEqual(order, [[independent.details.taskId, 0], [work.details.taskId, 0], [muted.details.taskId, 1], [observer.details.taskId, 1]]);
   assert.match(runtime.text(), /▾ running/);
   assert.match(runtime.text(), /↳ running/);
   assert.match(runtime.text(), /build progress · subscription · output muted/, "muting is visible even at the default width");
   runtime.state.columns = 100;
   assert.match(runtime.text(), /build progress · subscription · output muted · 0 events/);
   runtime.state.columns = 80;
-  runtime.input("down");
+  for (let i = 0; i < 3; i++) runtime.input("down");
   assert.equal(runtime.state.component.selected().id, observer.details.taskId);
   runtime.input("enter");
   const details = detailText(runtime);

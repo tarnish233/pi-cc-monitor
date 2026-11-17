@@ -153,8 +153,10 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 
 - **范围**：只列本会话的 Monitor；装了 pi-cc-loop 时，Loop 页显示该会话的定时任务和它可见的 durable 任务。别的会话执行的 durable 任务会标成 foreign，不会显示成“正在这里运行”。不做跨会话的全局面板。
 - **Tab / Shift+Tab**：两个及以上 provider 时显示 All 加各 provider 页；只装本包时只显示 Monitor，同时装 pi-cc-loop 才增加 Loop，不显示重复 All 或未安装包的空页。上下键走 Pi 的 `tui.select.up/down` 命名动作，会跟随你的 keybindings；PgUp/PgDn 翻页。选中项用 `provider + id` 记录，列表更新后不会跳到别的任务。
+- **排序**：按创建时间倒序，最新任务在最上方；All 页按同一时间顺序混排 Monitor / Loop，不再按 provider 分块。source 与 subscription 仍成组、父项在前，同级订阅也按创建时间倒序；相同时间保持稳定顺序，状态变化不改变排序。
+- **鼠标与滚动**：Pi fullscreen 模式下，单击页签切换列表，单击任务选中、双击打开详情；标题栏的返回/关闭和底部的 Detail / Stop / Cancel 都可点击。滚轮 / 触控板滚动列表、详情和长停止说明，右侧滚动条支持点击与拖动，底部显示可见范围；普通详情文本仍可拖拽选中。滚动到边界不会带动后方对话，普通 scrollback 模式保留完整键盘操作。
 - **Enter**：详情。Esc 先回列表，再按一次才关面板；关面板只关 UI，不取消任何任务，也不会把 Esc 传给 app.interrupt。
-- **分组**：仅依据同一 provider 内真实的 source id 把 subscription 放在源命令下；不根据标题猜关系，不跨会话或跨 provider 关联。不存在的父项保留为根项；分组/刷新不改变选中对象身份。静音、规则耗尽是附加标记，不是 stopped 状态。
+- **分组**：仅依据同一 provider 内真实的 source id 把 subscription 放在源命令下；不根据标题猜关系，不跨会话或跨 provider 关联。不存在的父项保留为根项；分组/刷新不改变选中对象身份。点击 source 的 `▾` / `▸`，或选中后按 Left / Right，可折叠或展开子任务；收起只影响显示，不停止任务。静音、规则耗尽是附加标记，不是 stopped 状态。
 - **Monitor 详情**：按 State → Observation（events）→ Delivery → Lifetime → Logs 分区，显示真实状态、资源归属、source 关系、规则状态、通知策略、期限及日志。once 命中标为 consumed，repeat 命中仍 active；subscription 不显示自己拥有 PID，继承的退出码明确叫 Source exit。stdout/stderr 只读**有上限的尾部**（约最后 8KB / 60 行），ANSI 和控制字符会被剥掉。订阅看到的是完整源日志，不只是命中行；读取不会喂给事件流。
 - **刷新**：任务变化会通知面板，但按 250ms 合并；时间显示每秒走一次。不会每来一行 stdout 就重绘。窄窗口、调整终端大小、宽字符（中文/emoji）、主题切换都有处理，正文高度有上限并可滚动。
 - **`x` 停止**：先本地确认（`y` / `n`），确认页显示对象类型、id 和影响范围，长文字自动换行；不经过模型。command/WebSocket 走 `endMonitor`：请求并确认资源清理后照常发一条 `[Monitor stopped]`；source observer 只结束订阅，不停工作。如果选中的是 Loop 页里的任务，则复用 pi-cc-loop 的停止逻辑（`retireChain` / `removeJob` / durable store），自定步调 loop 结束时会连带停止绑定的 Monitor。
