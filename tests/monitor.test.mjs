@@ -215,6 +215,13 @@ test("control characters in the command are refused", async () => {
 		() => tool.execute("c", { command: "ls\u0007", description: "x" }, undefined, undefined, h.ctx),
 		/control characters/,
 	);
+	// CR overwrites earlier dialog text just like the other control characters.
+	for (const command of ["echo hi\r", "echo a\r\necho b"]) {
+		await assert.rejects(
+			() => tool.execute("c", { command, description: "x" }, undefined, undefined, h.ctx),
+			/control characters/,
+		);
+	}
 });
 
 test("a ws url must be a valid ASCII ws:// or wss:// url", async () => {

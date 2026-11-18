@@ -145,3 +145,32 @@ test('update is explicit, narrow and never falls back to creating work; exactly 
   await assert.rejects(attach(h, { job: { taskId: observer.taskId } }), /running command/);
   assert.ok(!compile(h.tools.get('Monitor').parameters).check({ action: 'update', notify: {} }));
 });
+
+test('shutdown disarms a timed source observer: timeout and batch timers cannot outlive monitors.clear()', async (t) => {
+  const h = createHarness();
+  let closed = false;
+  const close = async () => { if (!closed) { closed = true; await h.close(); } };
+  t.after(close);
+  const p = await producer(h);
+  const timeoutMs = 123456; // distinctive: only the observer's deadline uses it
+  const { BATCH_WINDOW_MS } = await loadModule('index.ts');
+  const setT = globalThis.setTimeout, clearT = globalThis.clearTimeout;
+  const armed = new Set();
+  globalThis.setTimeout = function(fn, ms, ...rest) {
+    const wrapped = typeof fn === 'function' ? (...args) => { armed.delete(timer); fn(...args); } : fn;
+    // Park the batch window so a slow ACK write cannot let the real 200ms timer fire before the assertion; the handle stays real and clearable.
+    const timer = setT.call(globalThis, wrapped, ms === BATCH_WINDOW_MS ? 60000 : ms, ...rest);
+    if (ms === timeoutMs || ms === BATCH_WINDOW_MS) armed.add(timer);
+    return timer;
+  };
+  globalThis.clearTimeout = function(timer) { armed.delete(timer); return clearT.call(globalThis, timer); };
+  try {
+    await attach(h, p, { persistent: false, timeout_ms: timeoutMs, watches: [{ id: 'out', text: 'OUT', notify: 'context' }] });
+    await p.emit('OUT now'); // arms the batch window without waiting for the flush
+    assert.ok(await until(() => armed.size === 2), 'observer timeout and batch window are armed');
+    await close();
+    assert.equal(armed.size, 0, 'shutdown must disarm source-observer timers');
+  } finally {
+    globalThis.setTimeout = setT; globalThis.clearTimeout = clearT;
+  }
+});

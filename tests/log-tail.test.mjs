@@ -103,6 +103,14 @@ test("a byte-bounded tail drops its partial first line", () => {
 	assert.match(tail.note ?? "", /tail/i);
 });
 
+test("a byte limit landing on a line boundary keeps the complete first line", () => {
+	const file = write("boundary.log", "old\nkeep-1\nkeep-2\n");
+	const tail = readLogTail(file, 14); // the tail starts right after "old\n"
+	assert.deepEqual(tail.text.split("\n"), ["keep-1", "keep-2"], "a complete line is not a partial one");
+	assert.equal(tail.truncated, true, "older lines were still dropped by the byte bound");
+	assert.match(tail.note ?? "", /tail/i);
+});
+
 test("missing, non-file and empty logs are notes, not errors", () => {
 	assert.deepEqual(readLogTail(path.join(work, "absent.log")), {
 		text: "",

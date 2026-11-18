@@ -175,7 +175,7 @@ export type MonitorSnapshot = {
 // ------------------------------------------------------------------ helpers
 
 /** Control characters would be invisible in an approval dialog. */
-const CONTROL_CHARS = /[\x00-\x08\x0b\x0c\x0e-\x1f]/;
+const CONTROL_CHARS = /[\x00-\x08\x0b\x0c\x0d\x0e-\x1f]/;
 
 function hasControlChars(value: string): boolean {
 	return CONTROL_CHARS.test(value);
@@ -635,7 +635,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 
 	// Only watches an already-stopping owned resource; never reruns work or invokes the model.
 	function awaitCleanup(record: MonitorRecord): void {
-		if (record.cleanupTimer || !record.resourceActive) return;
+		// A disposed runtime must not keep polling an unkillable resource forever.
+		if (disposed || record.cleanupTimer || !record.resourceActive) return;
 		record.cleanupTimer = setTimeout(() => {
 			record.cleanupTimer = undefined;
 			if (releaseResource(record)) {
@@ -1391,7 +1392,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			// Agent-settled delivery is correct for an agent-issued stop, but the
 			// local overlay cannot wait for a turn that may never settle.
 			if (stopped && lastCtx?.isIdle()) flushCompletions(lastCtx?.isIdle() === true);
-			const value = { stopped, id: params.id, ...(!stopped ? { status: "stop_timeout" } : {}) };
+			// An already-finalized record (a natural exit with a living background
+			// group) keeps its real status; only an un-finalized stop times out.
+			const value = { stopped, id: params.id, ...(!stopped ? { status: snapshotMonitor(record).status } : {}) };
 			return {
 				content: [{ type: "text" as const, text: stopReceipt(snapshotMonitor(record), stopped) }],
 				...(!stopped ? { isError: true } : {}),
@@ -1590,6 +1593,17 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		tasks.close();
 		// Kill synchronously before any await: explicit process.exit can bypass future timers.
 		killAllNow();
+		// Source subscriptions own no resource and never enter the loop below:
+		// disarm their timers and batchers so nothing fires on the disposed
+		// runtime after monitors.clear(). Outstanding cleanup polls die here too.
+		for (const record of monitors.values()) {
+			if (record.cleanupTimer) clearTimeout(record.cleanupTimer);
+			record.cleanupTimer = undefined;
+			if (liveResources.has(record.id)) continue;
+			if (record.timeoutTimer) clearTimeout(record.timeoutTimer);
+			record.timeoutTimer = undefined;
+			record.batcher?.close();
+		}
 		await Promise.all([...liveResources.values()].map(async (record) => {
 			const pending = pendingEndings.get(record.id);
 			if (pending) pending.notice = undefined;
