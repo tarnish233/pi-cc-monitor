@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-18
+
+### Fixed
+- `monitor_stop` reports the record's real status instead of always claiming `stop_timeout`, so it agrees with `monitor_list` when a command exited but a background process group is still alive.
+- Stop polling an unkillable resource once the session is disposed, and disarm source-observer timeout and batch timers during shutdown.
+- Reject carriage returns in a command, which could overwrite earlier text in the approval dialog.
+- `/tasks`: keep Detail/Stop clickable when a long "new task" announcement is shown, drop invisible hit regions in the single-line layout, repaint after a scrollbar press so clicks match the painted frame, and ignore presses on a one-row scrollbar instead of jumping back to the top.
+- `/tasks`: always offer a mouse Back/Close when the title control is unavailable — short terminals, narrow frames, and the status line shown after a stop.
+- Log tails no longer discard a complete first line when the byte limit lands exactly on a line boundary.
+
 ## [0.11.0] - 2026-11-17
 
 ### Added
