@@ -215,3 +215,131 @@ test("shutdown drops pending wakeups and later stale settlement is a no-op", asy
 	assert.equal(h.sent.length, 0);
 	assert.equal(h.starts.length, 0);
 });
+
+/** The real navigateTree control flow with a scripted session_before_tree outcome. */
+function treeHarness(t, beforeTree) {
+	const h = harness(t);
+	h.session._isAgentRunActive = false;
+	h.session._extensionRunner = {
+		hasHandlers: type => type === "session_before_tree",
+		emit: async event => {
+			if (event.type === "session_before_tree") return beforeTree(event, h);
+			await h.emit(event.type, event);
+		},
+	};
+	// Tool loadout restoration is unrelated to delivery and needs the full runtime.
+	h.session._restoreToolsFromTranscript = () => {};
+	return h;
+}
+
+async function delivered(h, timeoutMs = 3000) {
+	const until = Date.now() + timeoutMs;
+	while (!h.sent.length && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 10));
+	return h.sent.length;
+}
+
+test("a cancelled tree navigation delivers the stranded completion context-only, once", async t => {
+	let release;
+	const gate = new Promise(resolve => release = resolve);
+	const h = treeHarness(t, async () => { await gate; return { cancel: true }; });
+	try {
+		const target = h.session.sessionManager.appendCustomEntry("target", {});
+		h.session.sessionManager.appendCustomEntry("leaf", {});
+		const nav = h.session.navigateTree(target);
+		assert.equal(h.session.isIdle, false, "navigation counts as busy");
+		await finished(h);
+		assert.equal(h.sent.length, 0, "the outcome waits while navigation is in flight");
+		release();
+		assert.deepEqual(await nav, { cancelled: true });
+		assert.equal(h.session.isIdle, true, "cancel returns to idle without session_tree or agent_settled");
+		assert.equal(await delivered(h), 1, "the idle fallback delivers without any unrelated input");
+		assert.equal(h.sent[0].options.triggerTurn, false, "context-only: an interrupted turn is not restarted");
+		assert.equal(h.starts.length, 0);
+		assert.equal(h.entries().length, 1, "the outcome is really in the session tree");
+		await h.emit("agent_settled", { aborted: false });
+		assert.equal(h.sent.length, 1, "a later settlement never repeats the outcome");
+	} finally {
+		release();
+	}
+});
+
+test("a throwing tree navigation also recovers through the idle fallback", async t => {
+	let release;
+	const gate = new Promise(resolve => release = resolve);
+	const h = treeHarness(t, async () => { await gate; throw new Error("tree exploded"); });
+	try {
+		const target = h.session.sessionManager.appendCustomEntry("target", {});
+		h.session.sessionManager.appendCustomEntry("leaf", {});
+		const nav = h.session.navigateTree(target);
+		await finished(h);
+		assert.equal(h.sent.length, 0);
+		release();
+		await assert.rejects(nav, /tree exploded/);
+		assert.equal(h.session.isIdle, true);
+		assert.equal(await delivered(h), 1);
+		assert.equal(h.sent[0].options.triggerTurn, false);
+		assert.equal(h.starts.length, 0);
+	} finally {
+		release();
+	}
+});
+
+test("an aborted branch summary delivers the stranded completion context-only", async t => {
+	let release;
+	const gate = new Promise(resolve => release = resolve);
+	const h = treeHarness(t, async () => { await gate; h.session._branchSummaryAbortController.abort(); });
+	try {
+		// Real summarization plumbing, fake provider: the abort is terminal, never retried.
+		Object.defineProperty(h.session, "model", { value: { contextWindow: 128000 } });
+		h.session.settingsManager = { getBranchSummarySettings: () => ({}), getRetrySettings: () => ({ enabled: false }) };
+		h.session._getSummarizationRequestAuth = async () => ({ model: h.session.model, apiKey: "test", headers: {}, env: {} });
+		h.session._summarizationRetryCallbacks = () => ({});
+		h.session.agent = { streamFunction: async () => ({ result: async () => ({ role: "assistant", content: [], stopReason: "aborted", timestamp: Date.now() }) }) };
+		const target = h.session.sessionManager.appendCustomEntry("target", {});
+		h.session.sessionManager.appendMessage({ role: "user", content: [{ type: "text", text: "branch work" }], timestamp: Date.now() });
+		const nav = h.session.navigateTree(target, { summarize: true });
+		await finished(h);
+		assert.equal(h.sent.length, 0);
+		release();
+		assert.deepEqual(await nav, { cancelled: true, aborted: true });
+		assert.equal(h.session.isIdle, true);
+		assert.equal(await delivered(h), 1);
+		assert.equal(h.sent[0].options.triggerTurn, false);
+		assert.equal(h.starts.length, 0);
+	} finally {
+		release();
+	}
+});
+
+test("a completed navigation still flushes through session_tree with its normal wakeup", async t => {
+	let release;
+	const gate = new Promise(resolve => release = resolve);
+	const h = treeHarness(t, async () => { await gate; });
+	try {
+		const target = h.session.sessionManager.appendCustomEntry("target", {});
+		h.session.sessionManager.appendCustomEntry("leaf", {});
+		const nav = h.session.navigateTree(target);
+		await finished(h);
+		assert.equal(h.sent.length, 0);
+		release();
+		await nav;
+		assert.equal(h.sent.length, 1, "session_tree keeps owning the delivery");
+		assert.equal(h.sent[0].options.triggerTurn, true, "the normal terminal wakeup is preserved");
+		assert.equal(h.starts.length, 1);
+		await new Promise(resolve => setTimeout(resolve, 300));
+		assert.equal(h.sent.length, 1, "the idle fallback never duplicates a session_tree delivery");
+	} finally {
+		release();
+	}
+});
+
+test("shutdown cancels the idle fallback before its first await", async t => {
+	const h = harness(t);
+	await finished(h);
+	assert.equal(h.sent.length, 0);
+	await h.emit("session_shutdown", { reason: "quit" });
+	h.session._isAgentRunActive = false;
+	await new Promise(resolve => setTimeout(resolve, 400));
+	assert.equal(h.sent.length, 0, "the fallback timer must not fire on the disposed runtime");
+	assert.equal(h.starts.length, 0);
+});

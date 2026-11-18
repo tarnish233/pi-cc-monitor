@@ -44,6 +44,14 @@ function safePrefix(text: string, chars: number): string {
 	return text.slice(0, end);
 }
 
+/** Keep a tail slice from starting on the low half of a split surrogate pair. */
+export function safeSuffix(text: string, chars: number): string {
+	let start = Math.max(0, text.length - Math.floor(chars));
+	const first = text.charCodeAt(start);
+	if (first >= 0xdc00 && first <= 0xdfff) start++;
+	return text.slice(start);
+}
+
 /** Bound composed event lines, including separators and the truncation marker. */
 export function capEventLines(lines: string[], maxChars = MAX_BATCH_CHARS): string[] {
 	const cap = Math.max(0, Math.floor(maxChars));
@@ -66,6 +74,10 @@ export function capEventLines(lines: string[], maxChars = MAX_BATCH_CHARS): stri
 export class LineBatcher {
 	private buffer = "";
 	private pending: string[] = [];
+	/** Total events since the last flush; most are counted, not retained. */
+	private pendingCount = 0;
+	/** Joined length of the retained prefix, separators included. */
+	private pendingChars = 0;
 	private timer: ReturnType<typeof setTimeout> | null = null;
 	/** Keeps a multi-byte character that is split across two chunks intact. */
 	private decoder = new StringDecoder("utf8");
@@ -84,7 +96,7 @@ export class LineBatcher {
 			index = this.buffer.indexOf("\n");
 		}
 		const cap = this.options.maxPartialLineChars ?? MAX_PARTIAL_LINE_CHARS;
-		if (this.buffer.length > cap) this.buffer = this.buffer.slice(-cap);
+		if (this.buffer.length > cap) this.buffer = safeSuffix(this.buffer, cap);
 	}
 
 	/** A WebSocket text frame is one event, even when it contains newlines. */
@@ -95,10 +107,12 @@ export class LineBatcher {
 	/** Emit whatever is pending right away. */
 	flush(): void {
 		this.clearTimer();
-		if (!this.pending.length) return;
+		if (!this.pendingCount) return;
 		const pending = this.pending;
-		const count = pending.length;
+		const count = this.pendingCount;
 		this.pending = [];
+		this.pendingCount = 0;
+		this.pendingChars = 0;
 		this.options.onBatch(capEventLines(pending, this.options.maxBatchChars ?? MAX_BATCH_CHARS), count);
 	}
 
@@ -110,14 +124,19 @@ export class LineBatcher {
 		if (rest) this.accept(rest);
 		this.clearTimer();
 		const pending = this.pending;
+		const count = this.pendingCount;
 		this.pending = [];
-		return pending.length ? { lines: capEventLines(pending, this.options.maxBatchChars ?? MAX_BATCH_CHARS), count: pending.length } : undefined;
+		this.pendingCount = 0;
+		this.pendingChars = 0;
+		return count ? { lines: capEventLines(pending, this.options.maxBatchChars ?? MAX_BATCH_CHARS), count } : undefined;
 	}
 
 	/** An explicit policy update discards unpublished old output, not the raw log. */
 	discard(): void {
 		this.clearTimer();
 		this.pending = [];
+		this.pendingCount = 0;
+		this.pendingChars = 0;
 		this.buffer = "";
 		this.decoder = new StringDecoder("utf8");
 	}
@@ -127,6 +146,8 @@ export class LineBatcher {
 		this.closed = true;
 		this.clearTimer();
 		this.pending = [];
+		this.pendingCount = 0;
+		this.pendingChars = 0;
 		this.buffer = "";
 	}
 
@@ -134,8 +155,19 @@ export class LineBatcher {
 		const line = trim ? raw.trimEnd() : raw;
 		if (trim && !line) return;
 		this.options.onLine?.(line);
-		const cap = this.options.maxLineChars ?? MAX_LINE_CHARS;
-		this.pending.push(line.length > cap ? `${safePrefix(line, cap - TRUNCATED.length)}${TRUNCATED.slice(0, Math.max(0, cap))}` : line);
+		this.pendingCount++;
+		// A burst can outrun the flush timer, so retain only the prefix
+		// capEventLines can read: through the first line that overflows the
+		// batch cap. Every later event is counted, not kept in memory.
+		const batchCap = Math.max(0, Math.floor(this.options.maxBatchChars ?? MAX_BATCH_CHARS));
+		if (this.pendingChars <= batchCap) {
+			const cap = this.options.maxLineChars ?? MAX_LINE_CHARS;
+			const display = line.length > cap ? `${safePrefix(line, cap - TRUNCATED.length)}${TRUNCATED.slice(0, Math.max(0, cap))}` : line;
+			// Detach the kept line from a giant frame's V8 slice backing; the
+			// UTF-16 roundtrip copies code units exactly, lone surrogates included.
+			this.pending.push(Buffer.from(display, "utf16le").toString("utf16le"));
+			this.pendingChars += (this.pending.length > 1 ? 1 : 0) + display.length;
+		}
 		this.schedule();
 	}
 

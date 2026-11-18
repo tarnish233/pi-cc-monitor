@@ -24,10 +24,11 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 | 输出订阅 | `events` + `source.monitorId`：订阅本会话中运行中的 command Monitor；观察不拥有进程，停止/超时/flood 不影响工作 | `Monitor` |
 | 动态 watches | literal、stdout/stderr/both、once/repeat、独立通知等级；`action=update` 原地更新，未变规则保留触发状态 | `Monitor` |
 | 通知策略 | `notify.output=turn/context/none`、`notify.terminal=turn/context`；用户停止只记 context 不重启回合 | `Monitor` |
-| 通知节奏 | completion 与 events 终态在忙时由插件暂存，Agent settled 后通知；中断只保存结果、不重启回复；events 普通输出仍为 steer | 自动 |
+| 通知节奏 | completion 与 events 终态在忙时暂存，Agent settled 后通知；无结束事件的空闲恢复有 context-only 兜底；中断不重启回复，events 普通输出仍为 steer | 自动 |
 | 超时/常驻 | `timeout_ms`：completion 默认 30 分钟（上限 2 小时）；events 默认 5 分钟（上限 1 小时）；`persistent` 到会话结束 | `Monitor` |
 | 批量 | events 模式：200ms 内的事件合并成一条通知 | 自动 |
-| 长度上限 | events 模式：单行 500 字符、完整通知 3000 字符（含头部、抑制提示、换行和截断标记）；仅显示头部有界，原始描述保留在 metadata | 自动 |
+| 长度上限 | events 模式：单行 500 字符、完整通知 3000 字符（含头部、抑制提示、换行和截断标记）；原始描述保留在 metadata | 自动 |
+| 内存上限 | 待发正文只保留最终通知需要的前缀（默认最多约 3501 字符），完整事件数单独统计；WS 日志积压最多 4 MiB，超限停止日志但不停止 socket | 自动 |
 | 限流 | events 模式：每来源突发 10 条、之后每 2 秒 1 条；持续超量 30 秒只停止该来源。另有会话级 20 条输出/60 秒预算：超出仅抑制并汇总，不停止工作，终态独立投递；汇总本身不占输出额度 | 自动 |
 | 停止语义 | 先 `stopping`；SIGTERM→2s→SIGKILL→1s 确认。未确认时 `stop_timeout` 保留句柄可重试；`exited` 是逻辑结果，资源层单独跟踪到消失 | 自动 |
 | 停止/列表 | 按 id 停止（source 只停订阅）、列出模式、状态、事件/抑制与退出码 | `monitor_stop` / `monitor_list` |
@@ -102,7 +103,9 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 }
 ```
 
-工具立即返回任务 ID 和日志路径。测试产生的 stdout/stderr 只写文件，不逐行进入对话；结束后模型收到一次退出码和日志路径。 忙碌时完成结果不进入 Pi 的可清除消息队列；如果当前回复被中断，已有完成结果会留在会话中，但不会强行重启该回复。中断之后才完成的新任务仍按正常的空闲通知规则处理。
+工具立即返回任务 ID 和日志路径。测试产生的 stdout/stderr 只写文件，不逐行进入对话；结束后模型收到一次退出码和日志路径。忙碌时完成结果不进入 Pi 的可清除消息队列；如果当前回复被中断，已有完成结果会留在会话中，但不会强行重启该回复。中断之后才完成的新任务仍按正常的空闲通知规则处理。
+
+若 `/tree` 取消或失败，只恢复空闲却没有 `session_tree` / `agent_settled`，待发结果用一个 200ms 空闲兜底保存为 **context-only**，不再无限等候下一次输入。正常结束事件仍按通知策略投递。这个保守兜底也可能早于很慢的其他 settled 处理器（超过 200ms），此时只保存结果而不唤醒模型。
 
 **等一次服务就绪，但不阻塞主 agent**
 
@@ -175,6 +178,8 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 - events 模式：空行不算事件；超长内容以 `...(truncated)` 截断
 - 日志按运行时隔离在 `$TMPDIR/pi-cc-monitor-*/`；目录 0700、文件 0600（POSIX）。只清理已关闭或确认所属进程已退出、且最后活动超过 3 天的目录；安静的活跃任务不清理。旧版无归属信息的扁平目录不自动删除
 - 运行中日志写入错误不会崩溃 Pi；初始化失败会正常收尾，不会遗留假的 running 记录
+- WS 日志写积压超过 **4 MiB** 或发生写错误时，停止该日志流、标记 `logError` / `log incomplete`，但不因日志故障结束 socket 或改变事件观察。已有日志可能不完整，后续帧不再写入；需要恢复日志时请新建 Monitor，update 不会重启日志。4 MiB 限的是待写内存，不是日志文件大小
+- 日志降级只发一次 **context-only 基础设施告警**：即使 `notify.output=none` 也可见，不占普通事件计数/输出预算，不启动模型。`monitor_list` 和 `/tasks` 详情会保留日志不完整标记
 - events 模式的管道要逐行 flush：`grep --line-buffered`；`head` 不行
 - 只匹配成功标记的监视脚本在 crash/hang 时会静默；把 `ERROR|FAILED|Killed` 也覆盖进去
 - `tail -f` / `while true` 不会自己退出；不需要时用 `monitor_stop` 或 `timeout_ms`
@@ -225,7 +230,7 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 ## 兼容性
 
 - Node.js `>=22.19.0`
-- Pi 1.5.1、1.5.2（本版回归通过）；Pi 1.5.0 及更早版本本版未重新验收
+- Pi 1.5.2（本轮修复与回归验收通过）；Pi 1.5.1 及更早版本本轮未重新验收
 - `pi-cc-loop` 可选；两者通过 `pi.events` 通信。建议搭配 Loop 0.9.0 获得完整分组/分区详情和停止确认；旧 Loop 接管面板时仍能读取兼容的扁平详情，不会出现空详情。
 - 与 `pi-cc-extensions` 共存。工具调用行交给 Pi 原生或 `pi-cc-extensions` 渲染，不需要配置它的 `excludeRenderers`，也不需要关闭 ccstyle 或其 tool grouping。事件卡片走独立 custom message renderer，不受 ccstyle 开关影响。本扩展不写其他插件的配置文件。
 
@@ -249,7 +254,8 @@ npm run typecheck
 行为选择规则对齐 Claude Code 2.1.318：一次完成用后台命令，多次发生用 Monitor 事件流。用 Pi 扩展 API 实现。有意不同的地方：
 
 - CC 分别使用 Bash 的 `run_in_background` 和独立 Monitor；本扩展把它们合并成 `Monitor.mode`，避免长命令先阻塞前台 Bash。缺省仍是 `events`，已有调用不变。
-- completion 在活动回合中先保留结果，等 `agent_settled` 后投递，避免 Pi 清队列丢失唯一通知；中断回合和手动 compaction 只保存结果，不重新启动模型。events 保持 Monitor 的 steer。
+- completion 在活动回合中先保留结果，等 `agent_settled` 后投递，避免 Pi 清队列丢失唯一通知；中断回合和手动 compaction 只保存结果，不重新启动模型。缺失结束事件的空闲恢复会 context-only 补发；events 保持 Monitor 的 steer。
+- 事件批处理内存只保留有界前缀，不影响完整事件计数；WS 日志积压超限会停止日志并告警，socket 继续。普通输出限流与日志写故障是两种独立机制。
 - `monitor_stop` / `monitor_list` 对应 CC 的 `TaskStop` / `TaskList`。
 - 底部显示 `2 monitors`（和 pi-cc-loop 的芯片同一格式）；CC 底部的任务 pill 也写作 `2 monitors`，还能选中后打开任务列表。
 - 事件是 Pi 的自定义消息（类型 `Monitor`，正文首行 `monitor <id> · <描述>`），不是 CC 的 `<task-notification>`。

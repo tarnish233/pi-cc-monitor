@@ -48,3 +48,20 @@ test('raw complete lines match before clipping, preserve split UTF8, finish and 
   parser.push(Buffer.from('OLD')); parser.clear(); parser.push(Buffer.from('NEW\n'));
   assert.equal(lines.at(-1), 'NEW');
 });
+
+test('partial-line tail clipping never starts with an orphan low surrogate; ASCII tail unchanged', async () => {
+  const { MAX_PARTIAL_LINE_CHARS } = await loadModule('stream.ts');
+  const rogue = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+  const raw = Buffer.from('😀' + 'x'.repeat(MAX_PARTIAL_LINE_CHARS - 1));
+  const lines = [];
+  const push = new OutputLines((line) => lines.push(line));
+  push.push(raw); push.push(Buffer.from('\n'));
+  assert.ok(!rogue.test(lines[0]), 'clipped head must be a whole code point');
+  assert.equal(lines[0], 'x'.repeat(MAX_PARTIAL_LINE_CHARS - 1));
+  const finish = new OutputLines((line) => lines.push(line));
+  finish.push(raw); finish.finish();
+  assert.ok(!rogue.test(lines[1]));
+  const ascii = new OutputLines((line) => lines.push(line));
+  ascii.push(Buffer.from('X'.repeat(MAX_PARTIAL_LINE_CHARS + 5))); ascii.push(Buffer.from('\n'));
+  assert.equal(lines[2], 'X'.repeat(MAX_PARTIAL_LINE_CHARS));
+});

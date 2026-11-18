@@ -2,7 +2,7 @@
 import { StringDecoder } from "node:string_decoder";
 import type { TerminalLevel } from "./notification-budget.ts";
 import { strongerLevel } from "./notification-budget.ts";
-import { MAX_PARTIAL_LINE_CHARS } from "./stream.ts";
+import { MAX_PARTIAL_LINE_CHARS, safeSuffix } from "./stream.ts";
 
 export type OutputStream = "stdout" | "stderr";
 export type WatchRule = {
@@ -72,7 +72,7 @@ export class OutputLines {
 			this.buffer = this.buffer.slice(newline + 1);
 			if (line.trim()) this.accept(line);
 		}
-		if (this.buffer.length > MAX_PARTIAL_LINE_CHARS) this.buffer = this.buffer.slice(-MAX_PARTIAL_LINE_CHARS);
+		if (this.buffer.length > MAX_PARTIAL_LINE_CHARS) this.buffer = safeSuffix(this.buffer, MAX_PARTIAL_LINE_CHARS);
 	}
 	finish(): void {
 		const line = this.buffer + this.decoder.end();

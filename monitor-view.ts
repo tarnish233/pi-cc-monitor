@@ -26,6 +26,7 @@ export interface MonitorView {
 	eventCount?: number;
 	suppressedCount?: number;
 	globalSuppressedCount?: number;
+	logError?: string;
 	watches?: WatchState[];
 }
 
@@ -63,6 +64,7 @@ export function monitorBadges(view: MonitorView): string[] {
 		if (view.globalSuppressedCount) badges.push(`${view.globalSuppressedCount} session-suppressed`);
 	}
 	if (view.notify.terminal === "context") badges.push("terminal context");
+	if (view.logError) badges.push("log incomplete");
 	if (view.resourceActive && view.status && !["running", "stopping", "stop_timeout"].includes(view.status)) badges.push("cleanup pending");
 	return badges;
 }

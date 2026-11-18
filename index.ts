@@ -90,6 +90,9 @@ export const ENDED_MONITOR_HISTORY_LIMIT = 50;
 /** Claude Code batches stdout lines within 200ms into a single notification. */
 export const BATCH_WINDOW_MS = 200;
 
+/** A ws log's queued writes are capped; past this the log degrades, the watch continues. */
+const WS_LOG_BACKLOG_LIMIT_BYTES = 4 * 1024 * 1024;
+
 export type MonitorCause = "output" | "exit" | "timeout" | "error" | "closed" | "stopped" | "flooded" | "stop_timeout";
 
 /** Claude Code's notice when a monitor is stopped. */
@@ -139,6 +142,8 @@ export interface MonitorRecord {
 	tails?: { stdout: LogTail; stderr: LogTail };
 	/** Closes a ws monitor's log; a command monitor's logs close with its process. */
 	closeLog?: () => void;
+	/** Set when a ws log stopped early (write error or backlog cap); the log is incomplete. */
+	logError?: string;
 	timeoutTimer?: ReturnType<typeof setTimeout>;
 	batcher?: LineBatcher;
 	limiter: RateLimiter;
@@ -170,6 +175,7 @@ export type MonitorSnapshot = {
 	pid?: number;
 	outputPath: string;
 	stderrPath: string;
+	logError?: string;
 };
 
 // ------------------------------------------------------------------ helpers
@@ -343,6 +349,7 @@ function snapshotMonitor(record: MonitorRecord): MonitorSnapshot {
 		...(record.child?.pid !== undefined ? { pid: record.child.pid } : {}),
 		outputPath: record.outputPath,
 		stderrPath: record.stderrPath,
+		...(record.logError !== undefined ? { logError: record.logError } : {}),
 	};
 }
 
@@ -355,11 +362,11 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	const observers = new Map<string, Set<string>>();
 	const pendingEndings = new Map<string, Ending>();
 	// Busy completions stay here, outside Pi's Esc-clearable message queues.
-	const pendingCompletions = new Map<string, Parameters<ExtensionAPI["sendMessage"]>[0]>();
-	const terminalLevels = new Map<string, TerminalLevel>();
+	const pendingCompletions = new Map<string, { message: Parameters<ExtensionAPI["sendMessage"]>[0]; terminal: TerminalLevel }>();
 	const outputBudget = new OutputBudget();
 	const globallySuppressed = new Map<string, number>();
 	let summaryTimer: ReturnType<typeof setTimeout> | undefined;
+	let idleFallbackTimer: ReturnType<typeof setTimeout> | undefined;
 	let logDirectory: ReturnType<typeof createLogDirectory> | undefined;
 	let lastCtx: ExtensionContext | undefined;
 
@@ -407,7 +414,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	}
 
 	let lastStatusText: string | undefined;
-	let statusSet = false;
 
 	/**
 	 * One chip in Pi's footer while monitors run: `2 monitors`, in the format of
@@ -428,9 +434,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			const label = running === 1 ? "monitor" : "monitors";
 			const text = loadConfig().footer && running > 0 ? `${running} ${label}` : undefined;
 			// Every call repaints, even with the same text, so speak only on change.
-			if (text === lastStatusText && (text !== undefined || !statusSet)) return;
+			// lastStatusText !== undefined doubles as "a status is set".
+			if (text === lastStatusText) return;
 			lastStatusText = text;
-			statusSet = text !== undefined;
 			ctx.ui.setStatus(STATUS_KEY, text);
 		} catch {
 			// a stale context must never break the monitor
@@ -458,13 +464,34 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	}
 
 	function flushCompletions(triggerTurn: boolean): void {
-		for (const [id, message] of [...pendingCompletions]) {
-			if (publish(message, "completion", triggerTurn && terminalLevels.get(id) !== "context")) {
+		for (const [id, pending] of [...pendingCompletions]) {
+			if (publish(pending.message, "completion", triggerTurn && pending.terminal !== "context")) {
 				pendingCompletions.delete(id);
-				terminalLevels.delete(id);
 			}
 		}
+		if (!pendingCompletions.size && idleFallbackTimer) {
+			clearTimeout(idleFallbackTimer);
+			idleFallbackTimer = undefined;
+		}
 		scheduleMonitorPrune();
+	}
+
+	/**
+	 * A cancelled or failed /tree navigation returns to idle without emitting
+	 * session_tree or agent_settled, which would strand the outbox. One timer,
+	 * armed only while results are pending, polls for that recovered idle and
+	 * delivers context-only so an interrupted turn is never restarted; normal
+	 * settlement still owns the wakeup and empties the outbox first.
+	 */
+	function scheduleIdleFallback(): void {
+		if (disposed || idleFallbackTimer || !pendingCompletions.size) return;
+		idleFallbackTimer = setTimeout(() => {
+			idleFallbackTimer = undefined;
+			if (disposed || !pendingCompletions.size) return;
+			if (lastCtx?.isIdle()) flushCompletions(false);
+			else scheduleIdleFallback();
+		}, 200);
+		idleFallbackTimer.unref?.();
 	}
 
 	function summaryLine(): string | undefined {
@@ -560,9 +587,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			// Keep critical outcomes outside Esc-clearable queues, in both modes.
 			const terminal = cause === "stopped" || cause === "stop_timeout" ? "context" : level === "turn" ? "turn" : "context";
 			message.details.notifyLevel = terminal;
-			pendingCompletions.set(record.id, message);
-			terminalLevels.set(record.id, terminal);
+			pendingCompletions.set(record.id, { message, terminal });
 			if (lastCtx?.isIdle()) flushCompletions(true);
+			else scheduleIdleFallback();
 			return true;
 		}
 		return publish(message, "events", level === "turn");
@@ -669,13 +696,11 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		if (record.kind === "source" && ending.flush && !ending.kill) finishObserver(record);
 		const batch = record.finalBatch ?? (ending.flush && !ending.kill ? record.batcher?.drain() : undefined);
 		let lastLines: string[] = [];
-		let lastLevel: OutputLevel = "none";
 		if (batch && ending.notice && record.notify.output !== "none") {
 			const verdict = record.limiter.take(batch.count);
 			if (verdict.deliver) {
 				record.eventCount += batch.count;
 				lastLines = verdict.suppressed ? [suppressionNotice(verdict.suppressed), ...batch.lines] : batch.lines;
-				lastLevel = outputLevel(record.notify.output, record.pendingLevel ?? record.notify.output);
 			} else record.suppressedCount += batch.count;
 		}
 		record.finalBatch = undefined;
@@ -692,9 +717,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		if (ending.notice) {
 			const global = globallySuppressed.get(record.id);
 			const lines = [ending.notice(), ...(global ? [`[Session budget suppressed ${global} events from this monitor; raw logs are unchanged.]`] : []), ...lastLines];
-			// A terminal policy of context is a hard ceiling: merged output cannot turn it into a wakeup.
-			const terminalLevel = record.notify.terminal === "context" ? "context" : strongerLevel(record.notify.terminal, lastLevel);
-			deliver(record, ending.cause, lines, terminalLevel, lastLines.length > 0);
+			// Context is a hard ceiling; turn is already the strongest level.
+			// Merging the last output cannot change the configured terminal policy.
+			deliver(record, ending.cause, lines, record.notify.terminal, lastLines.length > 0);
 			forgetSuppression(record.id);
 		} else if (globallySuppressed.has(record.id)) {
 			// A silent end (a source observer closed by its work) still owes the
@@ -824,7 +849,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		for (const record of [...monitors.values()]) {
 			if (record.loopPrompt === undefined || chainPrompt(record.loopPrompt) !== ended) continue;
 			pendingCompletions.delete(record.id);
-			terminalLevels.delete(record.id);
 			forgetSuppression(record.id);
 			if (!isActive(record)) continue;
 			stops.push(endMonitor(record, { status: "stopped", cause: "stopped", kill: true }));
@@ -1021,6 +1045,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			},
 			onExit: (code, signal) => {
 				record.exitCode = code;
+				// A confirmed Stop already released ownership; a late close must
+				// not probe or signal a PID the OS may have handed to a new group.
+				if (!record.resourceActive) return;
 				const gone = releaseResource(record);
 				const pending = pendingEndings.get(record.id);
 				if (pending) {
@@ -1070,11 +1097,43 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			try { fs.closeSync(fd); } catch { /* already closed */ }
 			throw error;
 		}
-		// A log write that fails (a full disk, a deleted temp dir) must not end the
-		// watch: a stream "error" without a listener is an uncaught exception.
-		stream.on("error", () => {});
-		record.closeLog = () => stream.end();
-		return (line) => stream.write(`${line}\n`);
+		// A log failure (a full disk, a deleted temp dir, a disk too slow for the
+		// frame rate) degrades the log, never the watch: stop writing, mark the
+		// log incomplete and warn once, context-only, even under output:none.
+		// Nothing further is queued into a stuck stream, and the warning is an
+		// infrastructure notice: no event-count or output-budget slot, no wakeup.
+		// record.logError is the degrade-once marker: only degrade sets it, and
+		// nothing ever clears it, so it replaces a private boolean.
+		const degrade = (reason: string) => {
+			if (record.logError !== undefined) return;
+			record.logError = reason;
+			record.closeLog = () => {};
+			stream.destroy();
+			if (disposed) return;
+			tasks.changed();
+			// A pending disk write can fail after the watch already ended; only a
+			// running watch keeps observing, so the notice must not claim continuation.
+			const outcome = record.status === "running"
+				? `The watch continues; later frames are not written to ${record.outputPath}.`
+				: `The watch is no longer observing; buffered writes may be missing from ${record.outputPath}.`;
+			const line = `[Log incomplete \u2014 ${reason}. ${outcome}]`;
+			publish({ customType: EVENT_MESSAGE_TYPE, content: `monitor ${record.id} \u00b7 log degraded\n${line}`, display: true,
+				details: { monitorId: record.id, kind: record.kind, mode: record.mode, description: record.description, cause: "output", lines: [line], notifyLevel: "context", outputPath: record.outputPath } }, "events", false);
+		};
+		// A stream "error" without a listener is an uncaught exception; an error
+		// after degradation (destroy flushes pending writes) must not warn twice.
+		stream.on("error", (error) => degrade(`log write failed: ${error.message}`));
+		record.closeLog = () => { if (record.logError === undefined) stream.end(); };
+		return (line) => {
+			if (record.logError !== undefined || stream.destroyed || stream.writableEnded) return;
+			// write() === false is ordinary backpressure; only a backlog past the
+			// cap means the disk cannot keep up and the log must stop.
+			if (stream.writableLength + Buffer.byteLength(line) + 1 > WS_LOG_BACKLOG_LIMIT_BYTES) {
+				degrade("disk writes fell behind (4 MiB log backlog cap)");
+				return;
+			}
+			stream.write(`${line}\n`);
+		};
 	}
 
 	function armWebSocket(input: ArmInput & { url: string; protocols?: string[] }): MonitorRecord {
@@ -1437,19 +1496,14 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					pid: Type.Optional(Type.Number()),
 					outputPath: Type.String(),
 					stderrPath: Type.String(),
+					logError: Type.Optional(Type.String()),
 				}),
 			),
 		}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			lastCtx = ctx;
 			const list = [...monitors.values()].map(snapshotMonitor);
-			if (!list.length) {
-				return {
-					content: [{ type: "text" as const, text: "No monitors." }],
-					details: { monitors: list },
-					structuredContent: { monitors: list },
-				};
-			}
+			// monitorListText([]) is "No monitors." — the empty case needs no branch.
 			const text = monitorListText(list);
 			return {
 				content: [{ type: "text" as const, text }],
@@ -1542,6 +1596,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 						...(record.sourceId ? [{ label: "Shared with", value: `source #${record.sourceId}; full source logs, not only matched events` }] : []),
 						{ label: "stdout", value: record.outputPath },
 						{ label: "stderr", value: record.stderrPath },
+						...(record.logError ? [{ label: "Log status", value: `incomplete \u2014 ${record.logError}` }] : []),
 					] },
 				],
 				logs: [
@@ -1591,6 +1646,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		disposed = true;
 		// Close an open task overlay before the context and logs go away.
 		tasks.close();
+		// The idle fallback must not fire on the disposed runtime after an await.
+		if (idleFallbackTimer) clearTimeout(idleFallbackTimer);
+		idleFallbackTimer = undefined;
 		// Kill synchronously before any await: explicit process.exit can bypass future timers.
 		killAllNow();
 		// Source subscriptions own no resource and never enter the loop below:
@@ -1613,7 +1671,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		}));
 		if (!liveResources.size) removeExitHook();
 		pendingCompletions.clear();
-		terminalLevels.clear();
 		globallySuppressed.clear();
 		if (summaryTimer) clearTimeout(summaryTimer);
 		summaryTimer = undefined;
@@ -1621,8 +1678,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		monitors.clear();
 		// Pi clears extension statuses when it unloads, but a reload should not
 		// leave a stale count behind until then.
-		if (statusSet) {
-			statusSet = false;
+		if (lastStatusText !== undefined) {
 			lastStatusText = undefined;
 			try {
 				lastCtx?.ui?.setStatus?.(STATUS_KEY, undefined);

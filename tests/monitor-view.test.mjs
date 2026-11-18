@@ -88,3 +88,13 @@ test("list text is a stable snapshot: roles, source relation, frozen age, counts
   assert.doesNotMatch(first.split("\n")[0], /0 events/);
   assert.equal(monitorListText([]), "No monitors.");
 });
+
+test("a degraded ws log is a visible badge, not a lifecycle state", () => {
+  const healthy = record({ kind: "ws", mode: "events" });
+  assert.ok(!monitorBadges(healthy).includes("log incomplete"));
+  const degraded = record({ kind: "ws", mode: "events", logError: "disk writes fell behind (4 MiB log backlog cap)" });
+  assert.ok(monitorBadges(degraded).includes("log incomplete"));
+  assert.equal(degraded.status, "running", "the badge never changes the status vocabulary");
+  assert.match(monitorListText([degraded], 2000), /log incomplete/);
+  assert.doesNotMatch(monitorListText([healthy], 2000), /log incomplete/);
+});
