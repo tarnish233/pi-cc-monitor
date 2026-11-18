@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-11-18
+
+### Fixed
+- Ignore late command-exit resource probes once ownership was confirmed released, while retaining exit-code correction and cleanup of still-owned background groups.
+- Recover terminal results stranded by cancelled/failed tree navigation using a pending-only idle fallback that stores them context-only, without restarting an interrupted run.
+- Bound pending event text before flushing, keep complete event counts, and detach retained prefixes from giant source-string backing storage.
+- Keep partial-line tail clipping from producing an orphan low surrogate in direct output and source observers.
+- Make shared settings-panel save errors nonfatal and preserve unreadable settings; fit long/wide task-detail labels without losing value text.
+- Report late log-write failures truthfully after a watch has already ended rather than claiming it still observes.
+
+### Changed
+- Cap WebSocket queued log writes at 4 MiB. On backlog overflow or write failure, stop logging but keep the socket/event stream, expose logError/log-incomplete markers, and send one context-only infrastructure warning even when ordinary output is muted. Healthy logs still flush on close.
+- Consolidate the protected terminal outbox and its policy, remove redundant footer/terminal/degradation state and the duplicate empty-list branch, and avoid constructing discarded event prefixes.
+- Document the conservative context-only idle fallback, log degradation and current Pi 1.5.2 validation; add real-navigation, blocked-Writable and memory-bound regression tests.
+
 ## [0.11.1] - 2026-11-18
 
 ### Fixed
