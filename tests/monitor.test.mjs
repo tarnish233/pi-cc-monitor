@@ -99,8 +99,17 @@ function summarize(sent) {
 	return sent.map((entry) => `${entry.message.details.cause}: ${entry.message.content.split("\n").slice(1).join(" | ")}`).join("\n");
 }
 
+const harnesses = new Set();
+test.after(async () => {
+	// A failed assertion must not leave a gated/persistent fixture alive until
+	// its 30-minute background deadline and hang the entire test worker.
+	for (const h of harnesses) await h.handlers.get("session_shutdown")?.({ reason: "quit" }, h.ctx);
+	harnesses.clear();
+});
+
 async function start(h) {
 	factory(h.pi);
+	harnesses.add(h);
 	return h;
 }
 
@@ -131,12 +140,14 @@ test("the schema extends Claude Code's Monitor with notification modes", async (
 		"command",
 		"description",
 		"id",
+		"ids",
 		"loopPrompt",
 		"mode",
 		"notify",
 		"persistent",
 		"source",
 		"timeout_ms",
+		"wait_timeout_ms",
 		"watches",
 		"ws",
 	]);
@@ -1275,11 +1286,14 @@ test("the tool description carries Claude Code's usage guidance", async () => {
 	for (const name of ["Monitor", "monitor_stop", "monitor_list"]) {
 		assert.ok(h.tools.get(name).promptSnippet, `${name} has a prompt snippet`);
 	}
-	assert.equal(tool.promptGuidelines.length, 3);
+	assert.equal(tool.promptGuidelines.length, 4);
 	assert.ok(tool.promptGuidelines[0].includes("instead of foreground bash"));
 	assert.ok(tool.description.includes("cover the expected runtime"), "deadline guidance belongs to the tool contract");
 	assert.ok(!tool.promptGuidelines.join(" ").includes("1800000"), "the deadline is not duplicated in selection guidelines");
-	assert.ok(tool.promptGuidelines[1].includes("end your turn now"));
+	assert.ok(tool.promptGuidelines[1].includes('action="wait"'));
+	assert.ok(tool.promptGuidelines[1].includes("required ids"));
+	assert.ok(tool.promptGuidelines[2].includes("completed=false"));
+	assert.ok(tool.description.includes('wait_timeout_ms'));
 	assert.ok(!h.handlers.has("before_agent_start"), "guidelines are static tool metadata, not a dynamic prompt hook");
 });
 

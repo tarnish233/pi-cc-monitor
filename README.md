@@ -19,6 +19,7 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 | 功能 | 说明 | 入口 |
 | --- | --- | --- |
 | 后台执行 | `completion`：命令异步运行，stdout/stderr 只写日志；终态与尚未发送的末批输出合成一条可信结果 | `Monitor` |
+| 结果收口 | `action=wait`：只等指定的 completion 依赖，批量返回终态、输出和路径；启动仍异步，不停止其他工作 | `Monitor` |
 | 后台监视 | `events`：命令 stdout 每行 = 一个事件；进程退出结束 | `Monitor` |
 | WebSocket | `events`：每个 text frame = 一个事件，binary 记为占位行 | `Monitor` |
 | 输出订阅 | `events` + `source.monitorId`：订阅本会话中运行中的 command Monitor；观察不拥有进程，停止/超时/flood 不影响工作 | `Monitor` |
@@ -40,11 +41,11 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 
 | 工具 | 说明 |
 | --- | --- |
-| `Monitor` | 启动 completion/events 任务，或 `source` 订阅；`action: "update"` 原地修改观察策略 |
+| `Monitor` | `start` 启动后台任务／订阅；`update` 修改观察策略；`wait` 按 `ids` 收回必要 completion 结果 |
 | `monitor_stop` | 按 id 停止 |
 | `monitor_list` | 列出模式、状态、事件数、退出码；退出后时长冻结 |
 
-三个工具都声明了 `outputSchema`：开了 codemode 时，脚本里 `tools.Monitor(...)` 返回 `{ taskId, mode, kind, outputPath, stderrPath, … }`，`tools.monitor_list()` 返回 `{ monitors: [...] }`，批量起/停不用解析文本。没开 codemode 时没有影响。
+三个工具都声明了 `outputSchema`：codemode 中 `Monitor` 的 start/update 保持 `{ taskId, mode, kind, outputPath, stderrPath, … }`；wait 返回 `{ action: "wait", completed, timedOut, allSucceeded, pendingIds, monitors, … }`。`monitor_list()` 仍返回 `{ monitors: [...] }`。脚本应按动作消费结构化结果，不必解析文本；工具数量不变。
 
 显示名称按职责分为 `task`（command/completion）、`watcher`（command/events）、`socket`（ws/events）、`subscription`（source/events）；只是展示术语，不改 API 枚举或结构化结果。工具正文先显示操作结论与身份，再列设置、完整日志路径和模型等待规则。update 显示实际规则/通知变化；stop 明确影响范围，清理未确认不会声称成功。`monitor_list` 是状态快照，不是实时输出流。
 
@@ -54,24 +55,46 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
-| `action` | `"start" \| "update"`? | 缺省 start；update 必须带 `id`，只接受 `watches`/`notify`，绝不启动或重启工作 |
+| `action` | `"start" \| "update" \| "wait"`? | 缺省 start；update 改策略；wait 只等待指定 completion 结果 |
 | `id` | string? | 仅 `action=update` 的目标 Monitor id |
+| `ids` | string[]? | 仅 wait：本会话 1–20 个不同的 command/completion 依赖 ID；不是全部后台任务 |
+| `wait_timeout_ms` | number? | 仅 wait：1000 起，默认 1800000（30 分钟），上限 7200000（2 小时）；只结束等待，不杀任务、不改任务期限 |
 | `source` | `{ monitorId }`? | events 专用：订阅本会话运行中的 command Monitor，不另起进程 |
 | `watches` | WatchRule[]? | 仅 source observer：`{id,text,stream?,once?,notify?}`；literal 匹配，最多 20 条，`[]` 静音 |
 | `notify` | object? | `output`：turn/context/none；`terminal`：turn/context。监听自身等级不能超过 Monitor 上限 |
 | `mode` | `"completion" \| "events"`? | 通知模式；缺省为 `events` 保持旧调用兼容。completion 只支持 `command` |
 | `command` | string? | 脚本；completion 记录日志并报告一次终态，events 每行 stdout 一个事件 |
 | `ws` | object? | `{ url, protocols? }`；events 模式下 text frame 一个事件 |
-| `description` | string | 出现在每条通知里 |
+| `description` | string | start 必填，出现在通知里；update/wait 不接受 |
 | `timeout_ms` | number? | 1000 起。completion 默认 1800000（30 分钟）、上限 7200000（2 小时）；events 默认 300000、上限 3600000 |
 | `persistent` | boolean? | 会话级常驻，不超时 |
 | `loopPrompt` | string? | 所属 `/loop` 的 prompt（原样），loop 结束时连带停止；只在装了 `pi-cc-loop` 时生效，否则忽略 |
 
-`command`、`ws`、`source` 三选一；`watches` 只能配 `source`。新调用应显式选择 `mode`：只需要完成结果用 `completion`，每次发生都要通知用 `events`。预计长时间运行、等待外部条件或可能碰到前台 Bash timeout 的命令，应直接用 `completion`，不要先在前台 Bash 阻塞。这个选择规则同时写在工具描述和静态 `promptGuidelines` 中；不修改原生 Bash，也不注册动态 prompt hook。
+start 的 `command`、`ws`、`source` 三选一；`watches` 只能配 `source`。update 只接受 `id`、`watches`、`notify`；wait 只接受 `ids`、`wait_timeout_ms`，不能混入启动／更新字段。新调用应显式选择 `mode`：只需要完成结果用 `completion`，每次发生都要通知用 `events`。预计长时间运行、等待外部条件或可能碰到前台 Bash timeout 的命令，应直接用 `completion`，不要先在前台 Bash 阻塞。这个选择规则同时写在工具描述和静态 `promptGuidelines` 中；不修改原生 Bash，也不注册动态 prompt hook。
 
 completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 设得足以覆盖预期耗时（最长 2 小时）；超时通知说明的是后台时限，不会显示成 `monitor expired`。退出码 0 记为 completed，非零／信号记为 failed。只有明确需要会话级常驻的进程才使用 `persistent: true`，它不是跨进程退出保留机制。
 
-模型侧的选择规则保持精简：一次完成用 completion，每次发生用 events，长期工作的选择性输出用 completion + source observer。静态 `promptGuidelines` 只有三句（completion 替代前台 Bash、等待时结束回合、update 不得重启工作）。不修改原生 Bash，也不注册动态 prompt hook。
+模型侧规则保持静态：一次完成用 completion，每次发生用 events，选择性输出用 completion + source observer。启动后继续独立工作；最终报告依赖后台结果时，先按必要 `ids` 调用 wait，再读取／核验材料。离开回合等待或 wait 未收齐时只能给阶段性／明确不完整的更新，不能宣布整个任务完成。不修改原生 Bash、system prompt 或历史，也不靠识别回答文字拦截最终报告。
+
+### 最终汇报前批量收口
+
+后台下载期间，主模型仍可调研其他内容。独立工作结束、准备汇报时，使用启动回执里的真实任务 ID：
+
+```json
+{ "action": "wait", "ids": ["taskA_id", "taskB_id"] }
+```
+
+- 已结束的任务立即返回；未结束的有限 command/completion 任务通过 Promise 等待**执行终态与日志收尾**，不等 `agent_settled` 通知，不轮询、不 sleep。events、WS、source subscription 与仍运行的 persistent 命令不是等待目标；待完成的是有限工作，不是常驻服务。
+- `completed=true` 只表示指定任务全到终态；只有全部 `status=completed` 时 `allSucceeded=true`。失败、被停止、任务自身超时均保留真实状态，不能算成功。执行终态与资源清理分开，`resourceActive=true` 仍需按需显式清理。
+- `wait_timeout_ms` 只限制这次等待；到预算返回 `completed=false`、`timedOut=true`、`pendingIds`，未完成任务继续运行。取消只退出等待；关闭／重载会话仍沿用原来的资源清理。
+- 结果保留 `cause`、终止 `signal` 及有界的执行基础设施 `error`，即使 stderr 为空也不丢失失败诊断；这些字段也可从 `monitor_list` 的结构化结果查看。结果含 stdout/stderr 有界尾部和完整路径；整批尾部最多 24 KiB，截断有标记。模型正文限制在 50 KiB／2000 行以内；需要截断时 `resultPath` 指向权限 0600 的完整批次回执。日志与实际下载／生成文件不改动，必要材料仍需主模型读取核验。
+- 只有持久化的、模型可见的工具输出包含**完整已发回执**或**完整 wait JSON 结果**，才删除对应待发终态通知；metadata 中的 `waitId` 和 `nestedCalls.status=ok` 本身不证明内容已交付。通过 codemode 调用时，用 `text(result)` 或 `return result` 转发完整结果；忽略结果、只输出 done／部分字段、修改诊断、截断或父调用失败时，保留原有终态兜底。每次 wait 使用独立 UUID 与不可变回执快照，复用旧工具调用 ID 或旧回执不能消费新结果。
+- wait 不启动／停止任务，也不改变通知策略或生命周期；清理不再需要的临时监听器仍用 `monitor_stop`，与报告无关的后台工作不受影响。依赖 ID 与实际材料核验由主模型明确负责，wait 不宣称自动判断报告完整性。运行中的 persistent 启动回执会提示改用有限的就绪／检查任务，不要求等待常驻进程本身。
+
+```js
+const result = await tools.Monitor({ action: "wait", ids: [taskAId, taskBId] });
+text(result); // 转发完整结果；只输出 "done" 不会取消终态兜底
+```
 
 ### 订阅与更新示例
 
@@ -171,7 +194,7 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 ## 规则
 
 - 命令和 Pi 的 bash 工具一样执行：用 Pi 设置里的 `shellPath`（支持开头的 `~`）和 `shellCommandPrefix`，PATH 最前面是 Pi 的 `bin` 目录
-- completion 模式：stdout/stderr 都只写日志，运行中不发输出通知；终态通知一次，附有界的 stdout（及非空 stderr）尾部和完整日志路径；退出码 0 = completed，非零／信号 = failed，普通日志量不会触发事件限流
+- completion 模式：stdout/stderr 都只写日志，运行中不发输出通知；终态由 wait 工具结果或原有完成通知交付，已确认收口的结果不再重复通知。附有界尾部和完整日志路径；退出码 0 = completed，非零／信号 = failed，普通日志量不会触发事件限流
 - 尾部读取每个日志最多约 8 KiB / 60 行，长行也标注截断并保留结尾；消息是净化后的纯文本，不带 TUI 样式字节
 - 直接 events 命令：只有 stdout 是事件流；stderr 写进文件，不触发唤醒。source observer 默认只观察未来 stdout；`watches[].stream` 可选 `stdout`/`stderr`/`both`，stderr 命中行在通知中带 `[stderr]` 前缀，但不会改变原命令的 event 语义
 - 退出、停止、超时都只发一条结束通知；completion 的超时通知说明后台时限（不是 `monitor expired`）；停止之后的输出会被丢弃
@@ -246,7 +269,7 @@ npm run typecheck
 ### 缓存约束
 
 提示缓存按前缀匹配（工具 → system prompt → 消息）。本扩展只往对话末尾追加通知消息：不注册会改 prompt 或历史的钩子
-（`before_agent_start` / `context` / `context_with_system` / `before_provider_request`），工具在加载时注册，描述和选择规则固定。
+（`before_agent_start` / `context` / `context_with_system` / `before_provider_request`），工具在加载时注册，描述和选择规则固定。`turn_end` 仅确认已持久化的 wait 交付，不追加／替换边界 entries，也不请求继续运行。
 `tests/cache.test.mjs` 守住这一点；真实 provider 的检查在 pi-cc-loop 的 `scripts/cache-check.mjs`，它会一起加载本扩展，覆盖 Monitor 事件。
 
 ## 与 Claude Code 的差异
@@ -254,7 +277,7 @@ npm run typecheck
 行为选择规则对齐 Claude Code 2.1.318：一次完成用后台命令，多次发生用 Monitor 事件流。用 Pi 扩展 API 实现。有意不同的地方：
 
 - CC 分别使用 Bash 的 `run_in_background` 和独立 Monitor；本扩展把它们合并成 `Monitor.mode`，避免长命令先阻塞前台 Bash。缺省仍是 `events`，已有调用不变。
-- completion 在活动回合中先保留结果，等 `agent_settled` 后投递，避免 Pi 清队列丢失唯一通知；中断回合和手动 compaction 只保存结果，不重新启动模型。缺失结束事件的空闲恢复会 context-only 补发；events 保持 Monitor 的 steer。
+- 未经 wait 确认交付的 completion 结果在活动回合中先保留，等 `agent_settled` 后投递，避免 Pi 清队列丢失唯一通知；wait 在执行终态后直接返回，普通通知路径在没有待确认 wait 时不读取会话历史；中断回合和手动 compaction 只保存结果，不重新启动模型。缺失结束事件的空闲恢复会 context-only 补发；events 保持 Monitor 的 steer。
 - 事件批处理内存只保留有界前缀，不影响完整事件计数；WS 日志积压超限会停止日志并告警，socket 继续。普通输出限流与日志写故障是两种独立机制。
 - `monitor_stop` / `monitor_list` 对应 CC 的 `TaskStop` / `TaskList`。
 - 底部显示 `2 monitors`（和 pi-cc-loop 的芯片同一格式）；CC 底部的任务 pill 也写作 `2 monitors`，还能选中后打开任务列表。

@@ -26,7 +26,9 @@ test("start receipts prioritize identity and setup but retain logs, policy and w
   assert.ok(text.includes(task.outputPath) && text.includes(task.stderrPath));
   assert.match(text, /do not poll or sleep/);
   assert.match(text, /not user replies/);
-  assert.match(text, /End your turn if you are only waiting/);
+  assert.match(text, /launch receipt, not a completed result/);
+  assert.match(text, /action="wait" and the required ids/);
+  assert.match(text, /progress update, not a final report/);
   const observer = record({ kind: "source", mode: "events", sourceId: "source12", watches: [], notify: { output: "none", terminal: "context" } });
   const observation = startReceipt(observer);
   assert.match(observation, /^Started subscription/);
@@ -35,6 +37,14 @@ test("start receipts prioritize identity and setup but retain logs, policy and w
   assert.match(observation, /output none · terminal context/);
   assert.match(observation, /an event is not their reply/);
   assert.match(startReceipt(record({ persistent: true, timeoutMs: 0 })), /session lifetime/);
+});
+
+test("persistent receipts never request an unsupported running wait target", () => {
+  const text = startReceipt(record({ persistent: true, timeoutMs: 0 }));
+  assert.match(text, /running persistent command is not a wait target/);
+  assert.match(text, /separate finite completion task/);
+  assert.match(text, /Once this persistent command has ended/);
+  assert.doesNotMatch(text, /Before a final report that depends on this/);
 });
 
 test("updates state the actual delta, including same-count revisions and no-op updates", () => {
