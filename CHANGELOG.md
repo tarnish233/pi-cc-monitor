@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-19
+
+### Added
+- `Monitor({ action: "wait", ids, wait_timeout_ms? })` joins explicit command/completion dependencies at report closeout while start remains asynchronous. Return each task's real outcome, bounded log tails and complete paths; a separate wait budget/cancellation never stops work.
+
+### Fixed
+- Deduplicate waited terminal notices only after the complete receipt or intact JSON result reaches persisted model-visible output; execution-only nested metadata, ignored/modified/truncated results and failed parents retain the protected outbox. Fresh UUIDs and immutable payload snapshots reject old receipts even when call IDs are reused.
+- Preserve terminal cause, signals and bounded infrastructure errors in wait/list results, including failures with empty stderr.
+- Skip conversation-history scanning on the ordinary no-wait notification path, and remove eager per-wait history copies.
+- Give running persistent commands their own start guidance rather than asking the model to wait on an unsupported target.
+- Distinguish launch/progress handoffs from completed final reports in static guidelines and receipts; require necessary output/file verification after waiting.
+
 ## [0.11.2] - 2026-11-18
 
 ### Fixed
