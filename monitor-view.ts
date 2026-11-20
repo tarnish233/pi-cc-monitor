@@ -83,7 +83,7 @@ export function startReceipt(view: MonitorView): string {
 	lines.push(`stdout: ${view.outputPath}`, `stderr: ${view.stderrPath}`);
 	if (view.persistent) lines.push("This instance runs until you stop it or the session ends.");
 	if (view.mode === "completion") {
-		lines.push("No result exists yet. End your turn now with one short message: what is running and that you will report when it finishes. Do NOT report results, conclusions or estimates for this task in this turn. Do not poll, sleep or re-read the logs. You will be notified once when it finishes; that notification is when you read the outputs and write the report. Notifications are not user replies.");
+		lines.push("No result exists yet. Continue independent work; if only waiting for Monitor, end your turn with one short message: what is running and that you will report when it finishes. Do NOT report results, conclusions or estimates for this task while it is pending. Do not poll, sleep or re-read the logs just to wait. You will be notified once at the next response/tool-batch boundary or from idle. Read and verify the required outputs before using the result; a completed task does not by itself mean the overall report is ready. Notifications are not user replies.");
 	} else {
 		lines.push("Keep working — do not poll or sleep. Events may arrive while you are waiting for the user — an event is not their reply.");
 		if (!view.persistent) lines.push("The watch ends at its time limit unless the source ends first; re-arm if you still need it.");

@@ -24,7 +24,7 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 | 输出订阅 | `events` + `source.monitorId`：订阅本会话中运行中的 command Monitor；观察不拥有进程，停止/超时/flood 不影响工作 | `Monitor` |
 | 动态 watches | literal、stdout/stderr/both、once/repeat、独立通知等级；`action=update` 原地更新，未变规则保留触发状态 | `Monitor` |
 | 通知策略 | `notify.output=turn/context/none`、`notify.terminal=turn/context`；用户停止只记 context 不重启回合 | `Monitor` |
-| 通知节奏 | completion 与 events 终态在忙时暂存，Agent settled 后通知；无结束事件的空闲恢复有 context-only 兜底；中断不重启回复，events 普通输出仍为 steer | 自动 |
+| 通知节奏 | completion 与 events 终态在当前响应／工具批次结束后交付，不中断执行，也不等整个 Agent settled；context 不请求续接，中止与空闲恢复仍有保守兜底；events 普通输出仍为 steer | 自动 |
 | 超时/常驻 | `timeout_ms`：completion 默认 30 分钟（上限 2 小时）；events 默认 5 分钟（上限 1 小时）；`persistent` 到会话结束 | `Monitor` |
 | 批量 | events 模式：200ms 内的事件合并成一条通知 | 自动 |
 | 长度上限 | events 模式：单行 500 字符、完整通知 3000 字符（含头部、抑制提示、换行和截断标记）；原始描述保留在 metadata | 自动 |
@@ -71,7 +71,7 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 
 completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 设得足以覆盖预期耗时（最长 2 小时）；超时通知说明的是后台时限，不会显示成 `monitor expired`。退出码 0 记为 completed，非零／信号记为 failed。只有明确需要会话级常驻的进程才使用 `persistent: true`，它不是跨进程退出保留机制。
 
-模型侧的选择规则保持精简：一次完成用 completion，每次发生用 events，长期工作的选择性输出用 completion + source observer。静态 `promptGuidelines` 只有三句（completion 替代前台 Bash、等待时结束回合、update 不得重启工作）。不修改原生 Bash，也不注册动态 prompt hook。
+模型侧保留五条静态规则：模式选择、启动回执不是结果、通知后验证输出、所需结果齐备后才完成报告、update 不得重启工作。启动后可继续独立工作；只剩等待时结束回合，不轮询／sleep。完成通知是任务事实，不强迫立即结束独立调研或输出完整报告。不修改原生 Bash，也不注册动态 prompt hook。
 
 ### 订阅与更新示例
 
@@ -103,7 +103,11 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 }
 ```
 
-工具立即返回任务 ID 和日志路径。测试产生的 stdout/stderr 只写文件，不逐行进入对话；结束后模型收到一次退出码和日志路径。忙碌时完成结果不进入 Pi 的可清除消息队列；如果当前回复被中断，已有完成结果会留在会话中，但不会强行重启该回复。中断之后才完成的新任务仍按正常的空闲通知规则处理。
+工具立即返回任务 ID 和日志路径。测试产生的 stdout/stderr 只写文件，不逐行进入对话；结束后模型收到一次退出码和日志路径。正在生成响应或执行工具时，终态先保存在保护队列，不打断当前工作；在下一个正常 `turn_end`（响应及整个工具批次结束）用 `triggerTurn: false` 交给 Pi 的只追加上下文通道，下一次模型请求即可读取。不使用 Esc 可清除的 steering/follow-up 队列，也不需要等待整个 Agent settled。
+
+`notify.terminal=turn` 在该边界最多请求一次续接，已有工具或排队输入自然满足这次续接，不额外开一个运行；`context` 和用户停止只追加结果，不请求续接。结果到达边界之后或 Agent 已空闲时仍走原有空闲／settled 交付。若当前回复被中断，边界不强制续接，已有完成结果会留在会话中，但不会重启该回复；中断之后才完成的新任务仍按正常的空闲通知规则处理。
+
+启动后继续必要的独立工作；只剩等待就交接。通知到达后先读取并验证所需输出，再根据当前工作进度继续分析或汇报；一项后台任务完成不等于整体报告完成。
 
 若 `/tree` 取消或失败，只恢复空闲却没有 `session_tree` / `agent_settled`，待发结果用一个 200ms 空闲兜底保存为 **context-only**，不再无限等候下一次输入。正常结束事件仍按通知策略投递。这个保守兜底也可能早于很慢的其他 settled 处理器（超过 200ms），此时只保存结果而不唤醒模型。
 
@@ -254,7 +258,7 @@ npm run typecheck
 行为选择规则对齐 Claude Code 2.1.318：一次完成用后台命令，多次发生用 Monitor 事件流。用 Pi 扩展 API 实现。有意不同的地方：
 
 - CC 分别使用 Bash 的 `run_in_background` 和独立 Monitor；本扩展把它们合并成 `Monitor.mode`，避免长命令先阻塞前台 Bash。缺省仍是 `events`，已有调用不变。
-- completion 在活动回合中先保留结果，等 `agent_settled` 后投递，避免 Pi 清队列丢失唯一通知；中断回合和手动 compaction 只保存结果，不重新启动模型。缺失结束事件的空闲恢复会 context-only 补发；events 保持 Monitor 的 steer。
+- completion 与 events 终态在活动响应／工具批次结束的 `turn_end` 边界交付，不中断当前工作，也不等整个 `agent_settled`。使用 Pi 的只追加上下文通道保护结果不被 Esc 清队列丢弃，按 terminal 策略最多请求一次续接；中断、手动 compaction 与缺失结束事件的空闲恢复只保存结果，不重新启动模型。events 普通输出仍保持 steer。
 - 事件批处理内存只保留有界前缀，不影响完整事件计数；WS 日志积压超限会停止日志并告警，socket 继续。普通输出限流与日志写故障是两种独立机制。
 - `monitor_stop` / `monitor_list` 对应 CC 的 `TaskStop` / `TaskList`。
 - 底部显示 `2 monitors`（和 pi-cc-loop 的芯片同一格式）；CC 底部的任务 pill 也写作 `2 monitors`，还能选中后打开任务列表。

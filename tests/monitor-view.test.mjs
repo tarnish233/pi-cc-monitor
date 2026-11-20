@@ -26,8 +26,10 @@ test("start receipts prioritize identity and setup but retain logs, policy and w
   assert.ok(text.includes(task.outputPath) && text.includes(task.stderrPath));
   assert.match(text, /Do not poll, sleep or re-read the logs/);
   assert.match(text, /not user replies/);
-  assert.match(text, /End your turn now/);
-  assert.match(text, /Do NOT report results, conclusions or estimates/);
+  assert.match(text, /Continue independent work; if only waiting for Monitor, end your turn/);
+  assert.match(text, /Do NOT report results, conclusions or estimates.*while it is pending/);
+  assert.ok(text.includes("next response/tool-batch boundary"));
+  assert.doesNotMatch(text, /End your turn now/);
   const observer = record({ kind: "source", mode: "events", sourceId: "source12", watches: [], notify: { output: "none", terminal: "context" } });
   const observation = startReceipt(observer);
   assert.match(observation, /^Started subscription/);

@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-11-20
+
+### Fixed
+- Deliver protected completion and events terminal outcomes at the next successful response/tool-batch boundary instead of waiting for the entire agent run to settle. Pi's context-only append lane keeps them outside Esc-clearable queues; turn-level outcomes request at most one continuation, while context-only outcomes never do.
+- Preserve interrupted/error response fallback, idle wakeups, manual compaction, cancelled navigation, loop-stop silence and resource cleanup; a handled boundary outcome does not wake a second run after final settlement.
+
+### Changed
+- Align completion guidance with safe-boundary delivery: continue independent work, hand off when only waiting, and verify required results before reporting. A launch receipt is not a result, and a completion notification no longer unconditionally demands the overall final report. Keep the five static guidelines and no polling/sleep discipline.
+
 ## [0.13.0] - 2026-11-20
 
 ### Removed

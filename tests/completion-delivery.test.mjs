@@ -10,6 +10,7 @@ const { default: factory } = await loadModule("index.ts");
 const installed = findPiInstall();
 const { Agent } = await import(pathToFileURL(path.join(installed.root, "@earendil-works", "pi-agent-core", "dist", "agent.js")).href);
 const { AgentSession, SessionManager } = await import(pathToFileURL(installed.piCodingAgent).href);
+const { ExtensionRunner } = await import(pathToFileURL(path.join(installed.root, "@earendil-works", "pi-coding-agent", "dist", "core", "extensions", "runner.js")).href);
 
 /** Use the real Pi message/queue/storage methods, without a provider or credentials. */
 function harness(t) {
@@ -19,6 +20,10 @@ function harness(t) {
 	Object.assign(session, {
 		agent: new Agent({ streamFn: async () => { throw new Error("No model/network calls are allowed in this test"); } }),
 		sessionManager: SessionManager.inMemory(cwd),
+		_cwd: cwd,
+		_entryIdsByMessage: new WeakMap(),
+		_boundaryDispatchedMessages: new WeakSet(),
+		_turnIndex: 0,
 		_isAgentRunActive: true,
 		_isEmittingAgentSettled: false,
 		_eventListeners: new Set(),
@@ -27,7 +32,6 @@ function harness(t) {
 		_pendingNextTurnMessages: [],
 		_pendingCustomMessages: [],
 		_deferredSettledActions: [],
-		_refreshFinalizedContext: () => {},
 		_startRun: async ({ message }) => {
 			starts.push(message);
 			session._appendCustomMessage(message);
@@ -59,14 +63,23 @@ function harness(t) {
 			pending.push(session.sendCustomMessage(message, options));
 		},
 	};
+	const abortController = new AbortController();
 	const ctx = {
-		cwd, hasUI: false, mode: "print", ui: {},
+		cwd, hasUI: false, mode: "print", ui: {}, signal: abortController.signal,
 		sessionManager: session.sessionManager,
 		isIdle: () => session.isIdle,
 		// Pi's public helper counts user queues, not custom messages.
 		hasPendingMessages: () => session.pendingMessageCount > 0,
 	};
 	factory(pi);
+	const errors = [];
+	// Exercise Pi's actual boundary composition, validation and persistence,
+	// not a mock that ignores a handler's continuation result.
+	session._extensionRunner = Object.assign(Object.create(ExtensionRunner.prototype), {
+		extensions: [{ path: "pi-cc-monitor/index.ts", handlers }],
+		createContext: () => ctx,
+		emitError: error => errors.push(error),
+	});
 	const emit = async (key, value) => {
 		if (key === "agent_settled") session._isEmittingAgentSettled = true;
 		try {
@@ -82,7 +95,41 @@ function harness(t) {
 		await emit("session_shutdown", { reason: "quit" });
 		stale = true;
 	});
-	return { session, tools, pi, ctx, starts, sent, emit, entries: () => session.sessionManager.getBranch().filter(entry => entry.type === "custom_message") };
+	const finishTurn = async ({ outcome = "completed", tools: withTools = true, afterBoundary } = {}) => {
+		if (!session.sessionManager.getBranch().length) {
+			session.sessionManager.appendMessage({ role: "user", content: "Continue independent work", timestamp: Date.now() });
+		}
+		const callId = `independent-${session._turnIndex}`;
+		const toolResults = withTools && outcome === "completed" ? [{
+			role: "toolResult", toolCallId: callId, toolName: "read", isError: false,
+			content: [{ type: "text", text: "independent tool finished" }], timestamp: Date.now(),
+		}] : [];
+		const message = {
+			role: "assistant", api: "test", provider: "test", model: "test", timestamp: Date.now(),
+			content: toolResults.length
+				? [{ type: "toolCall", id: callId, name: "read", arguments: { path: "notes.md" } }]
+				: [{ type: "text", text: "Current response finished" }],
+			stopReason: outcome === "completed" ? (toolResults.length ? "toolUse" : "stop") : outcome,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		};
+		session.sessionManager.appendMessage(message);
+		for (const result of toolResults) session.sessionManager.appendMessage(result);
+		session._refreshFinalizedContext();
+		// These are the same two stages used by AgentSession.finishTurn and the
+		// subsequent low-level turn_end event, with no model or credentials.
+		session._boundaryDispatchedMessages.add(message);
+		const continuation = await session._dispatchTurnEndBoundary(message, toolResults);
+		await Promise.all(pending.splice(0));
+		await afterBoundary?.(continuation);
+		// The low-level turn_end event uses this prototype method to commit
+		// context-only messages after all assistant/tool entries are persisted.
+		session._flushPendingCustomMessages();
+		session._turnIndex++;
+		return continuation;
+	};
+	return { session, tools, pi, ctx, starts, sent, emit, finishTurn, abortController, errors,
+		entries: () => session.sessionManager.getBranch().filter(entry => entry.type === "custom_message") };
 }
 
 async function finished(h, extra = {}) {
@@ -161,6 +208,137 @@ for (const clear of [true, false]) {
 		assert.equal(h.sent.length, 1, "nothing is delivered a second time");
 	});
 }
+
+test("busy completion reaches context at the next tool boundary without waiting for settlement", async t => {
+	const h = harness(t);
+	await finished(h);
+	assert.equal(h.sent.length, 0, "completion does not interrupt the active response");
+	assert.equal(await h.finishTurn(), true, "one continuation is requested at the boundary");
+	assert.equal(h.errors.length, 0, "Pi accepts the boundary and its continuation");
+	assert.equal(h.session.isIdle, false, "independent work has not settled");
+	assert.equal(h.starts.length, 0, "no separate run is started in the middle of work");
+	assert.equal(h.sent.length, 1);
+	assert.equal(h.sent[0].options.triggerTurn, false, "context append, not a clearable steering send");
+	assert.equal(h.entries().length, 1);
+	const messages = h.session.agent.state.messages;
+	assert.equal(messages.at(-2).role, "toolResult", "the entire tool batch precedes the completion");
+	assert.equal(messages.at(-1).role, "custom", "the next provider request sees the result");
+	assert.equal(messages.at(-1).details.status, "completed");
+	assert.equal(await h.finishTurn(), false, "the next boundary does not request another continuation");
+	h.session._isAgentRunActive = false;
+	await h.emit("agent_settled", { aborted: false });
+	assert.equal(h.sent.length, 1, "no stale completion after the final report");
+	assert.equal(h.starts.length, 0);
+});
+
+test("clearQueue before and during boundary handoff cannot discard the completion", async t => {
+	const h = harness(t);
+	await finished(h);
+	h.session.clearQueue();
+	await h.finishTurn({ afterBoundary: continuation => {
+		assert.equal(continuation, true);
+		assert.equal(h.session.agent.peekQueuedMessages().length, 0);
+		assert.equal(h.session._pendingCustomMessages.length, 1, "Pi holds a non-clearable context append");
+		h.session.clearQueue();
+		assert.equal(h.session._pendingCustomMessages.length, 1);
+	} });
+	assert.equal(h.entries().length, 1);
+	assert.equal(h.session._pendingCustomMessages.length, 0);
+	h.session.clearQueue();
+	assert.equal(h.entries().length, 1, "the persisted outcome survives later Esc too");
+});
+
+test("a completion after a text-only response requests one next response, not an idle follow-up", async t => {
+	const h = harness(t);
+	await finished(h);
+	assert.equal(await h.finishTurn({ tools: false }), true);
+	assert.equal(h.entries().length, 1);
+	assert.equal(h.starts.length, 0);
+	assert.equal(h.errors.length, 0);
+});
+
+test("context-only terminal at a boundary is visible but never requests continuation", async t => {
+	const h = harness(t);
+	await finished(h, { notify: { terminal: "context" } });
+	assert.equal(await h.finishTurn({ tools: false }), false);
+	assert.equal(h.entries().length, 1);
+	assert.equal(h.sent[0].options.triggerTurn, false);
+	assert.equal(h.starts.length, 0);
+	h.session._isAgentRunActive = false;
+	await h.emit("agent_settled", { aborted: false });
+	assert.equal(h.starts.length, 0);
+	assert.equal(h.sent.length, 1);
+});
+
+test("multiple outcomes at one boundary coalesce continuation and retain each policy", async t => {
+	const h = harness(t);
+	await finished(h);
+	await finished(h, { notify: { terminal: "context" } });
+	assert.equal(await h.finishTurn(), true);
+	assert.equal(h.entries().length, 2);
+	assert.deepEqual(h.entries().map(entry => entry.details.notifyLevel), ["turn", "context"]);
+	assert.equal(h.starts.length, 0);
+	assert.equal(await h.finishTurn(), false);
+	assert.equal(h.sent.length, 2);
+});
+
+for (const outcome of ["aborted", "error"]) {
+	test(`${outcome} response does not force boundary continuation and retains the outbox`, async t => {
+		const h = harness(t);
+		await finished(h);
+		assert.equal(await h.finishTurn({ outcome, tools: false }), false);
+		assert.equal(h.sent.length, 0);
+		assert.equal(h.entries().length, 0);
+		h.session._isAgentRunActive = false;
+		await h.emit("agent_settled", { aborted: outcome === "aborted" });
+		assert.equal(h.entries().length, 1);
+		assert.equal(h.starts.length, outcome === "aborted" ? 0 : 1, "the original settled fallback policy is preserved");
+	});
+}
+
+test("an already-aborted signal wins over a completed boundary outcome", async t => {
+	const h = harness(t);
+	await finished(h);
+	h.abortController.abort();
+	assert.equal(await h.finishTurn(), false);
+	assert.equal(h.sent.length, 0);
+	h.session._isAgentRunActive = false;
+	await h.emit("agent_settled", { aborted: true });
+	assert.equal(h.entries().length, 1);
+	assert.equal(h.starts.length, 0);
+});
+
+test("a failed boundary publish stays protected and never requests an empty continuation", async t => {
+	const h = harness(t);
+	await finished(h);
+	const send = h.pi.sendMessage;
+	h.pi.sendMessage = () => { throw new Error("publish temporarily unavailable"); };
+	assert.equal(await h.finishTurn(), false);
+	assert.equal(h.entries().length, 0);
+	assert.equal(h.errors.length, 0);
+	h.pi.sendMessage = send;
+	assert.equal(await h.finishTurn(), true);
+	assert.equal(h.entries().length, 1);
+});
+
+test("events terminal results use the same safe boundary, leaving live output routing unchanged", async t => {
+	const h = harness(t);
+	await finished(h, { mode: "events" });
+	assert.equal(h.sent.length, 0);
+	assert.equal(await h.finishTurn(), true);
+	assert.equal(h.entries().length, 1);
+	assert.equal(h.entries()[0].details.mode, "events");
+	assert.ok(h.entries()[0].details.finalLines.includes("done"));
+});
+
+test("a stopped loop cannot be revived by the next boundary", async t => {
+	const h = harness(t);
+	await finished(h, { loopPrompt: "check the deploy" });
+	h.pi.events.emit("loop:stopped", { prompt: "check the deploy", reason: "stopped" });
+	assert.equal(await h.finishTurn(), false);
+	assert.equal(h.sent.length, 0);
+	assert.equal(h.entries().length, 0);
+});
 
 test("an already-idle completion starts one follow-up immediately", async t => {
 	const h = harness(t);
@@ -294,7 +472,7 @@ test("an aborted branch summary delivers the stranded completion context-only", 
 		h.session.settingsManager = { getBranchSummarySettings: () => ({}), getRetrySettings: () => ({ enabled: false }) };
 		h.session._getSummarizationRequestAuth = async () => ({ model: h.session.model, apiKey: "test", headers: {}, env: {} });
 		h.session._summarizationRetryCallbacks = () => ({});
-		h.session.agent = { streamFunction: async () => ({ result: async () => ({ role: "assistant", content: [], stopReason: "aborted", timestamp: Date.now() }) }) };
+		h.session.agent = { state: { messages: h.session.agent.state.messages }, streamFunction: async () => ({ result: async () => ({ role: "assistant", content: [], stopReason: "aborted", timestamp: Date.now() }) }) };
 		const target = h.session.sessionManager.appendCustomEntry("target", {});
 		h.session.sessionManager.appendMessage({ role: "user", content: [{ type: "text", text: "branch work" }], timestamp: Date.now() });
 		const nav = h.session.navigateTree(target, { summarize: true });

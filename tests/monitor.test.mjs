@@ -340,7 +340,8 @@ test("completion mode logs without output events and reports one terminal result
 	assert.ok(armed.content[0].text.includes(armed.details.stderrPath));
 	assert.match(armed.content[0].text, /notified once/);
 	assert.match(armed.content[0].text, /Do not poll, sleep or re-read the logs/);
-	assert.match(armed.content[0].text, /End your turn now/);
+	assert.match(armed.content[0].text, /if only waiting for Monitor, end your turn/);
+	assert.ok(armed.content[0].text.includes("next response/tool-batch boundary"));
 
 	assert.ok(await waitFor(() =>
 		fs.existsSync(armed.details.outputPath) && fs.readFileSync(armed.details.outputPath, "utf8").includes("begin") &&
@@ -352,7 +353,7 @@ test("completion mode logs without output events and reports one terminal result
 	assert.ok(await waitFor(() => h.sent.some((entry) => entry.message.details.cause === "exit")));
 	assert.equal(h.sent.length, 1, `one terminal notification only:\n${summarize(h.sent)}`);
 	const finished = h.sent[0];
-	assert.equal(finished.options.deliverAs, "followUp", "completion follows the active turn instead of steering it");
+	assert.equal(finished.options.deliverAs, "followUp", "an idle completion uses the normal wakeup lane");
 	assert.equal(finished.options.triggerTurn, true);
 	assert.equal(finished.message.details.mode, "completion");
 	assert.equal(finished.message.details.status, "failed", "a nonzero exit is a failed completion");
@@ -1280,8 +1281,10 @@ test("the tool description carries Claude Code's usage guidance", async () => {
 	assert.ok(tool.promptGuidelines[0].includes("instead of foreground bash"));
 	assert.ok(tool.description.includes("cover the expected runtime"), "deadline guidance belongs to the tool contract");
 	assert.ok(!tool.promptGuidelines.join(" ").includes("1800000"), "the deadline is not duplicated in selection guidelines");
-	assert.ok(tool.promptGuidelines[1].includes("end your turn immediately"));
-	assert.ok(tool.promptGuidelines[1].includes("Never write the task's results"));
+	assert.ok(tool.promptGuidelines[1].includes("if only waiting for Monitor, end your turn"));
+	assert.ok(tool.promptGuidelines[1].includes("Never write a pending task's results"));
+	assert.ok(tool.promptGuidelines[2].includes("safe response/tool-batch boundaries"));
+	assert.ok(!tool.promptGuidelines.join(" ").includes("end your turn immediately"));
 	assert.ok(!h.handlers.has("before_agent_start"), "guidelines are static tool metadata, not a dynamic prompt hook");
 });
 

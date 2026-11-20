@@ -2,9 +2,9 @@
  * pi-cc-monitor — background commands and Claude Code-style event monitors.
  *
  * `mode: "completion"` runs a shell command without blocking the agent: its
- * stdout/stderr go to log files and its terminal result arrives once after the
- * active turn. `mode: "events"` is Claude Code's Monitor: each stdout line or
- * WebSocket text frame is an event, delivered between tool calls. Omitting
+ * stdout/stderr go to log files and its terminal result arrives once at the
+ * next response/tool-batch boundary, without interrupting active work.
+ * `mode: "events"` delivers stdout lines or WebSocket text frames as events. Omitting
  * mode preserves the original events behaviour.
  *
  * The schema extends Claude Code's Monitor:
@@ -273,7 +273,7 @@ function exitNotice(record: MonitorRecord, signal: NodeJS.Signals | null): strin
 		const banner = record.status === "completed" ? "Monitor completed" : "Monitor failed";
 		return [
 			`[${banner} \u2014 ${how}. Output: ${record.outputPath}; stderr: ${record.stderrPath}]`,
-			"This is the completion you were waiting for. Now read and verify the outputs and result files this task was asked to produce, then write the final report the user asked for. The log tail below is not verification. If the exit is nonzero or outputs are missing, report that honestly instead of a success.",
+			"Read and verify the outputs and result files before using this task's result. The log tail below is not verification. Continue any independent work; write the final report only when all required results have been obtained and verified. If the exit is nonzero or outputs are missing, report that honestly instead of a success.",
 			...completionTailLines(record),
 		].join("\n");
 	}
@@ -362,7 +362,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	const liveResources = new Map<string, MonitorRecord>();
 	const observers = new Map<string, Set<string>>();
 	const pendingEndings = new Map<string, Ending>();
-	// Busy completions stay here, outside Pi's Esc-clearable message queues.
+	// Terminal outcomes stay outside Esc-clearable queues until a safe boundary or idle.
 	const pendingCompletions = new Map<string, { message: Parameters<ExtensionAPI["sendMessage"]>[0]; terminal: TerminalLevel }>();
 	const outputBudget = new OutputBudget();
 	const globallySuppressed = new Map<string, number>();
@@ -453,7 +453,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** Events steer at tool boundaries; completions are sent only after settling. */
+	/** Live output steers; terminal results append context at safe boundaries or wake from idle. */
 	function publish(message: Parameters<ExtensionAPI["sendMessage"]>[0], mode: MonitorMode, triggerTurn = true): boolean {
 		if (disposed) return false;
 		try {
@@ -464,10 +464,13 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	function flushCompletions(triggerTurn: boolean): void {
+	/** Returns whether a turn-level outcome was successfully handed off. */
+	function flushCompletions(triggerTurn: boolean): boolean {
+		let hasTurnResult = false;
 		for (const [id, pending] of [...pendingCompletions]) {
 			if (publish(pending.message, "completion", triggerTurn && pending.terminal !== "context")) {
 				pendingCompletions.delete(id);
+				hasTurnResult ||= pending.terminal === "turn";
 			}
 		}
 		if (!pendingCompletions.size && idleFallbackTimer) {
@@ -475,6 +478,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			idleFallbackTimer = undefined;
 		}
 		scheduleMonitorPrune();
+		return hasTurnResult;
 	}
 
 	/**
@@ -611,8 +615,17 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		deliver(record, "output", summary ? [summary, ...lines] : lines, level);
 	}
 
+	pi.on("turn_end", (event, ctx) => {
+		lastCtx = ctx;
+		if (disposed || event.outcome !== "completed" || ctx.signal?.aborted) return;
+		// Pi's triggerTurn:false lane appends after this response and all its
+		// tool results, outside the Esc-clearable steering/follow-up queues.
+		// Request at most one continuation; existing work satisfies it naturally.
+		if (flushCompletions(false)) return { continue: true };
+	});
 	pi.on("agent_settled", (event, ctx) => {
 		lastCtx = ctx;
+		// Fallback for results arriving after a boundary, or an interrupted run.
 		// Esc aborts the reply, not the outcome: store it without restarting.
 		flushCompletions(!event.aborted);
 	});
@@ -1449,8 +1462,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				kill: true,
 				notice: () => STOPPED_NOTICE,
 			});
-			// Agent-settled delivery is correct for an agent-issued stop, but the
-			// local overlay cannot wait for a turn that may never settle.
+			// Agent-issued stops append their context-only notice at a safe boundary;
+			// the local overlay can deliver immediately when already idle.
 			if (stopped && lastCtx?.isIdle()) flushCompletions(lastCtx?.isIdle() === true);
 			// An already-finalized record (a natural exit with a living background
 			// group) keeps its real status; only an un-finalized stop times out.
