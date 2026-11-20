@@ -216,68 +216,6 @@ test("shutdown drops pending wakeups and later stale settlement is a no-op", asy
 	assert.equal(h.starts.length, 0);
 });
 
-test("a persisted batch wait in real Pi storage consumes its notices without a follow-up", async t => {
-	const h = harness(t);
-	const first = await finished(h);
-	const second = await finished(h);
-	const result = await h.tools.get("Monitor").execute("join", { action: "wait", ids: [first.details.taskId, second.details.taskId] }, undefined, undefined, h.ctx);
-	assert.equal(result.details.completed, true);
-	assert.equal(h.sent.length, 0);
-	const message = { role: "toolResult", toolName: "Monitor", toolCallId: "join", content: result.content, details: result.details, isError: false, timestamp: Date.now() };
-	h.session.sessionManager.appendMessage(message);
-	await h.emit("turn_end", { toolResults: [message], outcome: "completed" });
-	h.session._isAgentRunActive = false;
-	await h.emit("agent_settled", { aborted: false });
-	assert.equal(h.sent.length, 0);
-	assert.equal(h.starts.length, 0);
-	assert.equal(h.entries().length, 0);
-	assert.equal(h.session.sessionManager.getBranch().filter(entry => entry.type === "message" && entry.message.role === "toolResult").length, 1);
-});
-
-test("an unpersisted wait still survives real Pi clearQueue and aborted settlement", async t => {
-	const h = harness(t);
-	const receipt = await finished(h);
-	await h.tools.get("Monitor").execute("join", { action: "wait", ids: [receipt.details.taskId] }, undefined, undefined, h.ctx);
-	assert.deepEqual(h.session.clearQueue(), { steering: [], followUp: [] });
-	h.session._isAgentRunActive = false;
-	await h.emit("agent_settled", { aborted: true });
-	assert.equal(h.entries().length, 1);
-	assert.equal(h.sent[0].options.triggerTurn, false);
-	assert.equal(h.starts.length, 0);
-	await h.emit("agent_settled", { aborted: false });
-	assert.equal(h.sent.length, 1);
-});
-
-test("real Pi parent storage confirms a complete forwarded wait JSON result", async t => {
-	const h = harness(t);
-	const receipt = await finished(h);
-	const result = await h.tools.get("Monitor").execute("code/1", { action: "wait", ids: [receipt.details.taskId] }, undefined, undefined, h.ctx);
-	const message = { role: "toolResult", toolName: "codemode", toolCallId: "code", content: [{ type: "text", text: JSON.stringify(result.structuredContent, null, 2) }], details: {}, isError: false, timestamp: Date.now(),
-		nestedCalls: { complete: true, calls: [{ id: "code/1", name: "Monitor", status: "ok" }] } };
-	h.session.sessionManager.appendMessage(message);
-	await h.emit("turn_end", { toolResults: [message], outcome: "completed" });
-	h.session._isAgentRunActive = false;
-	await h.emit("agent_settled", { aborted: false });
-	assert.equal(h.sent.length, 0);
-	assert.equal(h.starts.length, 0);
-});
-
-test("a successful parent with only nested metadata preserves a failed result in real Pi", async t => {
-	const h = harness(t);
-	const receipt = await h.tools.get("Monitor").execute("run", { command: "exit 7", description: "failed nested dependency", mode: "completion" }, undefined, undefined, h.ctx);
-	const result = await h.tools.get("Monitor").execute("code/1", { action: "wait", ids: [receipt.details.taskId] }, undefined, undefined, h.ctx);
-	assert.equal(result.details.allSucceeded, false);
-	const message = { role: "toolResult", toolName: "codemode", toolCallId: "code", content: [{ type: "text", text: "done" }], details: {}, isError: false, timestamp: Date.now(),
-		nestedCalls: { complete: true, calls: [{ id: "code/1", name: "Monitor", status: "ok" }] } };
-	h.session.sessionManager.appendMessage(message);
-	await h.emit("turn_end", { toolResults: [message], outcome: "completed" });
-	h.session._isAgentRunActive = false;
-	await h.emit("agent_settled", { aborted: false });
-	assert.equal(h.entries().length, 1);
-	assert.equal(h.sent.length, 1);
-	assert.equal(h.sent[0].message.details.exitCode, 7);
-});
-
 /** The real navigateTree control flow with a scripted session_before_tree outcome. */
 function treeHarness(t, beforeTree) {
 	const h = harness(t);

@@ -1,6 +1,6 @@
 /** Display vocabulary and plain-text receipts. No execution or notification state changes. */
 import { formatDuration } from "./render.ts";
-import { sanitizeDisplay, type LogTail } from "./log-tail.ts";
+import { sanitizeDisplay } from "./log-tail.ts";
 import type { NotifyPolicy } from "./notification-budget.ts";
 import type { WatchState } from "./watches.ts";
 
@@ -83,66 +83,11 @@ export function startReceipt(view: MonitorView): string {
 	lines.push(`stdout: ${view.outputPath}`, `stderr: ${view.stderrPath}`);
 	if (view.persistent) lines.push("This instance runs until you stop it or the session ends.");
 	if (view.mode === "completion") {
-		if (view.persistent) {
-			lines.push("This is a launch receipt, not a completed result. A running persistent command is not a wait target. Keep doing independent work; if a report needs readiness or a finite check, start a separate finite completion task and wait for that task. Once this persistent command has ended, wait can retrieve its result. Do not poll or sleep; do not claim unresolved work is complete. Notifications are not user replies.");
-		} else {
-			lines.push("This is a launch receipt, not a completed result. Unless collected by wait, you will be notified once when the command finishes. Keep doing independent work. Before a final report that depends on this finite task, call Monitor with action=\"wait\" and the required ids, then read and verify the needed outputs/files. While working, do not poll or sleep. If you leave the turn while waiting, give only a progress update, not a final report. Notifications are not user replies.");
-		}
+		lines.push("No result exists yet. End your turn now with one short message: what is running and that you will report when it finishes. Do NOT report results, conclusions or estimates for this task in this turn. Do not poll, sleep or re-read the logs. You will be notified once when it finishes; that notification is when you read the outputs and write the report. Notifications are not user replies.");
 	} else {
 		lines.push("Keep working — do not poll or sleep. Events may arrive while you are waiting for the user — an event is not their reply.");
 		if (!view.persistent) lines.push("The watch ends at its time limit unless the source ends first; re-arm if you still need it.");
 	}
-	return lines.join("\n");
-}
-
-export interface WaitTaskView {
-	id: string;
-	description: string;
-	status: string;
-	resourceActive: boolean;
-	exitCode?: number | null;
-	signal?: string;
-	error?: string;
-	cause?: string;
-	outputPath: string;
-	stderrPath: string;
-	stdout?: LogTail;
-	stderr?: LogTail;
-}
-
-export interface WaitResultView {
-	waitId?: string;
-	completed: boolean;
-	timedOut: boolean;
-	allSucceeded: boolean;
-	pendingIds: string[];
-	waitedMs: number;
-	monitors: WaitTaskView[];
-}
-
-/** A batch result, not a declaration that the user's report or file reads are done. */
-export function waitReceipt(result: WaitResultView): string {
-	const ended = result.monitors.length - result.pendingIds.length;
-	const header = result.completed ? "Collected task results" : result.timedOut ? "Wait time limit reached" : "Waiting for task results";
-	const lines = [`${header} · ${ended}/${result.monitors.length} ended · ${formatDuration(result.waitedMs)}`];
-	if (result.waitId) lines.push(`Wait receipt: ${displayLine(result.waitId)}`);
-	if (result.completed && !result.allSucceeded) lines.push("Not all tasks succeeded; inspect each outcome before reporting.");
-	if (result.pendingIds.length) lines.push(`Pending: ${result.pendingIds.map(displayLine).join(", ")}. Work was not stopped; dependencies are not yet collected.`);
-	for (const task of result.monitors) {
-		lines.push("", `task #${displayLine(task.id)} · ${displayLine(task.description)} · ${displayLine(task.status)}` +
-			(task.exitCode !== undefined && task.exitCode !== null ? ` · exit ${task.exitCode}` : "") +
-			(task.signal ? ` · signal ${displayLine(task.signal)}` : "") +
-			(task.cause && task.cause !== "exit" ? ` · cause ${displayLine(task.cause)}` : "") +
-			(task.resourceActive ? " · owned resource still active" : ""),
-			`stdout: ${task.outputPath}`, `stderr: ${task.stderrPath}`);
-		if (task.error) lines.push(`error: ${displayLine(task.error)}`);
-		for (const stream of ["stdout", "stderr"] as const) {
-			const tail = task[stream];
-			if (!tail || stream === "stderr" && !tail.text && !tail.note) continue;
-			lines.push(`${stream} tail${tail.truncated ? " (truncated)" : ""}${tail.note ? ` · ${tail.note}` : ""}:`, tail.text || "(no output)");
-		}
-	}
-	lines.push("", "These are bounded log tails, not proof that downloaded/generated files were read. Read and verify the material required by the final report. Wait did not stop work or clean up still-active resources; use monitor_stop only for resources no longer needed.");
 	return lines.join("\n");
 }
 

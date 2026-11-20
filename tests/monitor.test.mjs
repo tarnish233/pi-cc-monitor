@@ -99,17 +99,8 @@ function summarize(sent) {
 	return sent.map((entry) => `${entry.message.details.cause}: ${entry.message.content.split("\n").slice(1).join(" | ")}`).join("\n");
 }
 
-const harnesses = new Set();
-test.after(async () => {
-	// A failed assertion must not leave a gated/persistent fixture alive until
-	// its 30-minute background deadline and hang the entire test worker.
-	for (const h of harnesses) await h.handlers.get("session_shutdown")?.({ reason: "quit" }, h.ctx);
-	harnesses.clear();
-});
-
 async function start(h) {
 	factory(h.pi);
-	harnesses.add(h);
 	return h;
 }
 
@@ -140,14 +131,12 @@ test("the schema extends Claude Code's Monitor with notification modes", async (
 		"command",
 		"description",
 		"id",
-		"ids",
 		"loopPrompt",
 		"mode",
 		"notify",
 		"persistent",
 		"source",
 		"timeout_ms",
-		"wait_timeout_ms",
 		"watches",
 		"ws",
 	]);
@@ -350,7 +339,8 @@ test("completion mode logs without output events and reports one terminal result
 	assert.ok(armed.content[0].text.includes(armed.details.outputPath));
 	assert.ok(armed.content[0].text.includes(armed.details.stderrPath));
 	assert.match(armed.content[0].text, /notified once/);
-	assert.match(armed.content[0].text, /do not poll or sleep/);
+	assert.match(armed.content[0].text, /Do not poll, sleep or re-read the logs/);
+	assert.match(armed.content[0].text, /End your turn now/);
 
 	assert.ok(await waitFor(() =>
 		fs.existsSync(armed.details.outputPath) && fs.readFileSync(armed.details.outputPath, "utf8").includes("begin") &&
@@ -1286,14 +1276,12 @@ test("the tool description carries Claude Code's usage guidance", async () => {
 	for (const name of ["Monitor", "monitor_stop", "monitor_list"]) {
 		assert.ok(h.tools.get(name).promptSnippet, `${name} has a prompt snippet`);
 	}
-	assert.equal(tool.promptGuidelines.length, 4);
+	assert.equal(tool.promptGuidelines.length, 5);
 	assert.ok(tool.promptGuidelines[0].includes("instead of foreground bash"));
 	assert.ok(tool.description.includes("cover the expected runtime"), "deadline guidance belongs to the tool contract");
 	assert.ok(!tool.promptGuidelines.join(" ").includes("1800000"), "the deadline is not duplicated in selection guidelines");
-	assert.ok(tool.promptGuidelines[1].includes('action="wait"'));
-	assert.ok(tool.promptGuidelines[1].includes("required ids"));
-	assert.ok(tool.promptGuidelines[2].includes("completed=false"));
-	assert.ok(tool.description.includes('wait_timeout_ms'));
+	assert.ok(tool.promptGuidelines[1].includes("end your turn immediately"));
+	assert.ok(tool.promptGuidelines[1].includes("Never write the task's results"));
 	assert.ok(!h.handlers.has("before_agent_start"), "guidelines are static tool metadata, not a dynamic prompt hook");
 });
 

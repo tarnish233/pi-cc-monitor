@@ -2,17 +2,15 @@
  * pi-cc-monitor — background commands and Claude Code-style event monitors.
  *
  * `mode: "completion"` runs a shell command without blocking the agent: its
- * stdout/stderr go to log files. A terminal result is collected by wait or,
- * when uncollected, notified after the active turn. `mode: "events"` is Claude Code's Monitor: each stdout line or
+ * stdout/stderr go to log files and its terminal result arrives once after the
+ * active turn. `mode: "events"` is Claude Code's Monitor: each stdout line or
  * WebSocket text frame is an event, delivered between tool calls. Omitting
  * mode preserves the original events behaviour.
  *
  * The schema extends Claude Code's Monitor:
  *
- *   action      "start" | "update" | "wait"? default start
+ *   action      "start" | "update"?      default start; update is explicit
  *   id          string?                  update target; never starts work
- *   ids         string[]?                wait targets; existing completion tasks
- *   wait_timeout_ms number?              wait budget only; never kills work
  *   mode        "completion" | "events"? notification semantics (default events)
  *   command     string?                  shell command or script
  *   ws          object?                  { url, protocols? }; events only
@@ -30,8 +28,6 @@
  *
  * Exactly one of command, ws or source.monitorId is required for start;
  * update only accepts id, watches and notify and never restarts work.
- * wait joins explicit completion dependencies before final reporting; start
- * remains nonblocking, and waiting neither stops work nor changes its policy.
  * Control characters are refused, ws urls must be ASCII ws:// or wss://
  * without userinfo or whitespace, and ws protocols must be unique RFC 6455
  * tokens. loopPrompt only takes effect when pi-cc-loop is loaded; without it
@@ -49,9 +45,8 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
 import type { ChildProcess } from "node:child_process";
-import { truncateHead, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { invalidateConfig, loadConfig } from "./config.ts";
 import { CONFIG_CHANNEL, registerPiCcCommand } from "./settings.ts";
@@ -66,8 +61,7 @@ import { cleanOldLogDirectories, createLogDirectory } from "./log-store.ts";
 import { registerTaskProvider, type TaskDetail, type TaskItem, type TaskStopResult } from "./tasks.ts";
 import { formatDuration } from "./render.ts";
 import { renderMonitorMessage } from "./message-render.ts";
-import { displayLine, monitorBadges, monitorListText, monitorRole, observationLabel, startReceipt, stopReceipt, stopScope, updateReceipt, waitReceipt } from "./monitor-view.ts";
-import { isWaitResultVisible } from "./wait-delivery.ts";
+import { displayLine, monitorBadges, monitorListText, monitorRole, observationLabel, startReceipt, stopReceipt, stopScope, updateReceipt } from "./monitor-view.ts";
 
 /**
  * The event bus channel pi-cc-loop publishes when a chain ends. Monitors that
@@ -92,11 +86,6 @@ export const MAX_COMPLETION_TIMEOUT_MS = MONITOR_TIMEOUTS.completion.maxMs;
 export const MIN_TIMEOUT_MS = 1_000;
 /** Terminal records retained after delivery and resource cleanup; active/pending records never count. */
 export const ENDED_MONITOR_HISTORY_LIMIT = 50;
-export const MAX_WAIT_TASKS = 20;
-export const DEFAULT_WAIT_TIMEOUT_MS = MONITOR_TIMEOUTS.wait.defaultMs;
-export const MAX_WAIT_TIMEOUT_MS = MONITOR_TIMEOUTS.wait.maxMs;
-/** Aggregate UTF-8 tail budget; identity and complete log paths remain outside it. */
-export const WAIT_TAIL_BYTES = 24 * 1024;
 
 /** Claude Code batches stdout lines within 200ms into a single notification. */
 export const BATCH_WINDOW_MS = 200;
@@ -135,9 +124,6 @@ export interface MonitorRecord {
 	endedAt?: number;
 	/** The exit code of a command monitor, once it ended. */
 	exitCode?: number | null;
-	signal?: NodeJS.Signals;
-	error?: string;
-	cause?: MonitorCause;
 	loopPrompt?: string;
 	outputPath: string;
 	stderrPath: string;
@@ -184,9 +170,6 @@ export type MonitorSnapshot = {
 	status: MonitorStatus;
 	endedAt?: number;
 	exitCode?: number | null;
-	signal?: NodeJS.Signals;
-	error?: string;
-	cause?: MonitorCause;
 	loopPrompt?: string;
 	/** Process id of a command monitor's shell. */
 	pid?: number;
@@ -194,62 +177,6 @@ export type MonitorSnapshot = {
 	stderrPath: string;
 	logError?: string;
 };
-
-type WaitLogTail = { text: string; truncated: boolean; note?: string };
-
-export type MonitorWaitResult = {
-	action: "wait";
-	waitId: string;
-	ids: string[];
-	completed: boolean;
-	timedOut: boolean;
-	allSucceeded: boolean;
-	/** Complete batch text, only when the model-facing receipt was truncated. */
-	resultPath?: string;
-	pendingIds: string[];
-	waitedMs: number;
-	monitors: {
-		id: string;
-		kind: "command";
-		mode: "completion";
-		description: string;
-		status: MonitorStatus;
-		resourceActive: boolean;
-		createdAt: number;
-		endedAt?: number;
-		exitCode?: number | null;
-		signal?: string;
-		error?: string;
-		cause?: MonitorCause;
-		outputPath: string;
-		stderrPath: string;
-		stdout?: WaitLogTail;
-		stderr?: WaitLogTail;
-	}[];
-};
-
-type PendingCompletion = { message: Parameters<ExtensionAPI["sendMessage"]>[0]; terminal: TerminalLevel };
-interface WaitBatch {
-	waitId: string;
-	ids: string[];
-	returned: boolean;
-	/** Immutable snapshots of the complete result and its emitted receipt. */
-	deliveryJson?: string;
-	deliveryContent?: string;
-	notices: Map<string, PendingCompletion>;
-	check: () => void;
-	cancel: (error: Error) => void;
-}
-
-/** Byte-bound the copied tails without changing the original captured/logged result. */
-function boundedWaitTail(tail: LogTail, maxBytes: number): WaitLogTail {
-	const bytes = Buffer.from(tail.text, "utf8");
-	if (bytes.length <= maxBytes) return { ...tail };
-	let start = bytes.length - maxBytes;
-	while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++;
-	return { text: bytes.subarray(start).toString("utf8"), truncated: true,
-		note: [tail.note, "wait batch tail limit (end kept)"].filter(Boolean).join("; ") };
-}
 
 // ------------------------------------------------------------------ helpers
 
@@ -346,6 +273,7 @@ function exitNotice(record: MonitorRecord, signal: NodeJS.Signals | null): strin
 		const banner = record.status === "completed" ? "Monitor completed" : "Monitor failed";
 		return [
 			`[${banner} \u2014 ${how}. Output: ${record.outputPath}; stderr: ${record.stderrPath}]`,
+			"This is the completion you were waiting for. Now read and verify the outputs and result files this task was asked to produce, then write the final report the user asked for. The log tail below is not verification. If the exit is nonzero or outputs are missing, report that honestly instead of a success.",
 			...completionTailLines(record),
 		].join("\n");
 	}
@@ -418,9 +346,6 @@ function snapshotMonitor(record: MonitorRecord): MonitorSnapshot {
 		status: record.status,
 		...(record.endedAt !== undefined ? { endedAt: record.endedAt } : {}),
 		...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
-		...(record.signal !== undefined ? { signal: record.signal } : {}),
-		...(record.error !== undefined ? { error: record.error } : {}),
-		...(record.cause !== undefined ? { cause: record.cause } : {}),
 		...(record.loopPrompt !== undefined ? { loopPrompt: record.loopPrompt } : {}),
 		...(record.child?.pid !== undefined ? { pid: record.child.pid } : {}),
 		outputPath: record.outputPath,
@@ -438,10 +363,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	const observers = new Map<string, Set<string>>();
 	const pendingEndings = new Map<string, Ending>();
 	// Busy completions stay here, outside Pi's Esc-clearable message queues.
-	const pendingCompletions = new Map<string, PendingCompletion>();
-	// Reserve selected results until the wait's tool-result delivery is confirmed.
-	const waits = new Map<string, WaitBatch>();
-	const waitRefs = new Map<string, number>();
+	const pendingCompletions = new Map<string, { message: Parameters<ExtensionAPI["sendMessage"]>[0]; terminal: TerminalLevel }>();
 	const outputBudget = new OutputBudget();
 	const globallySuppressed = new Map<string, number>();
 	let summaryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -472,7 +394,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			!isActive(record) &&
 			!record.pendingStop &&
 			!pendingCompletions.has(record.id) &&
-			!waitRefs.has(record.id) &&
 			!pendingEndings.has(record.id) &&
 			!(observers.get(record.id)?.size),
 		);
@@ -544,19 +465,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	}
 
 	function flushCompletions(triggerTurn: boolean): void {
-		// The ordinary notification path must not traverse conversation history.
-		// Only returned waits awaiting delivery proof need the idle fallback scan.
-		if ([...waits.values()].some((batch) => batch.returned)) {
-			const messages: unknown[] = [];
-			try {
-				for (const entry of lastCtx?.sessionManager.getBranch?.() ?? lastCtx?.sessionManager.getEntries?.() ?? []) {
-					if (entry.type === "message") messages.push(entry.message);
-				}
-			} catch { /* Preserve the outbox if session inspection fails. */ }
-			reconcileWaitReceipts(messages);
-		}
 		for (const [id, pending] of [...pendingCompletions]) {
-			if (waitRefs.has(id)) continue;
 			if (publish(pending.message, "completion", triggerTurn && pending.terminal !== "context")) {
 				pendingCompletions.delete(id);
 			}
@@ -566,147 +475,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			idleFallbackTimer = undefined;
 		}
 		scheduleMonitorPrune();
-	}
-
-	function releaseWait(batch: WaitBatch): void {
-		if (!waits.delete(batch.waitId)) return;
-		for (const id of batch.ids) {
-			const count = (waitRefs.get(id) ?? 1) - 1;
-			if (count > 0) waitRefs.set(id, count);
-			else waitRefs.delete(id);
-		}
-		if (pendingCompletions.size) scheduleIdleFallback();
-		scheduleMonitorPrune();
-	}
-
-	/** turn_end runs after persistence. A successful nested call or details marker
-	 * alone is not delivery: the full receipt/result must be model-visible.
-	 * A fresh UUID plus the immutable payload makes historical call-id reuse irrelevant. */
-	function waitWasDelivered(batch: WaitBatch, messages: readonly unknown[]): boolean {
-		return messages.some((value) => {
-			if (!value || typeof value !== "object") return false;
-			const message = value as { role?: string; isError?: boolean; content?: unknown };
-			return message.role === "toolResult" && !message.isError &&
-				isWaitResultVisible(message.content, batch.deliveryJson, batch.deliveryContent);
-		});
-	}
-
-	function reconcileWaitReceipts(messages: readonly unknown[]): void {
-		for (const batch of [...waits.values()]) {
-			if (!batch.returned) continue;
-			if (waitWasDelivered(batch, messages)) {
-				for (const [id, notice] of batch.notices) {
-					// A later cleanup failure is a different outcome and must survive.
-					if (pendingCompletions.get(id) === notice) pendingCompletions.delete(id);
-				}
-			}
-			// Unproven/aborted delivery keeps its terminal results for the fallback.
-			releaseWait(batch);
-		}
-	}
-
-	function waitResult(batch: WaitBatch, records: MonitorRecord[], startedAt: number, timedOut: boolean): MonitorWaitResult {
-		const pendingIds = records.filter((record) => !record.finalized).map((record) => record.id);
-		const completed = pendingIds.length === 0;
-		const perStreamBytes = Math.floor(WAIT_TAIL_BYTES / (records.length * 2));
-		return { action: "wait", waitId: batch.waitId, ids: [...batch.ids], completed, timedOut,
-			allSucceeded: completed && records.every((record) => record.status === "completed"),
-			pendingIds, waitedMs: Math.max(0, Date.now() - startedAt),
-			monitors: records.map((record) => ({
-				id: record.id, kind: "command", mode: "completion",
-				description: capEventLines([displayLine(record.description)], 120).join(" "),
-				status: record.status, resourceActive: record.resourceActive === true, createdAt: record.createdAt,
-				...(record.endedAt !== undefined ? { endedAt: record.endedAt } : {}),
-				...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
-				...(record.signal !== undefined ? { signal: record.signal } : {}),
-				...(record.error !== undefined ? { error: record.error } : {}),
-				...(record.cause !== undefined ? { cause: record.cause } : {}),
-				outputPath: record.outputPath, stderrPath: record.stderrPath,
-				...(record.finalized ? {
-					stdout: boundedWaitTail(record.tails?.stdout ?? readLogTail(record.outputPath), perStreamBytes),
-					stderr: boundedWaitTail(record.tails?.stderr ?? readLogTail(record.stderrPath), perStreamBytes),
-				} : {}),
-			})) };
-	}
-
-	function waitContent(result: MonitorWaitResult): string {
-		const text = waitReceipt(result);
-		// Leave room for the complete receipt path even under a long TMPDIR.
-		const clipped = truncateHead(text, { maxBytes: 40 * 1024, maxLines: 1900 });
-		if (!clipped.truncated) return text;
-		result.resultPath = path.join(outputDir(), `${result.waitId}.wait.txt`);
-		fs.writeFileSync(result.resultPath, text, { encoding: "utf8", mode: 0o600 });
-		return `${clipped.content}\n\n[Wait receipt truncated. Read the complete batch: ${result.resultPath}. Read required output/files before final reporting.]`;
-	}
-
-	/** Wait only on finalized execution/log facts. Waiting on settled delivery here
-	 * would deadlock: Pi cannot settle until this tool has returned. */
-	function waitForTasks(ids: string[] | undefined, budget: number | undefined,
-		signal: AbortSignal | undefined, onProgress: (result: MonitorWaitResult) => void): Promise<MonitorWaitResult> {
-		if (!Array.isArray(ids) || !ids.length || ids.length > MAX_WAIT_TASKS ||
-			ids.some((id) => typeof id !== "string" || !id.trim())) throw new Error(`wait requires 1-${MAX_WAIT_TASKS} non-empty Monitor ids`);
-		const targets = ids.map((id) => id.trim());
-		if (new Set(targets).size !== targets.length) throw new Error("wait ids must be distinct");
-		const records = targets.map((id) => {
-			const record = monitors.get(id);
-			if (!record) throw new Error(`wait target ${id} does not exist in this session`);
-			if (record.kind !== "command" || record.mode !== "completion") throw new Error(`wait target ${id} must be a command/completion task`);
-			if (record.persistent && !record.finalized) throw new Error(`wait target ${id} is persistent; use a finite completion task for required results`);
-			return record;
-		});
-		const timeoutMs = budget ?? DEFAULT_WAIT_TIMEOUT_MS;
-		if (!Number.isFinite(timeoutMs) || timeoutMs < MIN_TIMEOUT_MS || timeoutMs > MAX_WAIT_TIMEOUT_MS) {
-			throw new Error(`wait_timeout_ms must be between ${MIN_TIMEOUT_MS} and ${MAX_WAIT_TIMEOUT_MS}; it does not change the task deadline`);
-		}
-		const abortError = () => Object.assign(new Error("Monitor wait cancelled; background work was not stopped"), { name: "AbortError" });
-		if (signal?.aborted) throw abortError();
-		const startedAt = Date.now();
-		return new Promise((resolve, reject) => {
-			let settled = false;
-			let timer: ReturnType<typeof setTimeout> | undefined;
-			const batch: WaitBatch = { waitId: randomUUID(), ids: targets, returned: false,
-				notices: new Map(), check: () => {}, cancel: () => {} };
-			while (waits.has(batch.waitId)) batch.waitId = randomUUID();
-			const cleanup = () => {
-				if (timer) clearTimeout(timer);
-				timer = undefined;
-				signal?.removeEventListener("abort", onAbort);
-			};
-			const finish = (timedOut: boolean) => {
-				if (settled) return;
-				const result = waitResult(batch, records, startedAt, timedOut);
-				settled = true;
-				cleanup();
-				for (const record of records) {
-					const notice = record.finalized ? pendingCompletions.get(record.id) : undefined;
-					if (notice) batch.notices.set(record.id, notice);
-				}
-				batch.returned = true;
-				resolve(result);
-			};
-			batch.cancel = (error) => {
-				if (!settled) { settled = true; cleanup(); reject(error); }
-				releaseWait(batch);
-			};
-			batch.check = () => {
-				try { if (records.every((record) => record.finalized)) finish(false); }
-				catch (error) { batch.cancel(error instanceof Error ? error : new Error(String(error))); }
-			};
-			const onAbort = () => batch.cancel(abortError());
-			waits.set(batch.waitId, batch);
-			for (const id of targets) waitRefs.set(id, (waitRefs.get(id) ?? 0) + 1);
-			signal?.addEventListener("abort", onAbort, { once: true });
-			timer = setTimeout(() => {
-				try { finish(true); }
-				catch (error) { batch.cancel(error instanceof Error ? error : new Error(String(error))); }
-			}, timeoutMs);
-			timer.unref?.();
-			try {
-				if (!records.every((record) => record.finalized)) onProgress(waitResult(batch, records, startedAt, false));
-				if (signal?.aborted) onAbort();
-				else batch.check();
-			} catch (error) { batch.cancel(error instanceof Error ? error : new Error(String(error))); }
-		});
 	}
 
 	/**
@@ -843,10 +611,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		deliver(record, "output", summary ? [summary, ...lines] : lines, level);
 	}
 
-	pi.on("turn_end", (event, ctx) => {
-		lastCtx = ctx;
-		reconcileWaitReceipts(event.toolResults);
-	});
 	pi.on("agent_settled", (event, ctx) => {
 		lastCtx = ctx;
 		// Esc aborts the reply, not the outcome: store it without restarting.
@@ -946,7 +710,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		pendingEndings.delete(record.id);
 		record.batcher?.close();
 		record.status = ending.status;
-		record.cause = ending.cause;
 		record.endedAt = Date.now();
 		if (record.timeoutTimer) clearTimeout(record.timeoutTimer);
 		record.timeoutTimer = undefined;
@@ -973,7 +736,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		}
 		releaseResource(record);
 		refreshStatus();
-		for (const batch of [...waits.values()]) batch.check();
 		scheduleMonitorPrune();
 	}
 
@@ -1249,7 +1011,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			record.child = spawnCommand(record, prefixedCommand(input.command, settings), monitorShell(settings), ctx);
 		} catch (error) {
 			// Nothing is running, so nothing may be listed as running.
-			record.error = capEventLines([displayLine(error instanceof Error ? error.message : error)], MAX_LINE_CHARS).join(" ");
 			endMonitor(record, { status: "failed", cause: "error" });
 			throw new Error(`Could not start the monitor: ${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -1285,8 +1046,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			},
 			onExit: (code, signal) => {
 				record.exitCode = code;
-				if (signal) record.signal = signal;
-				else delete record.signal;
 				// A confirmed Stop already released ownership; a late close must
 				// not probe or signal a PID the OS may have handed to a new group.
 				if (!record.resourceActive) return;
@@ -1317,12 +1076,11 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				});
 			},
 			onError: (error) => {
-				record.error = capEventLines([displayLine(error.message)], MAX_LINE_CHARS).join(" ");
 				endMonitor(record, {
 					status: "failed",
 					cause: "error",
 					kill: true,
-					notice: () => `[Monitor failed \u2014 ${record.error}]`,
+					notice: () => `[Monitor failed \u2014 ${error.message}]`,
 				});
 			},
 		});
@@ -1449,9 +1207,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		promptSnippet: MONITOR_SNIPPET,
 		promptGuidelines: MONITOR_PROMPT_GUIDELINES,
 		parameters: Type.Object({
-			action: Type.Optional(Type.Union([Type.Literal("start"), Type.Literal("update"), Type.Literal("wait")], { description: "Default start. Update changes only watches/notify; wait joins specified completion tasks without starting/stopping work." })),
+			action: Type.Optional(Type.Union([Type.Literal("start"), Type.Literal("update")], { description: "Default start. Explicit update requires id and changes only watches/notify; never starts or restarts work." })),
 			id: Type.Optional(Type.String({ description: "Existing Monitor id; only action=update uses this." })),
-			ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WAIT_TASKS, uniqueItems: true, description: "Only action=wait: distinct existing command/completion dependencies, not all background monitors." })),
 			source: Type.Optional(Type.Object({ monitorId: Type.String() }, { additionalProperties: false, description: "events-only: subscribe to an existing command Monitor, without spawning or rereading logs." })),
 			watches: Type.Optional(Type.Array(Type.Object({
 				id: Type.String({ pattern: "^[A-Za-z0-9_-]{1,64}$" }),
@@ -1490,7 +1247,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				),
 			),
 			description: Type.Optional(Type.String({
-				description: "Required for start; short description shown in notifications. Not accepted by update or wait.",
+				description: "Required for start; short description shown in notifications. Not accepted by update.",
 			})),
 			timeout_ms: Type.Optional(
 				Type.Number({
@@ -1503,8 +1260,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					`Completion: default ${DEFAULT_COMPLETION_TIMEOUT_MS}ms, max ${MAX_COMPLETION_TIMEOUT_MS}ms. Ignored when persistent is true.`,
 				}),
 			),
-			wait_timeout_ms: Type.Optional(Type.Number({ minimum: MIN_TIMEOUT_MS, maximum: MAX_WAIT_TIMEOUT_MS,
-				description: `Only action=wait: budget ${DEFAULT_WAIT_TIMEOUT_MS}ms by default, max ${MAX_WAIT_TIMEOUT_MS}ms. Ends only the wait; never kills work or changes its deadline.` })),
 			persistent: Type.Optional(
 				Type.Boolean({
 					description:
@@ -1522,11 +1277,10 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 						"when it ends that loop, this monitor is stopped with it. Ignored otherwise.",
 				}),
 			),
-		}, { allOf: [{ if: { properties: { action: { const: "update" } }, required: ["action"] }, then: { required: ["id"] },
-			else: { if: { properties: { action: { const: "wait" } }, required: ["action"] }, then: { required: ["ids"] }, else: { required: ["description"] } } }] }),
+		}, { allOf: [{ if: { properties: { action: { const: "update" } }, required: ["action"] }, then: { required: ["id"] }, else: { required: ["description"] } }] }),
 		annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
 		// What a codemode script gets: the task id and paths as values (Pi sends the shape, not this).
-		outputSchema: Type.Union([Type.Object({
+		outputSchema: Type.Object({
 			taskId: Type.String(),
 			mode: Type.Union([Type.Literal("completion"), Type.Literal("events")]),
 			timeoutMs: Type.Number(),
@@ -1538,33 +1292,10 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			notify: Type.Optional(Type.Object({ output: Type.String(), terminal: Type.String() })),
 			sourceId: Type.Optional(Type.String()),
 			watches: Type.Optional(Type.Array(Type.Object({ id: Type.String(), text: Type.String(), stream: Type.Optional(Type.String()), once: Type.Optional(Type.Boolean()), notify: Type.Optional(Type.String()), fired: Type.Boolean() }))),
-		}), Type.Object({
-			action: Type.Literal("wait"), waitId: Type.String(), ids: Type.Array(Type.String()),
-			completed: Type.Boolean(), timedOut: Type.Boolean(), allSucceeded: Type.Boolean(), resultPath: Type.Optional(Type.String()),
-			pendingIds: Type.Array(Type.String()), waitedMs: Type.Number(),
-			monitors: Type.Array(Type.Object({
-				id: Type.String(), kind: Type.Literal("command"), mode: Type.Literal("completion"),
-				description: Type.String(), status: Type.String(), resourceActive: Type.Boolean(), createdAt: Type.Number(),
-				endedAt: Type.Optional(Type.Number()), exitCode: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
-				signal: Type.Optional(Type.String()), error: Type.Optional(Type.String()), cause: Type.Optional(Type.String()),
-				outputPath: Type.String(), stderrPath: Type.String(),
-				stdout: Type.Optional(Type.Object({ text: Type.String(), truncated: Type.Boolean(), note: Type.Optional(Type.String()) })),
-				stderr: Type.Optional(Type.Object({ text: Type.String(), truncated: Type.Boolean(), note: Type.Optional(Type.String()) })),
-			})),
-		})]),
+		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			lastCtx = ctx;
 			if (disposed) throw new Error("This Monitor runtime has ended");
-			if (params.action === "wait") {
-				const allowed = new Set(["action", "ids", "wait_timeout_ms"]);
-				if (Object.keys(params).some((key) => !allowed.has(key))) throw new Error("wait accepts only action, ids and wait_timeout_ms; no work or policy was changed");
-				const value = await waitForTasks(params.ids, params.wait_timeout_ms, _signal ?? ctx.signal,
-					(progress) => _onUpdate?.({ content: [{ type: "text", text: `Waiting for ${progress.pendingIds.length} task(s): ${progress.pendingIds.join(", ")}. Background work continues; no final report yet.` }], details: progress }));
-				const content = waitContent(value);
-				const batch = waits.get(value.waitId);
-				if (batch) { batch.deliveryJson = JSON.stringify(value); batch.deliveryContent = content; }
-				return { content: [{ type: "text" as const, text: content }], details: value, structuredContent: value };
-			}
 			if (params.action === "update") {
 				const allowed = new Set(["action", "id", "watches", "notify"]);
 				if (Object.keys(params).some((key) => !allowed.has(key))) throw new Error("update accepts only action, id, watches and notify; execution/source/lifetime cannot change");
@@ -1595,8 +1326,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				const value = { ...receipt(record), updated: true };
 				return { content: [{ type: "text" as const, text: updateReceipt(snapshotMonitor(record), before) }], details: value, structuredContent: value };
 			}
-			if (params.action !== undefined && params.action !== "start") throw new Error("action must be start, update or wait");
-			if (params.ids !== undefined || params.wait_timeout_ms !== undefined) throw new Error("ids and wait_timeout_ms require explicit action=wait; no work was started");
+			if (params.action !== undefined && params.action !== "start") throw new Error("action must be start or update");
 			if (params.id !== undefined) throw new Error("id requires explicit action=update; no work was started");
 
 			// A model that fills every schema property (the GPT family sends
@@ -1763,7 +1493,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					status: Type.String(),
 					endedAt: Type.Optional(Type.Number()),
 					exitCode: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
-					signal: Type.Optional(Type.String()), error: Type.Optional(Type.String()), cause: Type.Optional(Type.String()),
 					loopPrompt: Type.Optional(Type.String()),
 					pid: Type.Optional(Type.Number()),
 					outputPath: Type.String(),
@@ -1916,7 +1645,6 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		// Set first: the processes killed below exit after Pi has invalidated
 		// this extension's API, and their callbacks must not touch it.
 		disposed = true;
-		for (const batch of [...waits.values()]) batch.cancel(new Error("Monitor wait cancelled: this runtime has ended"));
 		// Close an open task overlay before the context and logs go away.
 		tasks.close();
 		// The idle fallback must not fire on the disposed runtime after an await.

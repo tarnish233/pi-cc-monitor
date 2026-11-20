@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-20
+
+### Removed
+- Revert the 0.12.0 `Monitor({ action: "wait" })` closeout join and all of its delivery-proof machinery. Models used it to block the launch turn right after starting background work, which defeated the purpose of Monitor. start/update, monitor_stop and monitor_list are back to the 0.11.2 behavior.
+
+### Changed
+- Prompt-only reporting contract for completion tasks. The launch receipt now unconditionally requires ending the turn with a short "started, will report" message and forbids results, conclusions or estimates in the launch turn (previously only "end your turn if you are only waiting").
+- The tool description and static guidelines state the same two-turn rule, and add that one finished task out of several pending ones is partial progress, not overall completion.
+- The terminal completion notice now explicitly triggers the reporting step: read and verify the required outputs/files, then write the final report; nonzero exits or missing outputs must be reported honestly, and the log tail is not verification.
+
 ## [0.12.0] - 2026-11-19
 
 ### Added
