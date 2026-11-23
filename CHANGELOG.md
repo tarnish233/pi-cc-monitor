@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-11-23
+
+### Fixed
+- An expanded card taller than the fullscreen viewport made Pi's alternate screen fall back to a full redraw on every frame, and the card's background then painted the whole screen green. The expansion is now capped at 60% of the viewport height and 24 rows, ending with `… +N more rows · see /tasks`; the full output stays in the log path and in `/tasks`.
+- The hover wrapper was lost by every `/reload`: the new session installs it in `session_start`, then the old session's `session_shutdown` restores the original method, and both run against the same module state. Every hint the pointer had crossed stayed lit. The next render now re-arms it.
+
 ## [0.14.0] - 2026-11-23
 
 ### Changed

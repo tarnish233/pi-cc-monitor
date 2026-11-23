@@ -422,6 +422,47 @@ test("an exit code is the verdict, whichever mode reported it", () => {
 	assert.match(render(eventMessage("monitor mon1 \u00b7 build\nline", { kind: "ws", mode: "events", cause: "closed" })).text, /^ \u25a0 Monitor Closed/);
 });
 
+test("a reload that releases after installing re-arms on the next render", () => {
+	// /reload fires the new session's session_start before the old session's
+	// session_shutdown, and both run against this module's state: the late release
+	// used to leave the reloaded session with no hover at all.
+	const tui = { mode: "fullscreen", terminal: { rows: 40 }, handleViewportInput() {}, requestRender() {} };
+	const original = tui.handleViewportInput;
+	setNotificationTui(tui);
+	assert.notEqual(tui.handleViewportInput, original, "the wrapper is installed");
+
+	releaseNotificationHover();
+	assert.equal(tui.handleViewportInput, original, "a shutdown restores the original method");
+
+	const { renderers } = makeHarness();
+	const { theme } = makeTheme();
+	renderers.get("Monitor")(eventMessage("monitor mon1 \u00b7 x\nline"), { expanded: false, outputPad: 1 }, theme).render(80);
+	assert.notEqual(tui.handleViewportInput, original, "the next render re-arms it");
+
+	releaseNotificationHover();
+	setNotificationTui({ mode: "regular" });
+});
+
+test("an expanded card never outgrows the fullscreen viewport", () => {
+	const { renderers } = makeHarness();
+	const { theme } = makeTheme();
+	const tui = { mode: "fullscreen", terminal: { rows: 20 }, handleViewportInput() {}, requestRender() {} };
+	setNotificationTui(tui);
+	const body = Array.from({ length: 140 }, (_, i) => `line ${i + 1}`).join("\n");
+	const message = eventMessage("monitor mon1 \u00b7 big\n" + body, {
+		mode: "completion", cause: "exit", status: "completed", exitCode: 0,
+		stdoutTail: body, outputPath: "/tmp/big.log",
+	});
+	const lines = renderers.get("Monitor")(message, { expanded: true, outputPad: 1 }, theme).render(80);
+	// 60% of 20 rows, plus the box's padding rows.
+	assert.ok(lines.length <= 12 + 2, `${lines.length} rows`);
+	const text = lines.join("\n");
+	assert.match(text, /\+\d+ more rows/);
+	assert.match(text, /see \/tasks/);
+	releaseNotificationHover();
+	setNotificationTui({ mode: "regular" });
+});
+
 test("the regular screen offers the expand keybinding, never a click", () => {
 	const { text } = render(eventMessage("monitor mon1 \u00b7 deploy\nERROR: boom"));
 	assert.match(text, /ctrl\+o to show more/);
