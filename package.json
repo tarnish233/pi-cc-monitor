@@ -1,6 +1,6 @@
 {
 	"name": "pi-cc-monitor",
-	"version": "0.14.2",
+	"version": "0.14.3",
 	"description": "Background commands with one completion notice plus Claude Code-style Monitor event streams for the Pi coding agent.",
 	"author": "tarnish233",
 	"type": "module",
