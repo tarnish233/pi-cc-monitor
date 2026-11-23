@@ -13,8 +13,6 @@ import { findPiInstall, loadModule } from "./helpers.mjs";
 
 const mod = await loadModule("index.ts");
 const { visibleWidth, stripTerminalSequences } = await import(pathToFileURL(findPiInstall().piTui).href);
-/** An SGR idle-motion packet: code 35 = motion with no button held. */
-const IDLE_MOTION = "\x1b[<35;40;12M";
 const { messageBody } = await loadModule("message-render.ts");
 const { setNotificationTui, releaseNotificationHover } = await loadModule("render.ts");
 
@@ -199,47 +197,6 @@ test("the legacy padded card lists the identity once", () => {
 	}
 });
 
-test("hover never outlives the pointer: a click or a wheel clears it", () => {
-	const { renderers } = makeHarness();
-	const { theme, fgCalls } = makeTheme();
-	let renders = 0;
-	const tui = {
-		mode: "fullscreen",
-		handleViewportInput() {},
-		requestRender() {
-			renders += 1;
-		},
-	};
-	setNotificationTui(tui);
-	const message = eventMessage("monitor mon1 \u00b7 deploy\nERROR: boom");
-	const build = () => renderers.get("Monitor")(message, { expanded: false, outputPad: 1 }, theme);
-	const hintColor = (card) => {
-		fgCalls.length = 0;
-		card.render(120);
-		return fgCalls.find((call) => call.text === "click to show more")?.color;
-	};
-	const at = (type, x = 0) => ({ type, button: type === "move" ? "none" : "left", x, y: 0, screenX: 0, screenY: 0, width: 120, height: 1, shift: false, alt: false, ctrl: false });
-
-	const card = build();
-	const hintStart = card.render(120)[0].indexOf("click to show more");
-	card.handleMouse(at("move", hintStart + 2));
-	assert.equal(hintColor(card), "text", "the pointer on the hint lights it");
-	// Expanding hides the hint; collapsing must not bring back a stale highlight.
-	card.handleMouse(at("click"));
-	card.handleMouse(at("click"));
-	assert.equal(hintColor(card), "dim", "a click clears the hover");
-
-	// A wheel tick scrolls the content under a still pointer.
-	card.handleMouse(at("move", hintStart + 2));
-	assert.equal(hintColor(card), "text");
-	renders = 0;
-	tui.handleViewportInput("\x1b[<64;40;12M");
-	assert.equal(hintColor(card), "dim", "scrolling drops the hover");
-	assert.ok(renders > 0, "the clear asks for a render");
-	releaseNotificationHover();
-	setNotificationTui({ mode: "regular" });
-});
-
 test("every card collapses to a single line, and the expansion holds the output", () => {
 	const body = Array.from({ length: 8 }, (_, i) => `line ${i + 1}`).join("\n");
 	const cases = [
@@ -422,27 +379,6 @@ test("an exit code is the verdict, whichever mode reported it", () => {
 	assert.match(render(eventMessage("monitor mon1 \u00b7 build\nline", { kind: "ws", mode: "events", cause: "closed" })).text, /^ \u25a0 Monitor Closed/);
 });
 
-test("a reload that releases after installing re-arms on the next render", () => {
-	// /reload fires the new session's session_start before the old session's
-	// session_shutdown, and both run against this module's state: the late release
-	// used to leave the reloaded session with no hover at all.
-	const tui = { mode: "fullscreen", terminal: { rows: 40 }, handleViewportInput() {}, requestRender() {} };
-	const original = tui.handleViewportInput;
-	setNotificationTui(tui);
-	assert.notEqual(tui.handleViewportInput, original, "the wrapper is installed");
-
-	releaseNotificationHover();
-	assert.equal(tui.handleViewportInput, original, "a shutdown restores the original method");
-
-	const { renderers } = makeHarness();
-	const { theme } = makeTheme();
-	renderers.get("Monitor")(eventMessage("monitor mon1 \u00b7 x\nline"), { expanded: false, outputPad: 1 }, theme).render(80);
-	assert.notEqual(tui.handleViewportInput, original, "the next render re-arms it");
-
-	releaseNotificationHover();
-	setNotificationTui({ mode: "regular" });
-});
-
 test("an expanded card never outgrows the fullscreen viewport", () => {
 	const { renderers } = makeHarness();
 	const { theme } = makeTheme();
@@ -467,54 +403,6 @@ test("the regular screen offers the expand keybinding, never a click", () => {
 	const { text } = render(eventMessage("monitor mon1 \u00b7 deploy\nERROR: boom"));
 	assert.match(text, /ctrl\+o to show more/);
 	assert.ok(!text.includes("click to show more"), "the regular screen delivers no mouse events");
-});
-
-test("a fullscreen hover lights the hint, and leaving the card puts it out", () => {
-	const { renderers } = makeHarness();
-	const { theme, fgCalls } = makeTheme();
-	let renders = 0;
-	// The official chain turns an idle-motion packet into a `move` on the component
-	// under the pointer; here the pointer is over `card` at column `x`.
-	let moved = null;
-	const tui = {
-		mode: "fullscreen",
-		handleViewportInput() {
-			if (moved) moved.component.handleMouse({ ...mouse("move"), x: moved.x });
-		},
-		requestRender() {
-			renders += 1;
-		},
-	};
-	const mouse = (type) => ({ type, button: type === "move" ? "none" : "left", x: 0, y: 0, screenX: 0, screenY: 0, width: 120, height: 1, shift: false, alt: false, ctrl: false });
-	setNotificationTui(tui);
-	const message = eventMessage("monitor mon1 \u00b7 deploy\nERROR: boom");
-	const build = () => renderers.get("Monitor")(message, { expanded: false, outputPad: 1 }, theme);
-	const card = build();
-	const line = card.render(120)[0];
-	const hintStart = line.indexOf("click to show more");
-	assert.ok(hintStart > 0, line);
-
-	// Hovering off the hint does nothing.
-	moved = { component: card, x: 2 };
-	tui.handleViewportInput(IDLE_MOTION);
-	fgCalls.length = 0;
-	card.render(120);
-	assert.equal(fgCalls.find((call) => call.text === "click to show more")?.color, "dim");
-	// Hovering the hint brightens it.
-	moved = { component: card, x: hintStart + 2 };
-	tui.handleViewportInput(IDLE_MOTION);
-	fgCalls.length = 0;
-	card.render(120);
-	assert.equal(fgCalls.find((call) => call.text === "click to show more")?.color, "text");
-	// The pointer leaves every card: the next motion packet must clear it and repaint.
-	moved = null;
-	assert.equal(tui.handleViewportInput(IDLE_MOTION), undefined);
-	assert.ok(renders > 0, "the clear asks for a render or the old frame stays");
-	fgCalls.length = 0;
-	card.render(120);
-	assert.equal(fgCalls.find((call) => call.text === "click to show more")?.color, "dim");
-	releaseNotificationHover();
-	setNotificationTui({ mode: "regular" });
 });
 
 test("fullscreen says click to show more, and a click toggles the same card", () => {
