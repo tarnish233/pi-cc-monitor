@@ -194,27 +194,69 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 
 ## 渲染
 
-异步通知沿用 CC 风格的透明 `✻ monitor` 卡片；标题显示事实、时间和描述，下一行显示对象身份、真实来源或终态结果：
+异步事实画成 CC 风格的卡片：折叠是一行，展开是工具卡底色的 `├`/`│`/`└` 段落树。
 
 ```text
-✻ monitor · 10:22pm · build errors
-   subscription #obs12345 → build #job12345
-   [stderr] ERROR: compilation failed
+✻ Monitor ev12345 · build errors · 10:22pm · 3 events · click to show more
 
-✻ monitor completed · 10:24pm · build
-   task #job12345 · exit 0 · 2m
-   stdout: Build completed successfully.
+✓ Monitor Completed tx12345 · build · 10:24pm · exit 0 · 2m · click to show more
 
-✻ monitor stopped · 10:25pm · build errors
-   subscription #obs12345 → build #job12345 · context only
-   Subscription ended; source command was not stopped by this operation.
+■ Monitor Stopped st11111 · run.sh · 10:25pm · 42s · click to show more
+
+⚠ Monitor Stop Failed st33333 · stubborn.sh · 10:26pm · 1m 5s · click to show more
 ```
 
-表头按原因分：`monitor`（有事件）、`monitor ended`（命令退出）、`monitor expired`（events 超时；completion 超时改用后台时限措辞，不叫 expired）、
-`monitor failed`（启动或连接失败）、`monitor closed`（WebSocket 关闭）、`monitor stopped`（手动停止或输出过多被停）。
-折叠时一行标题、一行身份、最多两行**实际终端行**的正文；有剩余输出时显示 `+N more lines`。标题和身份截断到终端宽度，正文按宽度换行后再计预算；中文/emoji/ANSI 不会把折叠卡片撑成长页。completion 失败优先展示真实 stderr，成功保留 stdout；不生成虚构进度或输出摘要。Ctrl+O 展开完整有界输出、技术类型/模式、事件/抑制统计、通知策略、期限、命令或 URL、完整日志路径及 Loop 关联。成功色只表示真实 completed；普通结束/手动停止用主题的青蓝强调色（accent），提高终态辨识度；失败为错误色，超时/flood/停止未确认为警告色。异步卡片与任务面板使用同一语义配色，不覆盖 Pi/ccstyle 的原生工具外壳。渲染不改模型收到的异步消息，不新增观察者自动关闭通知。
+展开（`/tasks` 详情也有同样的内容）：
 
-`Monitor`、`monitor_stop`、`monitor_list` 的工具调用行和结果行走 Pi 原生或 `pi-cc-extensions` 的渲染，不走这里的自定义 renderer；只有异步事件卡片使用上面的 `✻ monitor` 样式。展开快捷键跟随宿主：Pi 原生可展开消息，ccstyle 接管 Ctrl+O 时会打开它的 detailed transcript；本扩展不抢占该快捷键，完整 Monitor 信息始终可从 `/tasks` 详情查看。
+```text
+✓ Monitor Completed #job12345 build
+├ Description
+│ build
+│
+├ Status
+│ task #job12345 · exit 0 · 2m
+│
+├ Output
+│ stdout: Build completed successfully.
+│
+└ Logs
+  stdout: /tmp/pi-cc-monitor/job12345/stdout.log
+```
+
+标题按原因分：`Monitor`（有事件）、`Monitor Ended`（命令退出）、`Monitor Expired`（events 超时；completion 超时改用后台时限措辞，不叫 expired）、
+`Monitor Failed`（启动/连接失败或非零退出）、`Monitor Closed`（WebSocket 关闭）、`Monitor Stopped`（手动停止或输出过多被停）、`Monitor Stop Failed`。
+图标和标题用同一个 tone 颜色，图标是**是否知道判决**的函数：知道就用判决，不知道才用中性标记。
+
+| 图标 | 含义 | 判据 |
+|---|---|---|
+| `✓` 绿 | 判决成功 | `exitCode === 0`，completion 和 events 两种模式一样；completion 的 `status: completed` 同样 |
+| `✗` 红 | 判决失败 | `exitCode !== 0`（completion）、`status: failed`、启动/连接失败、**停止未确认** |
+| `⚠` 黄 | 有判决但不是失败 | `exitCode !== 0`（events 观察者）、超时、输出过多 |
+| `■` 紫 | **没有判决** | 手动停止、WebSocket 关闭、被信号终止（`exitCode === null`） |
+| `✻` 蓝 | 还在进行 | 事件批次 |
+
+`■` 不表示"成功"也不表示"失败"，只表示这张卡拿不到判决 —— 那个进程是我们停掉的，可能被杀在任意时刻，输出也可能不完整。
+停的是订阅时，展开里还会说明源命令并没有被停。
+
+紫色取自 `syntaxFunction`：`pi-cc` 的深色主题把 `accent`、`borderAccent`、`mdLink`、`customMessageLabel` 全指向同一个蓝，
+能拿到独立色相的只剩这一个。换主题后它若未定义会回落到 `accent`，卡片依然是中性色，只是和 `✻` 同色。
+**每张卡折叠时都只有一行**：输出、身份、路径全在展开里。展开的段落只在有数据时出现：`Description`、`Status`、`Source`、`Events`、`Output`、`Command`、`Socket`、`Limits`、`Logs`、`Loop`。
+协议通知（`[Monitor stopped]`）和"源命令没有被停"这类说明是**关于监视器的陈述**，归 `Status`，不混进 `Output`。
+completion 失败优先展示真实 stderr，成功保留 stdout；不生成虚构进度或输出摘要。宽度、中文/emoji/ANSI 都在折叠与展开两条路径上守住终端列数。
+
+按宿主屏幕模式给不同的展开入口，用的都是 Pi 原生接口：
+
+- **fullscreen**：提示 `click to show more`，左键点卡片展开/收起，指针停在这段提示上时它提亮到正文色（`Component.handleMouse`）
+- **regular**：提示 `ctrl+o to show more`（`options.keyHint("app.tools.expand", …)`），因为主屏不投递鼠标事件
+
+Ctrl+O 走宿主自己的 `CustomMessageComponent.setExpanded`，两种模式都有效。点击状态按消息记录，宿主重建卡片不会丢。
+
+hover 需要一个全局"指针在哪"的答案：Pi 只把 `move` 派发给指针下的组件，卡片永远收不到"指针离开"。所以和 `pi-cc-extensions` 一样拦截
+fullscreen 的 viewport 输入（`tui.handleViewportInput`），在一个只含一张卡的全局槽里先熄灯、再交给官方派发重新点亮 —— 指针落在正文或输入框时
+由拦截器自己请求一次重绘。SGR 解析是从 `pi-cc-extensions`（MIT）复制的一份，两个包各自发布，不互相依赖。
+渲染不改模型收到的异步消息，不新增观察者自动关闭通知。
+
+`Monitor`、`monitor_stop`、`monitor_list` 的工具调用行和结果行走 Pi 原生或 `pi-cc-extensions` 的渲染，不走这里的自定义 renderer；只有异步事件卡片使用上面的样式。
 
 样式开关是 `~/.pi/agent/pi-cc.json` 里的 `compactMessages`（和 pi-cc-loop 共用，用 `/pi_cc` 面板或 `/pi_cc messages on|off` 切换，
 或用环境变量 `PI_CC_COMPACT_MESSAGES=0|1` 覆盖）；关闭时回到旧的带底色卡片。
@@ -234,7 +276,7 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 ## 兼容性
 
 - Node.js `>=22.19.0`
-- Pi 1.5.2（本轮修复与回归验收通过）；Pi 1.5.1 及更早版本本轮未重新验收
+- Pi 1.6.0（本轮修复与回归验收通过）；Pi 1.5.2 及更早版本本轮未重新验收
 - `pi-cc-loop` 可选；两者通过 `pi.events` 通信。建议搭配 Loop 0.9.0 获得完整分组/分区详情和停止确认；旧 Loop 接管面板时仍能读取兼容的扁平详情，不会出现空详情。
 - 与 `pi-cc-extensions` 共存。工具调用行交给 Pi 原生或 `pi-cc-extensions` 渲染，不需要配置它的 `excludeRenderers`，也不需要关闭 ccstyle 或其 tool grouping。事件卡片走独立 custom message renderer，不受 ccstyle 开关影响。本扩展不写其他插件的配置文件。
 

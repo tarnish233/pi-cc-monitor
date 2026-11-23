@@ -1,7 +1,17 @@
 /** CC-style asynchronous cards. Tool rows remain entirely owned by Pi/ccstyle. */
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
-import { bodyLines, contentText, formatDuration, formatStamp, renderCard } from "./render.ts";
+import type { Component } from "@earendil-works/pi-tui";
+import {
+	bodyLines,
+	contentText,
+	formatDuration,
+	formatStamp,
+	renderCard,
+	renderNotificationCard,
+	type KeyHintFn,
+	type NotificationSection,
+	type NotificationTone,
+} from "./render.ts";
 import { sanitizeDisplay } from "./log-tail.ts";
 import { displayLine, monitorRole } from "./monitor-view.ts";
 import type { NotifyPolicy } from "./notification-budget.ts";
@@ -41,36 +51,49 @@ export interface MonitorMessageDetails {
 }
 
 const LABELS: Record<string, string> = {
-	output: "monitor", exit: "monitor ended", timeout: "monitor expired", error: "monitor failed",
-	closed: "monitor closed", stopped: "monitor stopped", flooded: "monitor stopped", stop_timeout: "monitor stop failed",
+	output: "Monitor", exit: "Monitor Ended", timeout: "Monitor Expired", error: "Monitor Failed",
+	closed: "Monitor Closed", stopped: "Monitor Stopped", flooded: "Monitor Stopped", stop_timeout: "Monitor Stop Failed",
 };
 
 export function messageLabel(details: MonitorMessageDetails): string {
 	if (details.mode === "completion" && details.cause === "exit" && details.status) {
-		return details.status === "completed" ? "monitor completed" : "monitor failed";
+		return details.status === "completed" ? "Monitor Completed" : "Monitor Failed";
 	}
-	if (details.mode === "completion" && details.cause === "timeout") return "monitor stopped";
+	if (details.mode === "completion" && details.cause === "timeout") return "Monitor Stopped";
 	return LABELS[details.cause ?? "output"] ?? LABELS.output!;
 }
 
 export function messageTone(details: MonitorMessageDetails): ThemeColor {
-	if (details.cause === "stop_timeout" || details.cause === "timeout" || details.cause === "flooded") return "warning";
+	// A stop we could not confirm is a failed stop, not a warning: the label already
+	// says "Stop Failed" and the resource is still alive.
+	if (details.cause === "stop_timeout") return "error";
+	if (details.cause === "timeout" || details.cause === "flooded") return "warning";
 	if (details.cause === "error" || details.status === "failed") return "error";
-	if (details.mode === "completion" && details.status === "completed") return "success";
+	// The exit code is the command's own verdict, whichever mode reported it: a
+	// successful watcher and a successful completion are the same fact.
+	if (details.cause === "exit") {
+		if (details.exitCode === 0) return "success";
+		if (details.exitCode !== undefined && details.exitCode !== null) return "warning";
+	}
 	if (details.cause === "output" || details.cause === undefined) return "accent";
-	if (details.exitCode !== undefined && details.exitCode !== null && details.exitCode !== 0) return "warning";
-	if (details.cause === "stopped" || details.cause === "exit" || details.cause === "closed") return "accent";
+	if (details.cause === "stopped" || details.cause === "closed") return "accent";
 	return "muted";
 }
 
-function messageRole(details: MonitorMessageDetails): string {
+function cardTone(details: MonitorMessageDetails): NotificationTone {
+	const tone = messageTone(details);
+	return tone === "success" || tone === "error" || tone === "warning" ? tone : "accent";
+}
+
+/** What the card watched: a command task, a watcher, a socket or a subscription. */
+function messageRoleOf(details: MonitorMessageDetails): string {
 	if (!details.monitorId) return "notification summary";
 	const kind = details.kind ?? (details.sourceId ? "source" : details.wsUrl ? "ws" : details.mode ? "command" : undefined);
 	return kind ? monitorRole({ kind, mode: details.mode ?? "events" }) : "monitor";
 }
 
 export function messageIdentity(details: MonitorMessageDetails): string {
-	const parts = [messageRole(details) + (details.monitorId ? ` #${details.monitorId}` : "")];
+	const parts = [messageRoleOf(details) + (details.monitorId ? ` #${details.monitorId}` : "")];
 	if (details.sourceId) parts[0] += ` → ${details.sourceDescription ? `${displayLine(details.sourceDescription)} ` : ""}#${details.sourceId}`;
 	const terminal = details.cause !== undefined && details.cause !== "output";
 	if (terminal && details.resourceActive) parts.unshift("cleanup pending at report");
@@ -132,65 +155,107 @@ export function messageBody(content: unknown, details: MonitorMessageDetails): s
 	return lines;
 }
 
-function expandedMeta(details: MonitorMessageDetails): string[] {
-	const lines: string[] = [];
-	if (details.monitorId) lines.push(`id ${details.monitorId}${details.kind ? ` · ${details.kind}/${details.mode ?? "events"}` : ""}`);
-	if (details.eventCount !== undefined && details.mode !== "completion") lines.push(`${details.eventCount} events delivered${details.suppressedCount ? ` · ${details.suppressedCount} rate-suppressed` : ""}${details.globalSuppressedCount ? ` · ${details.globalSuppressedCount} session-suppressed` : ""}`);
-	if (details.sourceId) lines.push(`source #${details.sourceId}${details.watchCount !== undefined ? ` · ${details.watchCount} rules` : " · all stdout"}`);
-	if (details.notify) lines.push(`notify: output ${details.notify.output} · terminal ${details.notify.terminal}`);
-	if (details.persistent) lines.push("lifetime: until stopped or the session ends");
-	else if (details.timeoutMs !== undefined) lines.push(`time limit: ${formatDuration(details.timeoutMs)}`);
-	if (details.command) lines.push(`command: ${sanitizeDisplay(details.command)}`);
-	if (details.wsUrl) lines.push(`socket: ${displayLine(details.wsUrl)}`);
-	if (details.outputPath) lines.push(`stdout: ${sanitizeDisplay(details.outputPath)}`);
-	if (details.stderrPath) lines.push(`stderr: ${sanitizeDisplay(details.stderrPath)}`);
-	if (details.loopPrompt) lines.push(`loop: ${displayLine(details.loopPrompt)}`);
-	return lines;
+/** The one-line collapsed facts: an observable exit and how long the work took. */
+function terminalStats(details: MonitorMessageDetails): string[] {
+	const stats: string[] = [];
+	if (details.exitCode !== undefined && details.exitCode !== null) stats.push(`exit ${details.exitCode}`);
+	if (details.createdAt !== undefined && details.endedAt !== undefined) {
+		stats.push(formatDuration(Math.max(0, details.endedAt - details.createdAt)));
+	}
+	return stats;
 }
 
-/** One title, one identity line, two physical body rows, then an honest expansion hint. */
+function eventStats(details: MonitorMessageDetails): string[] {
+	if (details.mode === "completion" || details.eventCount === undefined) return [];
+	const stats = [`${details.eventCount} ${details.eventCount === 1 ? "event" : "events"}`];
+	if (details.suppressedCount) stats.push(`${details.suppressedCount} rate-suppressed`);
+	if (details.globalSuppressedCount) stats.push(`${details.globalSuppressedCount} session-suppressed`);
+	return stats;
+}
+
+/**
+ * Protocol notices (`[Monitor stopped]`) and the "the source kept running"
+ * caveats are statements about the monitor, not captured output.
+ */
+function isNotice(line: string): boolean {
+	return /^\[.*\]$/.test(line) || line.endsWith("was not stopped by this operation.");
+}
+
+/** Everything the folded card cannot show, split into the sections a reader looks for. */
+function cardSections(details: MonitorMessageDetails, body: string[]): NotificationSection[] {
+	const sections: NotificationSection[] = [];
+	const notices = body.filter(isNotice);
+	const output = body.filter((line) => !isNotice(line));
+	if (details.description) {
+		sections.push({ heading: "Description", lines: [displayLine(details.description)], color: "text" });
+	}
+	sections.push({ heading: "Status", lines: [messageIdentity(details), ...notices], color: "muted" });
+	if (details.sourceId) {
+		const rules = details.watchCount !== undefined ? `${details.watchCount} rules` : "all stdout";
+		sections.push({ heading: "Source", lines: [`#${details.sourceId} · ${rules}`], color: "dim" });
+	}
+	const events = eventStats(details);
+	if (events.length) sections.push({ heading: "Events", lines: events, color: "dim" });
+	if (output.length) sections.push({ heading: "Output", lines: output, color: "toolOutput" });
+	if (details.command) {
+		sections.push({ heading: "Command", lines: [sanitizeDisplay(details.command)], color: "toolOutput" });
+	}
+	if (details.wsUrl) {
+		sections.push({ heading: "Socket", lines: [displayLine(details.wsUrl)], color: "toolOutput" });
+	}
+	const limits: string[] = [];
+	if (details.notify) limits.push(`notify: output ${details.notify.output} · terminal ${details.notify.terminal}`);
+	if (!details.notify && details.notifyLevel) limits.push(`notify: ${details.notifyLevel}`);
+	if (details.persistent) limits.push("lifetime: until stopped or the session ends");
+	else if (details.timeoutMs !== undefined) limits.push(`time limit: ${formatDuration(details.timeoutMs)}`);
+	if (limits.length) sections.push({ heading: "Limits", lines: limits, color: "dim" });
+	const logs: string[] = [];
+	if (details.outputPath) logs.push(`stdout: ${sanitizeDisplay(details.outputPath)}`);
+	if (details.stderrPath) logs.push(`stderr: ${sanitizeDisplay(details.stderrPath)}`);
+	if (logs.length) sections.push({ heading: "Logs", lines: logs, color: "dim" });
+	if (details.loopPrompt) {
+		sections.push({ heading: "Loop", lines: [displayLine(details.loopPrompt)], color: "dim" });
+	}
+	return sections;
+}
+
 export function renderMonitorMessage(
 	message: { content: unknown; details?: unknown; timestamp?: number },
-	options: { expanded: boolean; outputPad: number },
+	options: { expanded: boolean; outputPad: number; keyHint?: KeyHintFn },
 	theme: Theme,
 	compact = true,
 ): Component {
 	const details = (message.details ?? {}) as MonitorMessageDetails;
-	const label = `✻ ${messageLabel(details)}`;
-	const stamp = formatStamp(message.timestamp);
 	const body = messageBody(message.content, details);
-	const identity = messageIdentity(details);
-	const meta = expandedMeta(details);
-	const header = () => [
-		theme.fg(messageTone(details), theme.bold(label)),
-		...(stamp ? [theme.fg("muted", stamp)] : []),
-		...(details.description ? [theme.fg("dim", displayLine(details.description))] : []),
-	].join(theme.fg("dim", " · "));
 	if (!compact) {
-		return renderCard({ header: header(), body: [identity, ...body, ...meta].join("\n"), expanded: options.expanded, outputPad: options.outputPad, theme });
+		const header = [
+			theme.fg(messageTone(details), theme.bold(messageLabel(details))),
+			...(formatStamp(message.timestamp) ? [theme.fg("muted", formatStamp(message.timestamp))] : []),
+			...(details.description ? [theme.fg("dim", displayLine(details.description))] : []),
+		].join(theme.fg("dim", " · "));
+		// The header already carries the description, so the section list starts at Status.
+		return renderCard({
+			header,
+			body: cardSections(details, body)
+				.filter((section) => section.heading !== "Description")
+				.flatMap((section) => section.lines)
+				.join("\n"),
+			expanded: options.expanded,
+			outputPad: options.outputPad,
+			theme,
+		});
 	}
-	return {
-		invalidate() {}, // No width- or theme-colored cache is retained.
-		render(width: number): string[] {
-			const columns = Math.max(1, Math.floor(Number(width) || 0));
-			const pad = Math.max(0, Math.min(columns - 1, Math.floor(Number(options.outputPad) || 0)));
-			const indent = Math.min(columns - 1, pad + 2);
-			const available = Math.max(1, columns - indent);
-			const fitted = (text: string, padding: number) => " ".repeat(padding) + truncateToWidth(text, columns - padding, "…");
-			const lines = [fitted(header(), pad), fitted(theme.fg("dim", identity), indent)];
-			const wrapped = body.flatMap((line) => wrapTextWithAnsi(line, available));
-			const shown = options.expanded ? wrapped : wrapped.slice(0, 2);
-			for (const line of shown) lines.push(fitted(theme.fg("customMessageText", line), indent));
-			if (!options.expanded && wrapped.length > shown.length) {
-				lines.push(fitted(theme.fg("dim", `+${wrapped.length - shown.length} more lines`), indent));
-			}
-			if (options.expanded && meta.length) {
-				lines.push("");
-				for (const line of meta) {
-					for (const part of wrapTextWithAnsi(line, available)) lines.push(fitted(theme.fg("dim", part), indent));
-				}
-			}
-			return lines;
-		},
-	};
+	// Process and outcome share one collapsed line; the difference is the icon
+	// and what the expansion holds.
+	const terminal = details.cause !== undefined && details.cause !== "output";
+	return renderNotificationCard(message, options, theme, {
+		title: messageLabel(details),
+		id: details.monitorId,
+		subtitle: details.description ? displayLine(details.description) : undefined,
+		stamp: formatStamp(message.timestamp),
+		stats: terminal ? terminalStats(details) : eventStats(details),
+		tone: cardTone(details),
+		terminal,
+		sections: cardSections(details, body),
+	});
 }

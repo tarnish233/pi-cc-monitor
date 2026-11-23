@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-23
+
+### Changed
+- Redraw the asynchronous card in Claude Code's notification shape: a status icon, a Title Case label, and one collapsed line. The icon is a pure function of the card's tone, and process and outcome are told apart: `✓` completed, `✗` failed, `⚠` timeout/flood, `✻` (accent) an in-progress event batch, `■` (violet) a neutral outcome (manual stop, terminated command, closed socket). The title carries the same colour as its icon, so an outcome is readable without parsing the label. The violet comes from `syntaxFunction`, the only distinct non-status hue pi-cc's dark theme exposes; a theme that leaves it undefined falls back to `accent`. Every card collapses to that single row, event batches included: the output is one click or one Ctrl+O away, and Ctrl+O expands every card at once, so a preview row costs more than it buys.
+- Replace the flat identity line with a tool-card background and a `├`/`│`/`└` section tree on expansion: `Description`, `Status`, `Source`, `Events`, `Output`, `Command`, `Socket`, `Limits`, `Logs`, `Loop`, each only when the payload has it. Every field the old card showed is still reachable.
+- Adapt the expand affordance to the host screen through native interfaces only: the fullscreen alt screen says `click to show more` and toggles on a left click (`Component.handleMouse`, whose handled result already asks the host to render); the regular screen says `ctrl+o to show more` from `options.keyHint("app.tools.expand", …)` because it delivers no mouse events. Ctrl+O still goes through the host's own `CustomMessageComponent.setExpanded`. Click state is remembered per message, so a rebuild does not reset it, and a host expand discards it. The hover highlight is driven the way pi-cc-extensions drives its own: intercepting the fullscreen viewport input, because Pi only delivers `move` to the component under the pointer and a card never learns that the pointer left. SGR parsing is a copy of pi-cc-extensions' (MIT); the packages stay independent.
+- A neutral card expands on the pending background, not the success one: `■ Monitor Stopped` on a green card read as a win.
+- Protocol notices (`[Monitor stopped]`, the "source command was not stopped" caveat) moved from `Output` to `Status`. They describe the monitor, not captured output.
+### Fixed
+- An events-mode watcher whose command exited 0 was drawn as a neutral square while the same exit 0 in completion mode was a green check. The exit code is now the verdict in both modes: `✓` for 0, `⚠` for a non-zero watcher exit (the monitor did not fail), `✗` for a failed completion. `■` is reserved for cards with no verdict at all: a manual stop, a closed socket, a signal (`exitCode === null`).
+- An unconfirmed stop (`stop_timeout`) is a failure, not a warning: the label already says "Stop Failed" and the resource is still alive, so it now uses `✗` and the error colour, matching the `isError` result `monitor_stop` returns.
+- The legacy padded card (`compactMessages` off) printed the identity line twice: once from the body and once from the new `Status` section.
+- The hint highlight could outlive the pointer: expanding and collapsing the card, or scrolling the transcript, left it lit. A click now clears it, and a wheel tick is treated like motion.
+- The expand hint no longer rescans keystrokes for SGR mouse packets.
+### Removed
+- The unused `renderBlock` helper in the shared `render.ts`.
+
 ## [0.13.1] - 2026-11-20
 
 ### Fixed

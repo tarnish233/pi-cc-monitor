@@ -1,6 +1,7 @@
 /**
- * Rendering tests: an event is drawn like a scheduled fire — a timestamped
- * header, identity and body — while tool rows stay native/ccstyle.
+ * Rendering tests: an asynchronous fact draws one collapsed line, and an
+ * expanded section tree with the tool-card background. Tool rows stay
+ * native/ccstyle.
  */
 import assert from "node:assert";
 import fs from "node:fs";
@@ -12,7 +13,10 @@ import { findPiInstall, loadModule } from "./helpers.mjs";
 
 const mod = await loadModule("index.ts");
 const { visibleWidth, stripTerminalSequences } = await import(pathToFileURL(findPiInstall().piTui).href);
+/** An SGR idle-motion packet: code 35 = motion with no button held. */
+const IDLE_MOTION = "\x1b[<35;40;12M";
 const { messageBody } = await loadModule("message-render.ts");
+const { setNotificationTui, releaseNotificationHover } = await loadModule("render.ts");
 
 /** A theme that keeps the text as-is, so assertions can read it. */
 function makeTheme() {
@@ -84,36 +88,40 @@ function eventMessage(content, details = {}) {
 	};
 }
 
+/** Regular screen: no mouse, so the hint is the host's expand keybinding. */
 function render(message, expanded = false, width = 120) {
+	setNotificationTui({ mode: "regular" });
 	const { renderers } = makeHarness();
 	const { theme, bgCalls, fgCalls } = makeTheme();
 	const component = renderers.get("Monitor")(message, { expanded, outputPad: 1 }, theme);
 	const lines = component.render(width);
-	return { text: lines.join("\n"), lines, bgCalls, fgCalls };
+	return { text: lines.join("\n"), lines, bgCalls, fgCalls, component };
 }
 
 test("an output event reads like a scheduled fire", () => {
-	const { text } = render(
-		eventMessage("monitor mon1 \u00b7 errors in deploy.log\nERROR: connection refused on :3000"),
-	);
-	assert.match(text, /\u273b monitor · 10:22pm · errors in deploy\.log/);
-	assert.match(text, /ERROR: connection refused on :3000/);
+	const message = eventMessage("monitor mon1 \u00b7 errors in deploy.log\nERROR: connection refused on :3000");
+	const { text, lines } = render(message);
+	assert.equal(lines.length, 1, "one line, always");
+	assert.match(text, /\u273b Monitor mon1 \u00b7 errors in deploy\.log \u00b7 10:22pm \u00b7 2 events/);
+	assert.ok(!text.includes("ERROR: connection refused"), "the output is behind the expansion");
 	assert.ok(!text.includes("monitor mon1 \u00b7"), "the id line is for the model only");
 	assert.ok(!text.includes("[Monitor]"), "no machine label");
+	assert.match(render(message, true).text, /ERROR: connection refused on :3000/);
 });
 
 test("every cause has its own wording", () => {
+	// A warning cause is a warning icon, not the neutral event mark.
 	const cases = [
-		["exit", "monitor ended"],
-		["timeout", "monitor expired"],
-		["error", "monitor failed"],
-		["closed", "monitor closed"],
-		["stopped", "monitor stopped"],
-		["flooded", "monitor stopped"],
+		["exit", "\u25a0 Monitor Ended"],
+		["timeout", "\u26a0 Monitor Expired"],
+		["error", "\u2717 Monitor Failed"],
+		["closed", "\u25a0 Monitor Closed"],
+		["stopped", "\u25a0 Monitor Stopped"],
+		["flooded", "\u26a0 Monitor Stopped"],
 	];
 	for (const [cause, label] of cases) {
 		const { text } = render(eventMessage(`monitor mon1 \u00b7 errors in deploy.log\n[${cause}]`, { cause }));
-		assert.match(text, new RegExp(`\u273b ${label} · 10:22pm`), `${cause}: ${text}`);
+		assert.match(text, new RegExp(`${label} mon1`), `${cause}: ${text}`);
 	}
 });
 
@@ -128,16 +136,16 @@ test("completion metadata does not claim that zero events were delivered", () =>
 		}),
 		true,
 	);
-	assert.match(text, /\u273b monitor completed/);
+	assert.match(text, /\u2713 Monitor Completed/);
 	assert.match(text, /exit 0/);
 	assert.doesNotMatch(text, /0 events/);
 });
 
 test("completion terminal headers distinguish completed, failed and deadline stop", () => {
 	const cases = [
-		[{ cause: "exit", status: "completed" }, "monitor completed"],
-		[{ cause: "exit", status: "failed" }, "monitor failed"],
-		[{ cause: "timeout", status: "timed_out" }, "monitor stopped"],
+		[{ cause: "exit", status: "completed" }, "Monitor Completed"],
+		[{ cause: "exit", status: "failed" }, "Monitor Failed"],
+		[{ cause: "timeout", status: "timed_out" }, "Monitor Stopped"],
 	];
 	for (const [details, label] of cases) {
 		const { text } = render(
@@ -147,29 +155,106 @@ test("completion terminal headers distinguish completed, failed and deadline sto
 				...details,
 			}),
 		);
-		assert.match(text, new RegExp(`\u273b ${label} · 10:22pm`), `${JSON.stringify(details)}: ${text}`);
+		assert.match(text, new RegExp(`${label} mon1`), `${JSON.stringify(details)}: ${text}`);
 	}
 	// The events wording is unchanged by a completion happening nearby.
 	const { text } = render(
 		eventMessage("monitor mon1 · background test\n[terminal notice]", { cause: "exit" }),
 	);
-	assert.match(text, /\u273b monitor ended · 10:22pm/);
+	assert.match(text, /\u25a0 Monitor Ended mon1/);
 });
 
-test("the body is capped when collapsed and whole when expanded", () => {
-	const lines = Array.from({ length: 8 }, (_, i) => `line ${i + 1}`).join("\n");
-	const message = eventMessage(`monitor mon1 \u00b7 errors in deploy.log\n${lines}`);
+test("protocol notices are Status, not Output", () => {
+	const source = render(eventMessage("monitor mon1 \u00b7 build errors\n[Monitor stopped]", {
+		kind: "source", mode: "events", sourceId: "tx12345", sourceDescription: "build", cause: "stopped", status: "stopped",
+	}), true);
+	const status = source.text.slice(source.text.indexOf("Status"), source.text.indexOf("Source"));
+	assert.match(status, /subscription #mon1 → build #tx12345/);
+	assert.match(status, /source command was not stopped by this operation/);
+	assert.ok(!source.text.includes("Output"), "a stop with no captured output has no Output section");
 
-	const collapsed = render(message).text;
-	assert.match(collapsed, /line 2/);
-	assert.ok(!collapsed.includes("line 3"), "identity plus two body rows, not three output rows");
-	assert.ok(!collapsed.includes("line 8"));
-	assert.match(collapsed, /\+6 more lines/);
+	// Real output still lives under Output, and a notice never shares that heading.
+	const mixed = render(eventMessage("monitor mon1 \u00b7 test\n[Monitor stopped]\nreal line 1", {
+		kind: "command", mode: "events", cause: "stopped", status: "stopped",
+	}), true);
+	const output = mixed.text.slice(mixed.text.indexOf("Output"));
+	assert.match(output, /real line 1/);
+	assert.ok(!output.includes("[Monitor stopped]"), output);
+});
 
-	const expanded = render(message, true).text;
-	assert.match(expanded, /line 8/);
-	assert.match(expanded, /id mon1/);
-	assert.match(expanded, /2 events/);
+test("the legacy padded card lists the identity once", () => {
+	const { renderers, busHandlers } = makeHarness();
+	fs.writeFileSync(process.env.PI_CC_CONFIG_FILE, JSON.stringify({ compactMessages: false }), "utf8");
+	busHandlers.get("pi-cc:config")?.({}, {});
+	try {
+		const { theme } = makeTheme();
+		const message = eventMessage("monitor mon1 \u00b7 build\nstdout tail:\nok", {
+			mode: "completion", cause: "exit", status: "completed", exitCode: 0, command: "npm run build",
+		});
+		const body = renderers.get("Monitor")(message, { expanded: true, outputPad: 1 }, theme).render(120).join("\n");
+		assert.equal(body.split("task #mon1").length - 1, 1, body);
+	} finally {
+		fs.writeFileSync(process.env.PI_CC_CONFIG_FILE, JSON.stringify({ compactMessages: true }), "utf8");
+		busHandlers.get("pi-cc:config")?.({}, {});
+	}
+});
+
+test("hover never outlives the pointer: a click or a wheel clears it", () => {
+	const { renderers } = makeHarness();
+	const { theme, fgCalls } = makeTheme();
+	let renders = 0;
+	const tui = {
+		mode: "fullscreen",
+		handleViewportInput() {},
+		requestRender() {
+			renders += 1;
+		},
+	};
+	setNotificationTui(tui);
+	const message = eventMessage("monitor mon1 \u00b7 deploy\nERROR: boom");
+	const build = () => renderers.get("Monitor")(message, { expanded: false, outputPad: 1 }, theme);
+	const hintColor = (card) => {
+		fgCalls.length = 0;
+		card.render(120);
+		return fgCalls.find((call) => call.text === "click to show more")?.color;
+	};
+	const at = (type, x = 0) => ({ type, button: type === "move" ? "none" : "left", x, y: 0, screenX: 0, screenY: 0, width: 120, height: 1, shift: false, alt: false, ctrl: false });
+
+	const card = build();
+	const hintStart = card.render(120)[0].indexOf("click to show more");
+	card.handleMouse(at("move", hintStart + 2));
+	assert.equal(hintColor(card), "text", "the pointer on the hint lights it");
+	// Expanding hides the hint; collapsing must not bring back a stale highlight.
+	card.handleMouse(at("click"));
+	card.handleMouse(at("click"));
+	assert.equal(hintColor(card), "dim", "a click clears the hover");
+
+	// A wheel tick scrolls the content under a still pointer.
+	card.handleMouse(at("move", hintStart + 2));
+	assert.equal(hintColor(card), "text");
+	renders = 0;
+	tui.handleViewportInput("\x1b[<64;40;12M");
+	assert.equal(hintColor(card), "dim", "scrolling drops the hover");
+	assert.ok(renders > 0, "the clear asks for a render");
+	releaseNotificationHover();
+	setNotificationTui({ mode: "regular" });
+});
+
+test("every card collapses to a single line, and the expansion holds the output", () => {
+	const body = Array.from({ length: 8 }, (_, i) => `line ${i + 1}`).join("\n");
+	const cases = [
+		["event batch", eventMessage(`monitor mon1 \u00b7 errors in deploy.log\n${body}`)],
+		["completion", eventMessage(`monitor mon1 \u00b7 deploy\n${body}`, { mode: "completion", cause: "exit", status: "completed", exitCode: 0 })],
+		["stop", eventMessage(`monitor mon1 \u00b7 run.sh\n${body}`, { cause: "stopped", status: "stopped" })],
+	];
+	for (const [label, message] of cases) {
+		const collapsed = render(message);
+		assert.equal(collapsed.lines.length, 1, `${label}: ${collapsed.text}`);
+		assert.ok(!collapsed.text.includes("line 1"), `${label} shows no body while collapsed`);
+		const expanded = render(message, true).text;
+		assert.match(expanded, /line 8/, label);
+		assert.match(expanded, /Output/, label);
+	}
 });
 
 test("completion paths are detail-view data, not collapsed noise", () => {
@@ -182,10 +267,10 @@ test("completion paths are detail-view data, not collapsed noise", () => {
 	const collapsed = render(message).text;
 	assert.ok(!collapsed.includes(outputPath), "collapsed card omits the log path");
 	assert.ok(!collapsed.includes(stderrPath), "collapsed card omits the stderr path");
-	assert.match(collapsed, /DONE/);
 	const expanded = render(message, true).text;
 	assert.ok(expanded.includes(outputPath), "expanded card keeps the log path");
 	assert.ok(expanded.includes(stderrPath), "expanded card keeps the stderr path");
+	assert.match(expanded, /DONE/);
 });
 
 test("compactMessages off draws the padded card instead", () => {
@@ -205,90 +290,252 @@ test("compactMessages off draws the padded card instead", () => {
 	busHandlers.get("pi-cc:config")?.({}, {});
 });
 
-test("all four roles have a visible identity and subscriptions name their actual source", () => {
-  const cases = [
-    [{ kind: "command", mode: "completion" }, /task #mon1/],
-    [{ kind: "command", mode: "events" }, /watcher #mon1 · stdout/],
-    [{ kind: "ws", mode: "events" }, /socket #mon1 · frames/],
-    [{ kind: "source", mode: "events", sourceId: "work1234", sourceDescription: "build" }, /subscription #mon1 → build #work1234/],
-  ];
-  for (const [details, identity] of cases) {
-    const { text, bgCalls } = render(eventMessage("monitor mon1 · errors in deploy.log\nERROR: detail", details));
-    assert.match(text, identity);
-    assert.equal(bgCalls.count, 0, "compact event cards have no success-background shell");
-  }
+test("all four roles name what was watched, in the expanded Status section", () => {
+	const cases = [
+		[{ kind: "command", mode: "completion" }, /task #mon1/],
+		[{ kind: "command", mode: "events" }, /watcher #mon1 · stdout/],
+		[{ kind: "ws", mode: "events" }, /socket #mon1 · frames/],
+		[{ kind: "source", mode: "events", sourceId: "work1234", sourceDescription: "build" }, /subscription #mon1 → build #work1234/],
+	];
+	for (const [details, identity] of cases) {
+		const collapsed = render(eventMessage("monitor mon1 · errors in deploy.log\nERROR: detail", details));
+		assert.match(collapsed.text, /\u273b Monitor mon1/);
+		assert.equal(collapsed.bgCalls.count, 0, "a collapsed event card has no success-background shell");
+		const expanded = render(eventMessage("monitor mon1 · errors in deploy.log\nERROR: detail", details), true);
+		assert.match(expanded.text, identity);
+	}
 });
 
 test("semantic colors reserve success for actual completion, not observer stop or source exit", () => {
-  const cases = [
-    [{ kind: "command", mode: "completion", cause: "exit", status: "completed", exitCode: 0 }, "success"],
-    [{ kind: "command", mode: "completion", cause: "exit", status: "failed", exitCode: 1 }, "error"],
-    [{ kind: "source", sourceId: "work", mode: "events", cause: "stopped", status: "stopped" }, "accent"],
-    [{ kind: "source", sourceId: "work", mode: "events", cause: "exit", status: "exited", exitCode: 0 }, "accent"],
-    [{ kind: "command", mode: "completion", cause: "stopped", status: "stopped" }, "accent"],
-    [{ kind: "ws", mode: "events", cause: "closed", status: "exited" }, "accent"],
-    [{ kind: "command", mode: "events", cause: "exit", status: "exited", exitCode: 3 }, "warning"],
-    [{ kind: "command", mode: "completion", cause: "timeout", status: "timed_out" }, "warning"],
-    [{ kind: "command", mode: "events", cause: "stop_timeout", status: "stop_timeout" }, "warning"],
-    [{ kind: "source", sourceId: "work", mode: "events", cause: "flooded", status: "flooded" }, "warning"],
-  ];
-  for (const [details, color] of cases) {
-    const result = render(eventMessage("monitor mon1 · test\n[terminal]", details));
-    assert.equal(result.fgCalls.find((call) => call.text.startsWith("✻ monitor")).color, color);
-  }
+	const cases = [
+		[{ kind: "command", mode: "completion", cause: "exit", status: "completed", exitCode: 0 }, "\u2713", "success"],
+		[{ kind: "command", mode: "completion", cause: "exit", status: "failed", exitCode: 1 }, "\u2717", "error"],
+		// A neutral outcome is a quiet blue square, never success green.
+		[{ kind: "source", sourceId: "work", mode: "events", cause: "stopped", status: "stopped" }, "\u25a0", "syntaxFunction"],
+		[{ kind: "source", sourceId: "work", mode: "events", cause: "exit", status: "exited", exitCode: 0 }, "\u2713", "success"],
+		[{ kind: "command", mode: "completion", cause: "stopped", status: "stopped" }, "\u25a0", "syntaxFunction"],
+		[{ kind: "ws", mode: "events", cause: "closed", status: "exited" }, "\u25a0", "syntaxFunction"],
+		[{ kind: "command", mode: "events", cause: "exit", status: "exited", exitCode: 3 }, "\u26a0", "warning"],
+		[{ kind: "command", mode: "completion", cause: "timeout", status: "timed_out" }, "\u26a0", "warning"],
+		[{ kind: "command", mode: "events", cause: "stop_timeout", status: "stop_timeout" }, "\u2717", "error"],
+		[{ kind: "source", sourceId: "work", mode: "events", cause: "flooded", status: "flooded" }, "\u26a0", "warning"],
+	];
+	for (const [details, icon, color] of cases) {
+		const result = render(eventMessage("monitor mon1 · test\n[terminal]", details), true);
+		assert.equal(result.fgCalls.find((call) => call.text === icon)?.color, color, JSON.stringify(details));
+		assert.ok(result.bgCalls.count > 0, "the expanded card carries the tool-card background");
+	}
 });
 
-test("folded failure cards prioritize real stderr, while expansion preserves both tails and metadata", () => {
-  const message = eventMessage("monitor mon1 · test\n[Monitor failed — exit code 1]\nstdout tail:\ninfo 1\ninfo 2\nstderr tail:\nERROR: bad dependency", {
-    kind: "command", mode: "completion", cause: "exit", status: "failed", exitCode: 1,
-    stdoutTail: "info 1\ninfo 2", stderrTail: "ERROR: bad dependency",
-    createdAt: 1000, endedAt: 121000, outputPath: "/tmp/full.out", stderrPath: "/tmp/full.err",
-  });
-  const before = JSON.stringify(message);
-  const collapsed = render(message).text;
-  assert.match(collapsed, /task #mon1 · exit 1 · 2m/);
-  assert.match(collapsed, /stderr: ERROR: bad dependency/);
-  assert.ok(collapsed.indexOf("ERROR") < collapsed.indexOf("info 1"));
-  assert.doesNotMatch(collapsed, /\/tmp\/full/);
-  const expanded = render(message, true).text;
-  assert.match(expanded, /info 1[\s\S]*info 2/);
-  assert.match(expanded, /stdout: \/tmp\/full.out/);
-  assert.match(expanded, /stderr: \/tmp\/full.err/);
-  assert.equal(JSON.stringify(message), before, "rendering cannot rewrite the model message");
+test("a failed completion leads with exit code, and stderr before stdout once expanded", () => {
+	const message = eventMessage("monitor mon1 · test\n[Monitor failed — exit code 1]\nstdout tail:\ninfo 1\ninfo 2\nstderr tail:\nERROR: bad dependency", {
+		kind: "command", mode: "completion", cause: "exit", status: "failed", exitCode: 1,
+		stdoutTail: "info 1\ninfo 2", stderrTail: "ERROR: bad dependency",
+		createdAt: 1000, endedAt: 121000, outputPath: "/tmp/full.out", stderrPath: "/tmp/full.err",
+	});
+	const before = JSON.stringify(message);
+	const collapsed = render(message).text;
+	assert.match(collapsed, /exit 1 · 2m/);
+	assert.doesNotMatch(collapsed, /\/tmp\/full/);
+	const expanded = render(message, true).text;
+	assert.match(expanded, /task #mon1 · exit 1 · 2m/);
+	assert.ok(expanded.indexOf("ERROR") < expanded.indexOf("info 1"), "stderr leads the expanded output");
+	assert.match(expanded, /stdout: \/tmp\/full.out/);
+	assert.match(expanded, /stderr: \/tmp\/full.err/);
+	assert.equal(JSON.stringify(message), before, "rendering cannot rewrite the model message");
 });
 
-test("subscription stops and deadlines expose their limited scope in the folded card", () => {
-  for (const [cause, notice] of [["stopped", "[Monitor stopped]"], ["timeout", "[Monitor expired after 5m]"], ["flooded", "[Monitor stopped — too much output]"]]) {
-    const message = eventMessage("monitor mon1 · test\n" + notice, { kind: "source", mode: "events", sourceId: "work", cause, status: cause === "timeout" ? "timed_out" : "stopped" });
-    const { text } = render(message, false, 100);
-    assert.match(text, /subscription #mon1 → #work/);
-    assert.match(text, /source command was not stopped by this operation/);
-  }
+test("subscription stops and deadlines expose their limited scope", () => {
+	for (const [cause, notice] of [["stopped", "[Monitor stopped]"], ["timeout", "[Monitor expired after 5m]"], ["flooded", "[Monitor stopped — too much output]"]]) {
+		const message = eventMessage("monitor mon1 · test\n" + notice, { kind: "source", mode: "events", sourceId: "work", cause, status: cause === "timeout" ? "timed_out" : "stopped" });
+		const expanded = render(message, true, 100).text;
+		assert.match(expanded, /subscription #mon1 → #work/);
+		assert.match(expanded, /source command was not stopped by this operation/);
+	}
 });
 
 test("narrow and wide-character cards cap physical rows, strip hostile terminal data and fit width", () => {
-  const message = eventMessage("monitor mon1 · test\n\x1b[31m" + "中文 🚀 ".repeat(150) + "\x1b[0m\nsecond\nthird", {
-    kind: "command", mode: "events", description: "描述\n\x1b[31m红色\x1b[0m",
-  });
-  assert.ok(messageBody(message.content, message.details).every((line) => !line.includes("\x1b")), "incoming ANSI is removed before Pi wraps/styles the body");
-  for (const width of [120, 40, 16, 5, 1]) {
-    const result = render(message, false, width);
-    assert.ok(result.lines.length <= 5, "one header, identity, two body rows and one hint");
-    assert.ok(result.lines.every((line) => visibleWidth(line) <= width));
-    assert.ok(!result.text.includes("\x1b[31m"), "incoming red style must not leak; Pi's own reset sequences are valid");
-    assert.ok(!stripTerminalSequences(result.text).includes("\x1b"));
-    assert.ok(!result.text.includes("\x00"));
-    const expanded = render(message, true, width);
-    assert.ok(expanded.lines.every((line) => visibleWidth(line) <= width));
-  }
+	const message = eventMessage("monitor mon1 · test\n\x1b[31m" + "中文 🚀 ".repeat(150) + "\x1b[0m\nsecond\nthird", {
+		kind: "command", mode: "events", description: "描述\n\x1b[31m红色\x1b[0m",
+	});
+	assert.ok(messageBody(message.content, message.details).every((line) => !line.includes("\x1b")), "incoming ANSI is removed before Pi wraps/styles the body");
+	for (const width of [120, 40, 16, 5, 1]) {
+		const result = render(message, false, width);
+		assert.equal(result.lines.length, 1, "exactly one collapsed row");
+		assert.ok(result.lines.every((line) => visibleWidth(line) <= width));
+		assert.ok(!result.text.includes("\x1b[31m"), "incoming red style must not leak; Pi's own reset sequences are valid");
+		assert.ok(!stripTerminalSequences(result.text).includes("\x1b"));
+		assert.ok(!result.text.includes("\x00"));
+		const expanded = render(message, true, width);
+		assert.ok(expanded.lines.every((line) => visibleWidth(line) <= width));
+	}
+});
+
+test("a live batch is a spark, a neutral outcome is a square", () => {
+	const cases = [
+		[{ cause: "output" }, "\u273b", "in-progress batch"],
+		[{ cause: "stopped", status: "stopped" }, "\u25a0", "manual stop"],
+		[{ cause: "exit", status: "completed", mode: "completion", exitCode: 0 }, "\u2713", "completed"],
+		[{ cause: "exit", status: "failed", mode: "completion", exitCode: 1 }, "\u2717", "failed"],
+		[{ cause: "flooded", status: "flooded" }, "\u26a0", "flooded"],
+		[{ cause: "stop_timeout", status: "stop_timeout" }, "\u2717", "an unconfirmed stop is a failure"],
+	];
+	for (const [details, icon, label] of cases) {
+		const { text } = render(eventMessage("monitor mon1 \u00b7 test\nline", details));
+		assert.ok(text.includes(`${icon} `), `${label} starts with ${icon}: ${text}`);
+	}
+});
+
+test("a long multi-byte description rides in the one collapsed row", () => {
+	const description = "验证单一接口的动态标题、等待、历史恢复及两个 Pi 版本";
+	const message = eventMessage("monitor mon1 \u00b7 x\nstdout tail:\nok", {
+		kind: "command",
+		mode: "completion",
+		cause: "exit",
+		status: "completed",
+		exitCode: 0,
+		description,
+	});
+	const wide = render(message, false, 140);
+	assert.equal(wide.lines.length, 1, "one row");
+	assert.ok(wide.text.includes(description), `the whole description fits a wide row: ${wide.text}`);
+	for (const width of [120, 100, 80, 60]) {
+		const { text, lines } = render(message, false, width);
+		assert.equal(lines.length, 1, `${width}: one row`);
+		assert.ok(text.includes(description.slice(0, 4)), `${width}: the description is shown (${text})`);
+	}
+});
+
+test("an exit code is the verdict, whichever mode reported it", () => {
+	// The same exit 0 must not be a green check in one mode and a square in another.
+	const exit = (mode, exitCode, extra = {}) =>
+		render(eventMessage("monitor mon1 \u00b7 build\nline", {
+			kind: "command", mode, cause: "exit", exitCode, ...extra,
+		})).text;
+	assert.match(exit("completion", 0, { status: "completed" }), /^ \u2713 Monitor Completed/);
+	assert.match(exit("events", 0, { status: "exited" }), /^ \u2713 Monitor Ended/);
+	assert.match(exit("events", 3, { status: "exited" }), /^ \u26a0 Monitor Ended/);
+	assert.match(exit("completion", 1, { status: "failed" }), /^ \u2717 Monitor Failed/);
+	// No exit code at all (a signal, or a stop): no verdict, so no check mark.
+	assert.match(exit("events", null, { status: "exited" }), /^ \u25a0 Monitor Ended/);
+	assert.match(render(eventMessage("monitor mon1 \u00b7 build\nline", { cause: "stopped", status: "stopped" })).text, /^ \u25a0 Monitor Stopped/);
+	assert.match(render(eventMessage("monitor mon1 \u00b7 build\nline", { kind: "ws", mode: "events", cause: "closed" })).text, /^ \u25a0 Monitor Closed/);
+});
+
+test("the regular screen offers the expand keybinding, never a click", () => {
+	const { text } = render(eventMessage("monitor mon1 \u00b7 deploy\nERROR: boom"));
+	assert.match(text, /ctrl\+o to show more/);
+	assert.ok(!text.includes("click to show more"), "the regular screen delivers no mouse events");
+});
+
+test("a fullscreen hover lights the hint, and leaving the card puts it out", () => {
+	const { renderers } = makeHarness();
+	const { theme, fgCalls } = makeTheme();
+	let renders = 0;
+	// The official chain turns an idle-motion packet into a `move` on the component
+	// under the pointer; here the pointer is over `card` at column `x`.
+	let moved = null;
+	const tui = {
+		mode: "fullscreen",
+		handleViewportInput() {
+			if (moved) moved.component.handleMouse({ ...mouse("move"), x: moved.x });
+		},
+		requestRender() {
+			renders += 1;
+		},
+	};
+	const mouse = (type) => ({ type, button: type === "move" ? "none" : "left", x: 0, y: 0, screenX: 0, screenY: 0, width: 120, height: 1, shift: false, alt: false, ctrl: false });
+	setNotificationTui(tui);
+	const message = eventMessage("monitor mon1 \u00b7 deploy\nERROR: boom");
+	const build = () => renderers.get("Monitor")(message, { expanded: false, outputPad: 1 }, theme);
+	const card = build();
+	const line = card.render(120)[0];
+	const hintStart = line.indexOf("click to show more");
+	assert.ok(hintStart > 0, line);
+
+	// Hovering off the hint does nothing.
+	moved = { component: card, x: 2 };
+	tui.handleViewportInput(IDLE_MOTION);
+	fgCalls.length = 0;
+	card.render(120);
+	assert.equal(fgCalls.find((call) => call.text === "click to show more")?.color, "dim");
+	// Hovering the hint brightens it.
+	moved = { component: card, x: hintStart + 2 };
+	tui.handleViewportInput(IDLE_MOTION);
+	fgCalls.length = 0;
+	card.render(120);
+	assert.equal(fgCalls.find((call) => call.text === "click to show more")?.color, "text");
+	// The pointer leaves every card: the next motion packet must clear it and repaint.
+	moved = null;
+	assert.equal(tui.handleViewportInput(IDLE_MOTION), undefined);
+	assert.ok(renders > 0, "the clear asks for a render or the old frame stays");
+	fgCalls.length = 0;
+	card.render(120);
+	assert.equal(fgCalls.find((call) => call.text === "click to show more")?.color, "dim");
+	releaseNotificationHover();
+	setNotificationTui({ mode: "regular" });
+});
+
+test("fullscreen says click to show more, and a click toggles the same card", () => {
+	const { renderers } = makeHarness();
+	const { theme } = makeTheme();
+	setNotificationTui({ mode: "fullscreen" });
+	const message = eventMessage("monitor mon1 \u00b7 deploy\nERROR: boom");
+	const component = renderers.get("Monitor")(message, { expanded: false, outputPad: 1 }, theme);
+	const collapsed = component.render(120);
+	assert.match(collapsed.join("\n"), /click to show more/);
+
+	// The host renders on a handled click, so the component must report one.
+	// A move never lights the hint: nothing reports that the pointer left again.
+	const at = (type) => ({ type, button: "left", x: 1, y: 0, screenX: 1, screenY: 0, width: 120, height: collapsed.length, shift: false, alt: false, ctrl: false });
+	assert.equal(component.handleMouse(at("move")), undefined, "a move off the hint changes nothing");
+	assert.equal(component.render(120).join("\n"), collapsed.join("\n"));
+
+	const result = component.handleMouse(at("click"));
+	assert.equal(result?.handled, true);
+	assert.equal(result?.render, true);
+	const expanded = component.render(120);
+	assert.match(expanded.join("\n"), /\u251c Description/);
+	assert.ok(expanded.length > collapsed.length);
+
+	component.handleMouse(at("click"));
+	assert.equal(component.render(120).length, collapsed.length, "a second click collapses it");
+	setNotificationTui({ mode: "regular" });
+});
+
+test("a click survives the host rebuilding the card, and Ctrl+O still wins", () => {
+	const { renderers } = makeHarness();
+	const { theme } = makeTheme();
+	setNotificationTui({ mode: "fullscreen" });
+	const message = eventMessage("monitor mon1 \u00b7 deploy\nERROR: boom");
+	const build = (expanded) => renderers.get("Monitor")(message, { expanded, outputPad: 1 }, theme);
+
+	const first = build(false);
+	first.handleMouse({ type: "click", button: "left", x: 1, y: 0, screenX: 1, screenY: 0, width: 120, height: 1, shift: false, alt: false, ctrl: false });
+
+	// CustomMessageComponent.rebuild() re-runs the renderer at the same base.
+	const rebuilt = build(false);
+	assert.match(rebuilt.render(120).join("\n"), /\u251c Description/, "the click is remembered per message");
+	// The host's own expand changes the base, so the local click no longer applies.
+	assert.match(build(true).render(120).join("\n"), /\u251c Description/);
+	setNotificationTui({ mode: "regular" });
+});
+
+test("a section is omitted when the payload has nothing for it", () => {
+	const { text } = render(eventMessage("monitor mon1 \u00b7 deploy\nERROR: boom"), true);
+	assert.match(text, /Description/);
+	assert.match(text, /Status/);
+	assert.ok(!text.includes("Logs"), "no log paths in this payload");
+	assert.ok(!text.includes("Command"), "no command in this payload");
+	assert.ok(!text.includes("Limits"), "no deadline in this payload");
 });
 
 test("Monitor tools expose no custom shell or call/result renderer", () => {
-  const { tools, toolRendererCalls } = makeHarness();
-  assert.equal(toolRendererCalls, 0);
-  for (const tool of tools.values()) {
-    assert.equal(tool.renderShell, undefined);
-    assert.equal(tool.renderCall, undefined);
-    assert.equal(tool.renderResult, undefined);
-  }
+	const { tools, toolRendererCalls } = makeHarness();
+	assert.equal(toolRendererCalls, 0);
+	for (const tool of tools.values()) {
+		assert.equal(tool.renderShell, undefined);
+		assert.equal(tool.renderCall, undefined);
+		assert.equal(tool.renderResult, undefined);
+	}
 });

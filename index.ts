@@ -59,7 +59,7 @@ import { DEFAULT_NOTIFY, OutputBudget, outputLevel, strongerLevel, type NotifyPo
 import { OutputLines, WatchRules, validateWatches, MAX_WATCHES, MAX_WATCH_TEXT, type WatchRule, type WatchState, type OutputStream } from "./watches.ts";
 import { cleanOldLogDirectories, createLogDirectory } from "./log-store.ts";
 import { registerTaskProvider, type TaskDetail, type TaskItem, type TaskStopResult } from "./tasks.ts";
-import { formatDuration } from "./render.ts";
+import { formatDuration, releaseNotificationHover, setNotificationTui } from "./render.ts";
 import { renderMonitorMessage } from "./message-render.ts";
 import { displayLine, monitorBadges, monitorListText, monitorRole, observationLabel, startReceipt, stopReceipt, stopScope, updateReceipt } from "./monitor-view.ts";
 
@@ -1647,6 +1647,14 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		lastCtx = ctx;
+		// The card says "click to show more" only where Pi actually delivers mouse
+		// events: fullscreen. An empty widget is the native way to reach the TUI.
+		if (ctx.mode === "tui" && ctx.hasUI && typeof ctx.ui.setWidget === "function") {
+			ctx.ui.setWidget("pi-cc-monitor:screen", (tui) => {
+				setNotificationTui(tui);
+				return { render: () => [], invalidate() {} };
+			});
+		}
 		// Another process may have edited the shared settings file.
 		invalidateConfig();
 		cleanOldLogDirectories();
@@ -1655,6 +1663,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	// --------------------------------------------------------------- lifecycle
 
 	pi.on("session_shutdown", async () => {
+		releaseNotificationHover();
 		// Set first: the processes killed below exit after Pi has invalidated
 		// this extension's API, and their callbacks must not touch it.
 		disposed = true;
