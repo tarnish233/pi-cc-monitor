@@ -616,7 +616,7 @@ test("task tree groups real source subscriptions and local stop confirms subscri
   assert.equal(list.find((item) => item.id === muted.details.taskId).status, "running");
   assert.equal(list.find((item) => item.id === independent.details.taskId).status, "running");
   assert.equal(runtime.sent.length, 1, "no extra source terminal card is introduced");
-  assert.equal(runtime.sent[0].options.triggerTurn, false, "local stop must not start a model reply");
+  assert.equal(runtime.sent[0].options.triggerTurn, true, "a stop wakes the model");
   assert.equal(runtime.state.aborts, 0);
   runtime.input("escape");
   await overlay;
@@ -652,7 +652,7 @@ test("sectioned Monitor details keep complete old-panel rows without duplicate m
   runtime.load();
   await runtime.start();
   const work = await arm(runtime, { command: "sleep 30", description: "legacy-compatible work", mode: "completion", persistent: true });
-  const observer = await arm(runtime, { source: { monitorId: work.details.taskId }, description: "legacy-compatible observer", mode: "events", persistent: true, watches: [{ id: "errors", text: "ERROR", stream: "stderr" }], notify: { output: "context", terminal: "context" } });
+  const observer = await arm(runtime, { source: { monitorId: work.details.taskId }, description: "legacy-compatible observer", mode: "events", persistent: true, watches: [{ id: "errors", text: "ERROR", stream: "stderr" }], notify: { output: "context" } });
   const overlay = openTasks(runtime);
   const panel = runtime.state.component;
   const provider = panel.options.registry.providers.get("monitor");

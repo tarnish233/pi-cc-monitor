@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-24
+
+### Changed
+- Reported completion, failure and explicit stop outcomes now request a model response at the existing safe response/tool-batch boundary or from idle, regardless of the live-output notification level. Interrupted-reply, manual-compaction and loop-stop safeguards remain unchanged.
+
+### Removed
+- Remove `notify.terminal` from Monitor start/update arguments. `notify` now accepts only `output` (`turn`/`context`/`none`), which controls live events, not terminal wakeups. Migration: remove the `terminal` field from existing calls; even `terminal: "turn"` is no longer accepted.
+
 ## [0.14.4] - 2026-11-23
 
 ### Fixed

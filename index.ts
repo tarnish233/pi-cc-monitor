@@ -17,8 +17,8 @@
  *   source      { monitorId }?            events-only live output subscription
  *   watches     WatchRule[]?              source observers; [] mutes, omitted
  *                                         means all stdout
- *   notify      object?                  output turn/context/none, terminal
- *                                         turn/context (defaults turn)
+ *   notify      object?                  output turn/context/none (live events
+ *                                         only). End, failure and stop always wake.
  *   description string                   start only; shown in notifications
  *   timeout_ms  number?                  min 1000; events default 300000, max
  *                                         3600000; completion default 1800000,
@@ -531,10 +531,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	}
 
 	function parseNotify(value: Partial<NotifyPolicy> | undefined, base: Readonly<NotifyPolicy> = DEFAULT_NOTIFY): NotifyPolicy {
-		if (value !== undefined && (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some((key) => key !== "output" && key !== "terminal"))) throw new Error("notify accepts only output and terminal");
-		const policy = { ...base, ...value };
+		if (value !== undefined && (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some((key) => key !== "output"))) throw new Error("notify accepts only output; end, failure and stop always wake the model");
+		const policy = { output: value?.output ?? base.output, terminal: "turn" as const };
 		if (!["turn", "context", "none"].includes(policy.output)) throw new Error("notify.output must be turn, context or none");
-		if (!["turn", "context"].includes(policy.terminal)) throw new Error("notify.terminal must be turn or context; failures cannot be hidden");
 		return policy;
 	}
 
@@ -589,8 +588,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			},
 		};
 		if (cause !== "output") {
-			// Keep critical outcomes outside Esc-clearable queues, in both modes.
-			const terminal = cause === "stopped" || cause === "stop_timeout" ? "context" : level === "turn" ? "turn" : "context";
+			// End, failure and stop always wake. The launch parameters cannot opt out.
+			const terminal = "turn" as const;
 			message.details.notifyLevel = terminal;
 			pendingCompletions.set(record.id, { message, terminal });
 			if (lastCtx?.isIdle()) flushCompletions(true);
@@ -1281,8 +1280,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			),
 			notify: Type.Optional(Type.Object({
 				output: Type.Optional(Type.Union([Type.Literal("turn"), Type.Literal("context"), Type.Literal("none")])),
-				terminal: Type.Optional(Type.Union([Type.Literal("turn"), Type.Literal("context")])),
-			}, { additionalProperties: false, description: "Output level (turn/context/none) and terminal level (turn/context). Defaults turn. User stops never start a turn." })),
+			}, { additionalProperties: false, description: "Live event level only (turn/context/none). Defaults turn. End, failure and stop always wake the model; that cannot be configured." })),
 			loopPrompt: Type.Optional(
 				Type.String({
 					description:

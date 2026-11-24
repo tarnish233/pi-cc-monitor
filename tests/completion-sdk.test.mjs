@@ -27,8 +27,6 @@ const hasCompletion = messages => messages.some(message =>
 const cases = [
 	{ boundary: "tool batch", terminal: "turn" },
 	{ boundary: "streamed text", terminal: "turn" },
-	{ boundary: "tool batch", terminal: "context" },
-	{ boundary: "streamed text", terminal: "context" },
 	{ boundary: "tool batch", terminal: "turn", jobs: 2 },
 	{ boundary: "streamed text", terminal: "turn", queued: true },
 	{ boundary: "streamed text", terminal: "turn", aborted: true },
@@ -112,7 +110,6 @@ for (const { boundary, terminal, jobs = 1, queued = false, aborted = false } of 
 				content = Array.from({ length: jobs }, (_, job) => ({
 					type: "toolCall", id: `launch-${job}`, name: "Monitor", arguments: {
 						command, mode: "completion", description: `SDK completion ${job}`, timeout_ms: 10000,
-						notify: { terminal },
 					},
 				}));
 			} else if (index === 1) {

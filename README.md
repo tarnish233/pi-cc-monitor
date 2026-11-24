@@ -23,7 +23,7 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 | WebSocket | `events`：每个 text frame = 一个事件，binary 记为占位行 | `Monitor` |
 | 输出订阅 | `events` + `source.monitorId`：订阅本会话中运行中的 command Monitor；观察不拥有进程，停止/超时/flood 不影响工作 | `Monitor` |
 | 动态 watches | literal、stdout/stderr/both、once/repeat、独立通知等级；`action=update` 原地更新，未变规则保留触发状态 | `Monitor` |
-| 通知策略 | `notify.output=turn/context/none`、`notify.terminal=turn/context`；用户停止只记 context 不重启回合 | `Monitor` |
+| 通知策略 | `notify.output=turn/context/none` 只管实时事件；结束、失败、停止一定唤醒，入参不能关掉 | `Monitor` |
 | 通知节奏 | completion 与 events 终态在当前响应／工具批次结束后交付，不中断执行，也不等整个 Agent settled；context 不请求续接，中止与空闲恢复仍有保守兜底；events 普通输出仍为 steer | 自动 |
 | 超时/常驻 | `timeout_ms`：completion 默认 30 分钟（上限 2 小时）；events 默认 5 分钟（上限 1 小时）；`persistent` 到会话结束 | `Monitor` |
 | 批量 | events 模式：200ms 内的事件合并成一条通知 | 自动 |
@@ -58,7 +58,7 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-cc-monitor
 | `id` | string? | 仅 `action=update` 的目标 Monitor id |
 | `source` | `{ monitorId }`? | events 专用：订阅本会话运行中的 command Monitor，不另起进程 |
 | `watches` | WatchRule[]? | 仅 source observer：`{id,text,stream?,once?,notify?}`；literal 匹配，最多 20 条，`[]` 静音 |
-| `notify` | object? | `output`：turn/context/none；`terminal`：turn/context。监听自身等级不能超过 Monitor 上限 |
+| `notify` | object? | 仅接受 `output`：turn/context/none，只控制实时事件。结束、失败、停止一定唤醒，不接受 `terminal`；单条 watch 不能提高实时输出等级 |
 | `mode` | `"completion" \| "events"`? | 通知模式；缺省为 `events` 保持旧调用兼容。completion 只支持 `command` |
 | `command` | string? | 脚本；completion 记录日志并报告一次终态，events 每行 stdout 一个事件 |
 | `ws` | object? | `{ url, protocols? }`；events 模式下 text frame 一个事件 |
@@ -105,7 +105,7 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 
 工具立即返回任务 ID 和日志路径。测试产生的 stdout/stderr 只写文件，不逐行进入对话；结束后模型收到一次退出码和日志路径。正在生成响应或执行工具时，终态先保存在保护队列，不打断当前工作；在下一个正常 `turn_end`（响应及整个工具批次结束）用 `triggerTurn: false` 交给 Pi 的只追加上下文通道，下一次模型请求即可读取。不使用 Esc 可清除的 steering/follow-up 队列，也不需要等待整个 Agent settled。
 
-`notify.terminal=turn` 在该边界最多请求一次续接，已有工具或排队输入自然满足这次续接，不额外开一个运行；`context` 和用户停止只追加结果，不请求续接。结果到达边界之后或 Agent 已空闲时仍走原有空闲／settled 交付。若当前回复被中断，边界不强制续接，已有完成结果会留在会话中，但不会重启该回复；中断之后才完成的新任务仍按正常的空闲通知规则处理。
+结束、失败和停止在该边界最多请求一次续接，已有工具或排队输入自然满足这次续接，不额外开一个运行。入参不能把终态降成 context。结果到达边界之后或 Agent 已空闲时仍走原有空闲／settled 交付。若当前回复被中断，边界不强制续接，已有完成结果会留在会话中，但不会重启该回复；中断之后才完成的新任务仍按正常的空闲通知规则处理。
 
 启动后继续必要的独立工作；只剩等待就交接。通知到达后先读取并验证所需输出，再根据当前工作进度继续分析或汇报；一项后台任务完成不等于整体报告完成。
 
@@ -300,7 +300,7 @@ npm run typecheck
 行为选择规则对齐 Claude Code 2.1.318：一次完成用后台命令，多次发生用 Monitor 事件流。用 Pi 扩展 API 实现。有意不同的地方：
 
 - CC 分别使用 Bash 的 `run_in_background` 和独立 Monitor；本扩展把它们合并成 `Monitor.mode`，避免长命令先阻塞前台 Bash。缺省仍是 `events`，已有调用不变。
-- completion 与 events 终态在活动响应／工具批次结束的 `turn_end` 边界交付，不中断当前工作，也不等整个 `agent_settled`。使用 Pi 的只追加上下文通道保护结果不被 Esc 清队列丢弃，按 terminal 策略最多请求一次续接；中断、手动 compaction 与缺失结束事件的空闲恢复只保存结果，不重新启动模型。events 普通输出仍保持 steer。
+- completion 与 events 终态在活动响应／工具批次结束的 `turn_end` 边界交付，不中断当前工作，也不等整个 `agent_settled`。使用 Pi 的只追加上下文通道保护结果不被 Esc 清队列丢弃，结束、失败和停止最多请求一次续接；中断、手动 compaction 与缺失结束事件的空闲恢复只保存结果，不重新启动模型。events 普通输出仍保持 steer。
 - 事件批处理内存只保留有界前缀，不影响完整事件计数；WS 日志积压超限会停止日志并告警，socket 继续。普通输出限流与日志写故障是两种独立机制。
 - `monitor_stop` / `monitor_list` 对应 CC 的 `TaskStop` / `TaskList`。
 - 底部显示 `2 monitors`（和 pi-cc-loop 的芯片同一格式）；CC 底部的任务 pill 也写作 `2 monitors`，还能选中后打开任务列表。

@@ -31,25 +31,25 @@ test('global fixed window admits 20 output messages, including at refill boundar
 test('context output and terminal messages never request a model turn', async (t) => {
   const h = createHarness(); t.after(() => h.close());
   const fixture = heldCommand(h, 'CONTEXT');
-  await h.call('Monitor', { command: fixture.command, description: 'context', notify: { output: 'context', terminal: 'context' } });
+  await h.call('Monitor', { command: fixture.command, description: 'context', notify: { output: 'context' } });
   assert.ok(await until(() => h.sent.some((m) => m.message.details.cause === 'output')));
   assert.equal(h.sent[0].options.triggerTurn, false);
   fs.writeFileSync(fixture.release, 'go');
   assert.ok(await until(() => h.sent.some((m) => m.message.details.cause === 'exit')));
-  assert.ok(h.sent.every((m) => m.options.triggerTurn === false));
+  assert.equal(h.sent.find((m) => m.message.details.cause === 'exit').options.triggerTurn, true);
   assert.ok(h.sent.every((m) => m.message.content.length <= 3000));
 });
 
 test('output none leaves full raw stdout/stderr and a visible failure outcome', async (t) => {
   const h = createHarness(); t.after(() => h.close());
-  const receipt = await h.call('Monitor', { command: "printf 'QUIET\\n'; printf 'problem\\n' >&2; exit 7", description: 'muted failure', mode: 'completion', notify: { output: 'none', terminal: 'context' } });
+  const receipt = await h.call('Monitor', { command: "printf 'QUIET\\n'; printf 'problem\\n' >&2; exit 7", description: 'muted failure', mode: 'completion', notify: { output: 'none' } });
   assert.ok(await until(() => h.sent.length));
   assert.equal(h.sent.length, 1);
   assert.equal(h.sent[0].message.details.status, 'failed');
-  assert.equal(h.sent[0].options.triggerTurn, false);
+  assert.equal(h.sent[0].options.triggerTurn, true);
   assert.equal(fs.readFileSync(receipt.details.outputPath, 'utf8'), 'QUIET\n');
   assert.equal(fs.readFileSync(receipt.details.stderrPath, 'utf8'), 'problem\n');
-  await assert.rejects(h.call('Monitor', { command: 'echo forbidden', description: 'bad policy', notify: { terminal: 'none' } }), /failures cannot be hidden/);
+  await assert.rejects(h.call('Monitor', { command: 'echo forbidden', description: 'bad policy', notify: { terminal: 'none' } }), /end, failure and stop always wake/);
 });
 
 test('critical events-mode terminal result survives busy Esc settlement without restarting', async (t) => {
@@ -76,22 +76,22 @@ test('stop preserves pre-stop buffered output in one context-only outcome', asyn
   const message = h.sent[0];
   assert.equal(message.message.details.cause, 'stopped');
   assert.ok(message.message.details.finalLines.includes('READY'));
-  assert.equal(message.options.triggerTurn, false);
+  assert.equal(message.options.triggerTurn, true, 'a stop wakes the model');
   assert.equal(groupAlive(job.pid), false);
 });
 
 test('a context terminal ceiling is not raised by merged turn-level output', async (t) => {
   const h = createHarness(); t.after(() => h.close());
   const fixture = heldCommand(h, 'CEILING');
-  const source = (await h.call('Monitor', { command: fixture.command, description: 'ceiling work', mode: 'completion', notify: { terminal: 'context' } })).details;
-  await h.call('Monitor', { source: { monitorId: source.taskId }, description: 'loud watch', watches: [{ id: 'line', text: 'CEILING', notify: 'turn' }], notify: { terminal: 'context' } });
+  const source = (await h.call('Monitor', { command: fixture.command, description: 'ceiling work', mode: 'completion' })).details;
+  await h.call('Monitor', { source: { monitorId: source.taskId }, description: 'loud watch', watches: [{ id: 'line', text: 'CEILING', notify: 'turn' }], notify: { output: 'context' } });
   assert.ok(await until(() => h.sent.some((m) => m.message.details.cause === 'output')));
   fs.writeFileSync(fixture.release, 'go');
   assert.ok(await until(() => h.sent.some((m) => m.message.details.cause === 'exit' && m.message.details.status === 'completed')));
   assert.equal((await h.snapshots()).find((r) => r.id === source.taskId)?.status, 'completed');
   const terminal = h.sent.filter((m) => m.message.details.cause === 'exit');
   assert.ok(terminal.length > 0);
-  assert.ok(terminal.every((m) => m.options.triggerTurn === false), 'terminal=context remains a hard no-turn ceiling');
+  assert.ok(terminal.every((m) => m.options.triggerTurn === true), 'end, failure and stop always wake');
   assert.equal(terminal.filter((m) => m.message.details.status === 'exited').length, 0, 'observer does not add its own terminal outcome');
 });
 

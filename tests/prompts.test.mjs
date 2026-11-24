@@ -20,7 +20,8 @@ test("completion contract keeps strong waiting and verification rules without un
 test("notification timing and no-turn policy match the boundary runtime", () => {
 	assert.ok(MONITOR_DESCRIPTION.includes("next response/tool-batch boundary"));
 	assert.match(MONITOR_DESCRIPTION, /does not interrupt the current response or tool batch/);
-	assert.match(MONITOR_DESCRIPTION, /context-only terminal never requests a continuation/);
+	assert.match(MONITOR_DESCRIPTION, /end, failure and stop always wake the model/);
+	assert.match(MONITOR_DESCRIPTION, /cannot be chosen at start/);
 	assert.match(MONITOR_DESCRIPTION, /stored without restarting/);
 	assert.doesNotMatch(MONITOR_DESCRIPTION, /protected settled delivery|result arrives after the active turn/);
 	assert.match(MONITOR_PROMPT_GUIDELINES[2], /does not require immediately finishing the overall report/);

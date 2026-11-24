@@ -163,15 +163,9 @@ test("events terminal outbox survives real Pi clearQueue and aborted settlement"
 	assert.equal(h.sent.length, 1);
 });
 
-test("context terminal policy stores in the real session without starting a turn", async t => {
+test("a launch cannot silence the terminal wakeup", async t => {
 	const h = harness(t);
-	await finished(h, { notify: { terminal: "context" } });
-	h.session._isAgentRunActive = false;
-	await h.emit("agent_settled", { aborted: false });
-	assert.equal(h.sent.length, 1);
-	assert.equal(h.starts.length, 0);
-	assert.equal(h.entries().length, 1);
-	assert.equal(h.sent[0].options.triggerTurn, false);
+	await assert.rejects(() => finished(h, { notify: { terminal: "context" } }), /end, failure and stop always wake/);
 });
 
 test("completion stays outside Pi's clearable queues while the agent is busy", async t => {
@@ -257,26 +251,13 @@ test("a completion after a text-only response requests one next response, not an
 	assert.equal(h.errors.length, 0);
 });
 
-test("context-only terminal at a boundary is visible but never requests continuation", async t => {
-	const h = harness(t);
-	await finished(h, { notify: { terminal: "context" } });
-	assert.equal(await h.finishTurn({ tools: false }), false);
-	assert.equal(h.entries().length, 1);
-	assert.equal(h.sent[0].options.triggerTurn, false);
-	assert.equal(h.starts.length, 0);
-	h.session._isAgentRunActive = false;
-	await h.emit("agent_settled", { aborted: false });
-	assert.equal(h.starts.length, 0);
-	assert.equal(h.sent.length, 1);
-});
-
-test("multiple outcomes at one boundary coalesce continuation and retain each policy", async t => {
+test("multiple terminal outcomes at one boundary coalesce into one continuation", async t => {
 	const h = harness(t);
 	await finished(h);
-	await finished(h, { notify: { terminal: "context" } });
+	await finished(h);
 	assert.equal(await h.finishTurn(), true);
 	assert.equal(h.entries().length, 2);
-	assert.deepEqual(h.entries().map(entry => entry.details.notifyLevel), ["turn", "context"]);
+	assert.deepEqual(h.entries().map(entry => entry.details.notifyLevel), ["turn", "turn"]);
 	assert.equal(h.starts.length, 0);
 	assert.equal(await h.finishTurn(), false);
 	assert.equal(h.sent.length, 2);
