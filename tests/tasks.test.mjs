@@ -265,7 +265,7 @@ test("standalone monitor: one native /cc-tasks, opened while busy, stops via end
 	runtime.load();
 	await runtime.start();
 	assert.deepEqual([...runtime.commands.keys()].filter((name) => name.startsWith("cc-tasks")), ["cc-tasks"]);
-	assert.ok(runtime.commands.get("pi_cc"), "/pi_cc is unchanged");
+	assert.ok(runtime.commands.get("monitor_settings"), "/monitor_settings stays available");
 
 	const armed = await arm(runtime, { command: "sleep 30", description: "standalone monitor", persistent: true });
 	runtime.state.idle = false;

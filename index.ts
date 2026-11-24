@@ -49,7 +49,7 @@ import type { ChildProcess } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { invalidateConfig, loadConfig } from "./config.ts";
-import { CONFIG_CHANNEL, registerPiCcCommand } from "./settings.ts";
+import { CONFIG_CHANNEL, registerSettingsCommand } from "./settings.ts";
 import { killTree, processGroupAlive, spawnMonitor, stopProcessGroup, KILL_CONFIRMATION_MS } from "./process.ts";
 import { MONITOR_DESCRIPTION, MONITOR_LIST_SNIPPET, MONITOR_PROMPT_GUIDELINES, MONITOR_SNIPPET, MONITOR_STOP_SNIPPET, MONITOR_TIMEOUTS } from "./prompts.ts";
 import { monitorEnv, monitorShell, prefixedCommand, type MonitorShell, type ShellSettings } from "./shell.ts";
@@ -1631,12 +1631,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// The shared pi-cc settings and their /pi_cc command. The first pi-cc
-	// package to load registers it; this one re-claims its own claim on /reload.
-	registerPiCcCommand(pi, "pi-cc-monitor");
+	registerSettingsCommand(pi);
 
-	// A pi-cc package changed the shared settings (loop, monitor or plugins
-	// all carry the command): the footer follows.
+	// A Monitor setting changed: the footer follows.
 	pi.events.on(CONFIG_CHANNEL, () => {
 		invalidateConfig();
 		// The footer may have been switched on or off.
@@ -1653,7 +1650,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				return { render: () => [], invalidate() {} };
 			});
 		}
-		// Another process may have edited the shared settings file.
+		// Another process may have edited the Monitor settings file.
 		invalidateConfig();
 		cleanOldLogDirectories();
 	});

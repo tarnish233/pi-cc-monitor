@@ -20,11 +20,12 @@ const mod = await loadModule("index.ts");
 function makeHarness() {
 	const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cc-monitor-footer-"));
 	const tools = new Map();
+	const commands = new Map();
 	const handlers = new Map();
 	const bus = new Map();
 	const statusCalls = [];
 	const pi = {
-		registerCommand() {},
+		registerCommand(name, command) { commands.set(name, command); },
 		registerTool(tool) {
 			tools.set(tool.name, tool);
 		},
@@ -38,7 +39,7 @@ function makeHarness() {
 		sendUserMessage() {},
 		sendMessage() {},
 		events: {
-			emit() {},
+			emit(channel, data) { bus.get(channel)?.(data); },
 			on(channel, handler) {
 				bus.set(channel, handler);
 				return () => bus.delete(channel);
@@ -69,6 +70,7 @@ function makeHarness() {
 		exec: (name, params) => tools.get(name).execute("c", params, undefined, undefined, ctx),
 		/** What the footer shows for this extension right now. */
 		status: () => monitorCalls().at(-1)?.[1],
+		command: (args) => commands.get("monitor_settings").handler(args, ctx),
 		start: () => handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx),
 		shutdown: () => handlers.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, ctx),
 	};
@@ -125,23 +127,22 @@ test("the chip repaints only when the count changes", async () => {
 	}
 });
 
-test("the chip follows the shared footer setting", async () => {
+test("/monitor_settings footer changes the live chip immediately", async () => {
+	const file = process.env.PI_CC_CONFIG_FILE;
+	const before = fs.readFileSync(file, "utf8");
 	const h = makeHarness();
 	await h.start();
 	try {
 		await h.exec("Monitor", forever("first"));
 		assert.equal(h.status(), "1 monitor");
-		// /loop settings footer off writes the shared file and announces it.
-		process.env.PI_CC_FOOTER = "0";
-		h.bus.get("pi-cc:config")();
+		await h.command("footer off");
 		assert.equal(h.status(), undefined, "footer off hides it");
 		await h.exec("Monitor", forever("second"));
 		assert.equal(h.status(), undefined, "and keeps it hidden");
-		process.env.PI_CC_FOOTER = "1";
-		h.bus.get("pi-cc:config")();
+		await h.command("footer on");
 		assert.equal(h.status(), "2 monitors", "back on, with the current count");
 	} finally {
-		delete process.env.PI_CC_FOOTER;
+		fs.writeFileSync(file, before);
 		await h.shutdown();
 	}
 });

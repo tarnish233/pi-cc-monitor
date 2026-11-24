@@ -170,7 +170,7 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 - **停止的是计划，不是主 agent**：不会 abort 当前回复，也不会结束正在运行的 turn；要中断模型请照常按 Esc 或用 Pi 的 abort。
 - 已结束的 Monitor 记录在终态通知投递且资源释放后保留最近 50 条，停止动作禁用；活跃、待通知、清理中或仍被订阅引用的记录不会因数量上限被淘汰。v1 不做暂停/恢复、不改 cron、不做每个 loop 的独立 transcript，也不保留已结束 loop 的历史。
 
-两个包共用一套命令注册：只装 pi-cc-monitor 或只装 pi-cc-loop 都能使用；两个都装时也只注册一个面板入口。所有 `session_start` 处理完成、构建补全列表之前，会检查当时已加载的扩展命令和 prompt 模板（包括已重名的 `/tasks:1` 等入口）：名称空闲时只注册 `/tasks`；已占用时不抢占、不新增 `/tasks:1`，只注册 `/cc-tasks`。无法安全查询命令列表的旧版宿主也只提供 `/cc-tasks`。同一运行时不因再次资源发现而切换或补注册别名；`/reload` 会为新的扩展实例重新检查。检查不覆盖其他插件之后动态新增的命令。任务面板入口不是 `/pi_cc`（pi-cc 设置面板），也不改变 `Monitor` 工具或 `/loop` 的语义。
+两个包共用一套命令注册：只装 pi-cc-monitor 或只装 pi-cc-loop 都能使用；两个都装时也只注册一个面板入口。所有 `session_start` 处理完成、构建补全列表之前，会检查当时已加载的扩展命令和 prompt 模板（包括已重名的 `/tasks:1` 等入口）：名称空闲时只注册 `/tasks`；已占用时不抢占、不新增 `/tasks:1`，只注册 `/cc-tasks`。无法安全查询命令列表的旧版宿主也只提供 `/cc-tasks`。同一运行时不因再次资源发现而切换或补注册别名；`/reload` 会为新的扩展实例重新检查。检查不覆盖其他插件之后动态新增的命令。任务面板入口不是 `/monitor_settings`（Monitor 设置面板），也不改变 `Monitor` 工具或 `/loop` 的语义。
 
 ## 规则
 
@@ -258,8 +258,7 @@ fullscreen 的 viewport 输入（`tui.handleViewportInput`），在一个只含�
 
 `Monitor`、`monitor_stop`、`monitor_list` 的工具调用行和结果行走 Pi 原生或 `pi-cc-extensions` 的渲染，不走这里的自定义 renderer；只有异步事件卡片使用上面的样式。
 
-样式开关是 `~/.pi/agent/pi-cc.json` 里的 `compactMessages`（和 pi-cc-loop 共用，用 `/pi_cc` 面板或 `/pi_cc messages on|off` 切换，
-或用环境变量 `PI_CC_COMPACT_MESSAGES=0|1` 覆盖）；关闭时回到旧的带底色卡片。
+样式开关是 `~/.pi/agent/pi-cc-monitor.json` 里的 `compactMessages`，用 `/monitor_settings` 面板或 `/monitor_settings messages on|off` 切换，也可用 `PI_CC_COMPACT_MESSAGES=0|1` 覆盖。关闭时回到旧卡片；文件中的选择不影响 Loop。
 
 ## 底部状态
 
@@ -268,10 +267,17 @@ fullscreen 的 viewport 输入（`tui.handleViewportInput`），在一个只含�
 - 装了 `pi-cc-extensions`：作为一个芯片出现在第 2 行，可在它的配置面板里移动或隐藏
 - 没装：Pi 内置 footer 把它和其他扩展的状态按 key 排序、拼成一行，比如 `1 loop · next 3m 1 monitor`
 
-开关是 pi-cc 扩展共用的 `footer`（`~/.pi/agent/pi-cc.json`，用 `/pi_cc` 面板或 `/pi_cc footer on|off` 切换，或用环境变量 `PI_CC_FOOTER=0|1` 覆盖）。
+开关是本包配置里的 `footer`（`~/.pi/agent/pi-cc-monitor.json`），用 `/monitor_settings footer on|off` 切换，不影响 Loop；`PI_CC_FOOTER=0|1` 可临时覆盖。
 
-`/pi_cc` 由四个 pi-cc 包（loop、monitor、plugins、compaction）共同提供：装了其中任意一个，命令就在；装了多个，也只有一个 `/pi_cc`
-（同名命令会被 Pi 改名成 `/pi_cc:1`、`/pi_cc:2`，所以由最先加载的包认领注册）。面板和非 TUI 摘要只显示已加载包的页面：本包的两项和 pi-cc-loop 共用在 Loop & Monitor 页，Plugins 页属于 pi-cc-plugins，Compact 页属于 pi-cc-compaction；多个页面时用 Tab / Shift+Tab 切换。未安装包的配置值仍保留，可用文字命令预配置。
+## /monitor_settings
+
+本包独立提供 `/monitor_settings`，只显示 **Message style** 和 **Footer summary**。TUI 中上下键选择、Enter/空格切换、Esc 关闭，改动立即生效；RPC 中不带参数输出摘要，也可用上述文字命令，不打开终端组件。
+
+配置路径跟随 `PI_CODING_AGENT_DIR`。新文件缺失时继承旧 `pi-cc.json` 中本包的有效字段，首次保存把这些选择带入新文件；已有新文件不会被旧值覆盖，旧文件不修改、不删除。`PI_CC_CONFIG_FILE` 显式指定路径时不回读旧文件。
+
+环境覆盖不写入文件，相应面板选项锁定。旧的 `PI_CC_FOOTER`、`PI_CC_COMPACT_MESSAGES` 变量名保留，全局设置仍同时覆盖 Loop 和 Monitor；默认配置文件和命令则完全独立。
+
+本包不再注册共享的 `/pi_cc`，旧脚本请改用 `/monitor_settings`。设置定义只在本仓库维护，不再跟随其他包同步。
 
 ## 兼容性
 

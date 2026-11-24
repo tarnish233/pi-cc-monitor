@@ -183,7 +183,7 @@ test("protocol notices are Status, not Output", () => {
 test("the legacy padded card lists the identity once", () => {
 	const { renderers, busHandlers } = makeHarness();
 	fs.writeFileSync(process.env.PI_CC_CONFIG_FILE, JSON.stringify({ compactMessages: false }), "utf8");
-	busHandlers.get("pi-cc:config")?.({}, {});
+	busHandlers.get("pi-cc-monitor:config")?.({}, {});
 	try {
 		const { theme } = makeTheme();
 		const message = eventMessage("monitor mon1 \u00b7 build\nstdout tail:\nok", {
@@ -193,7 +193,7 @@ test("the legacy padded card lists the identity once", () => {
 		assert.equal(body.split("task #mon1").length - 1, 1, body);
 	} finally {
 		fs.writeFileSync(process.env.PI_CC_CONFIG_FILE, JSON.stringify({ compactMessages: true }), "utf8");
-		busHandlers.get("pi-cc:config")?.({}, {});
+		busHandlers.get("pi-cc-monitor:config")?.({}, {});
 	}
 });
 
@@ -233,7 +233,7 @@ test("completion paths are detail-view data, not collapsed noise", () => {
 test("compactMessages off draws the padded card instead", () => {
 	const { renderers, busHandlers } = makeHarness();
 	fs.writeFileSync(process.env.PI_CC_CONFIG_FILE, JSON.stringify({ compactMessages: false }), "utf8");
-	busHandlers.get("pi-cc:config")?.({}, {});
+	busHandlers.get("pi-cc-monitor:config")?.({}, {});
 	const { theme, bgCalls } = makeTheme();
 	const message = eventMessage("monitor mon1 \u00b7 errors in deploy.log\nERROR: boom");
 	const text = renderers
@@ -244,7 +244,7 @@ test("compactMessages off draws the padded card instead", () => {
 	assert.match(text, /errors in deploy\.log/);
 	assert.match(text, /Ctrl\+O/, "the expand hint");
 	fs.writeFileSync(process.env.PI_CC_CONFIG_FILE, JSON.stringify({ compactMessages: true }), "utf8");
-	busHandlers.get("pi-cc:config")?.({}, {});
+	busHandlers.get("pi-cc-monitor:config")?.({}, {});
 });
 
 test("all four roles name what was watched, in the expanded Status section", () => {

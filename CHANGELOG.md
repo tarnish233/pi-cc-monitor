@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-24
+
+### Changed
+- Replace the shared /pi_cc command with /monitor_settings, showing only Monitor's message style and footer controls.
+- Save preferences in pi-cc-monitor.json independently of Loop. When absent, inherit valid Monitor keys from pi-cc.json and copy them on the first save without changing the legacy file; retain existing environment overrides.
+- Keep Monitor's settings definitions and change notifications local to this package instead of copying the other plugins' options.
+
+### Fixed
+- Fit every settings-panel row to narrow terminal widths while preserving cached render arrays and save-failure rollback.
+
 ## [0.15.0] - 2026-11-24
 
 ### Changed
