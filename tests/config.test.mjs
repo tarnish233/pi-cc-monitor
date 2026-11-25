@@ -11,12 +11,13 @@ import { loadModule } from "./helpers.mjs";
 
 const config = await loadModule("config.ts");
 const ownValues = (value) => Object.fromEntries(FIELDS.map((field) => [field, value]));
+const effective = (value) => ({ logRetentionDays: 3, logMaxMiB: 20, logBudgetMiB: 200, ...ownValues(value) });
 const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 
 async function isolated(body, explicit = false) {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "independent-settings-"));
 	const file = path.join(dir, explicit ? "explicit.json" : FILE_NAME);
-	const env = { PI_CODING_AGENT_DIR: dir, PI_CC_CONFIG_FILE: explicit ? file : undefined, [OVERRIDE]: undefined };
+	const env = { PI_CODING_AGENT_DIR: dir, PI_CC_CONFIG_FILE: explicit ? file : undefined, [OVERRIDE]: undefined, PI_MONITOR_LOG_RETENTION_DAYS: undefined, PI_MONITOR_LOG_MAX_MIB: undefined, PI_MONITOR_LOG_BUDGET_MIB: undefined };
 	const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
 	try {
 		for (const [key, value] of Object.entries(env)) {
@@ -38,8 +39,8 @@ async function isolated(body, explicit = false) {
 test("the default file and schema belong only to this extension", async () => {
 	await isolated(({ file }) => {
 		assert.equal(config.configPath(), file);
-		assert.deepEqual(config.DEFAULT_CONFIG, ownValues(true));
-		assert.deepEqual(config.loadConfig(), ownValues(true));
+		assert.deepEqual(config.DEFAULT_CONFIG, effective(true));
+		assert.deepEqual(config.loadConfig(), effective(true));
 		assert.equal(fs.existsSync(file), false, "loading settings does not write a file");
 	});
 });
@@ -48,7 +49,7 @@ test("legacy choices are inherited and copied only for this extension on its fir
 	await isolated(({ file, legacy }) => {
 		const old = JSON.stringify({ ...ownValues(false), foreignFlag: true, futureSetting: "kept" }, null, 2);
 		fs.writeFileSync(legacy, old);
-		assert.deepEqual(config.loadConfig(), ownValues(false));
+		assert.deepEqual(config.loadConfig(), effective(false));
 		assert.equal(fs.existsSync(file), false, "migration waits for an explicit save");
 		process.env[OVERRIDE] = "1";
 		config.invalidateConfig();
@@ -63,7 +64,7 @@ test("an existing independent file wins and a save preserves its unknown keys", 
 		fs.writeFileSync(legacy, JSON.stringify(ownValues(false)));
 		const current = { [FIELDS[0]]: true, mine: "keep me" };
 		fs.writeFileSync(file, JSON.stringify(current));
-		assert.deepEqual(config.loadConfig(), ownValues(true), "missing fields in the new file use defaults, not the old file");
+		assert.deepEqual(config.loadConfig(), effective(true), "missing fields in the new file use defaults, not the old file");
 		config.saveConfig({ [FIELDS[1]]: false });
 		assert.deepEqual(readJson(file), { ...current, [FIELDS[1]]: false });
 		assert.deepEqual(readJson(legacy), ownValues(false));
@@ -74,7 +75,7 @@ test("an explicit config path is isolated from both default files and legacy set
 	await isolated(({ dir, file, legacy }) => {
 		fs.writeFileSync(legacy, JSON.stringify(ownValues(false)));
 		assert.equal(config.configPath(), file);
-		assert.deepEqual(config.loadConfig(), ownValues(true));
+		assert.deepEqual(config.loadConfig(), effective(true));
 		config.saveConfig({ [FIELDS[0]]: false });
 		assert.deepEqual(readJson(file), { [FIELDS[0]]: false });
 		assert.equal(fs.existsSync(path.join(dir, FILE_NAME)), false);

@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { Writable } from 'node:stream';
+import { loadModule } from './helpers.mjs';
 import test from 'node:test';
 import { createHarness, until, sleep } from './runtime-harness.mjs';
 
 const CAP = 4 * 1024 * 1024;
+const { BoundedLog } = await loadModule('bounded-log.ts');
 
 /** A stand-in for WebSocket: records instances and delivers frames synchronously. */
 function fakeWebSocket() {
@@ -25,34 +26,26 @@ function fakeWebSocket() {
 
 /** Replace the log stream with a Writable whose writes never complete (a blocked disk). */
 function blockedLogs({ highWaterMark = 16384, error } = {}) {
-	const saved = fs.createWriteStream;
+	const construct = BoundedLog.prototype._construct, write = BoundedLog.prototype._write;
 	const logs = [];
-	fs.createWriteStream = (_file, options) => {
-		const entry = { fd: options.fd, pending: undefined };
-		const stream = new Writable({
-			highWaterMark,
-			write(_chunk, _encoding, callback) {
-				if (error) setTimeout(() => callback(error), 0);
-				else entry.pending = callback; // the disk holds the callback until the test fails it
-			},
-		});
-		entry.stream = stream;
-		logs.push(entry);
-		return stream;
+	BoundedLog.prototype._construct = function (callback) {
+		this._writableState.highWaterMark = highWaterMark;
+		logs.push({ stream: this, pending: undefined });
+		construct.call(this, callback);
 	};
-	return {
-		logs,
-		restore() {
-			fs.createWriteStream = saved;
-			for (const { stream, fd } of logs) {
-				stream.destroy();
-				try { fs.closeSync(fd); } catch { /* already closed */ }
-			}
-		},
+	BoundedLog.prototype._write = function (_chunk, _encoding, callback) {
+		const entry = logs.find((log) => log.stream === this);
+		if (error) setTimeout(() => callback(error), 0);
+		else entry.pending = callback; // the disk holds the callback until the test fails it
 	};
+	return { logs, restore() {
+		BoundedLog.prototype._construct = construct;
+		BoundedLog.prototype._write = write;
+		for (const { stream } of logs) stream.destroy();
+	} };
 }
 
-const warnings = (h) => h.sent.filter((m) => /Log incomplete/.test(m.message.content));
+const warnings = (h) => h.sent.filter((m) => m.message.details.cause === 'output' && /Log incomplete/.test(m.message.content));
 
 test('a blocked log caps its backlog at 4 MiB, warns once context-only, and the socket keeps observing frames', async (t) => {
 	const saved = globalThis.WebSocket;
@@ -62,6 +55,7 @@ test('a blocked log caps its backlog at 4 MiB, warns once context-only, and the 
 	const h = createHarness();
 	t.after(async () => { await h.close(); logs.restore(); globalThis.WebSocket = saved; });
 	await h.call('Monitor', { ws: { url: 'ws://x.example/feed' }, description: 'slow disk', persistent: true });
+	assert.ok(await until(() => logs.logs.length === 1));
 	const socket = fake.sockets[0];
 	for (let i = 0; i < 10000; i++) socket.emit('message', { data: 'x'.repeat(500) });
 	assert.ok(logs.logs[0].stream.writableLength <= CAP, 'the write backlog is capped');
@@ -96,6 +90,7 @@ test('a single frame larger than the cap degrades the log immediately without qu
 	const h = createHarness();
 	t.after(async () => { await h.close(); logs.restore(); globalThis.WebSocket = saved; });
 	await h.call('Monitor', { ws: { url: 'ws://x.example/feed' }, description: 'giant frame', persistent: true, notify: { output: 'none' } });
+	assert.ok(await until(() => logs.logs.length === 1));
 	fake.sockets[0].emit('message', { data: 'g'.repeat(CAP + 1) });
 	assert.equal(logs.logs[0].stream.writableLength, 0, 'the giant frame is never queued');
 	assert.ok(logs.logs[0].stream.destroyed);
@@ -122,6 +117,7 @@ test('an async log write error degrades once; a later destroy error never warns 
 	const h = createHarness();
 	t.after(async () => { await h.close(); logs.restore(); globalThis.WebSocket = saved; });
 	await h.call('Monitor', { ws: { url: 'ws://x.example/feed' }, description: 'broken disk', persistent: true });
+	assert.ok(await until(() => logs.logs.length === 1));
 	const socket = fake.sockets[0];
 	socket.emit('message', { data: 'first' });
 	assert.ok(await until(() => warnings(h).length === 1));
@@ -142,6 +138,7 @@ test('write() returning false is ordinary backpressure, not degradation', async 
 	const h = createHarness();
 	t.after(async () => { await h.close(); logs.restore(); globalThis.WebSocket = saved; });
 	await h.call('Monitor', { ws: { url: 'ws://x.example/feed' }, description: 'small watermark', persistent: true, notify: { output: 'none' } });
+	assert.ok(await until(() => logs.logs.length === 1));
 	for (let i = 0; i < 10; i++) fake.sockets[0].emit('message', { data: 'x'.repeat(100) });
 	assert.equal(logs.logs[0].stream.destroyed, false, 'below the cap the log keeps writing');
 	assert.equal(logs.logs[0].stream.writableLength, 10 * 101);
@@ -153,14 +150,15 @@ test('write() returning false is ordinary backpressure, not degradation', async 
 
 test('a healthy log still writes every frame and flushes on natural close', async (t) => {
 	const saved = globalThis.WebSocket;
-	const savedCreate = fs.createWriteStream;
+	const savedConstruct = BoundedLog.prototype._construct;
 	const streams = [];
-	fs.createWriteStream = (...args) => { const stream = savedCreate.apply(fs, args); streams.push(stream); return stream; };
+	BoundedLog.prototype._construct = function (callback) { streams.push(this); savedConstruct.call(this, callback); };
 	const fake = fakeWebSocket();
 	globalThis.WebSocket = fake.WebSocket;
 	const h = createHarness();
-	t.after(async () => { await h.close(); fs.createWriteStream = savedCreate; globalThis.WebSocket = saved; });
+	t.after(async () => { await h.close(); BoundedLog.prototype._construct = savedConstruct; globalThis.WebSocket = saved; });
 	const armed = await h.call('Monitor', { ws: { url: 'ws://x.example/feed' }, description: 'healthy log', persistent: true, notify: { output: 'none' } });
+	assert.ok(await until(() => streams.length === 1));
 	fake.sockets[0].emit('message', { data: 'frame one' });
 	fake.sockets[0].emit('message', { data: '' });
 	fake.sockets[0].emit('message', { data: 'frame two' });
@@ -182,9 +180,11 @@ test('a late disk-callback failure after the watch ended reports an incomplete l
 	for (const end of ['natural-close', 'stop']) {
 		const before = warnings(h).length;
 		const armed = await h.call('Monitor', { ws: { url: 'ws://x.example/feed' }, description: end, persistent: true, notify: { output: 'none' } });
+		assert.ok(await until(() => logs.logs.length === before + 1));
 		const socket = fake.sockets.at(-1);
 		const log = logs.logs.at(-1);
 		socket.emit('message', { data: 'queued frame' });
+		assert.ok(await until(() => typeof log.pending === 'function'), 'the mocked disk actually has a pending write');
 		assert.equal(warnings(h).length, before);
 		if (end === 'natural-close') socket.close();
 		else assert.equal((await h.call('monitor_stop', { id: armed.details.taskId })).details.stopped, true);

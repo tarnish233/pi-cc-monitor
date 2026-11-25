@@ -8,6 +8,8 @@
  * Environment overrides win while set and are never written to the file:
  *   PI_CC_COMPACT_MESSAGES=0|1
  *   PI_CC_FOOTER=0|1
+ *   PI_MONITOR_LOG_RETENTION_DAYS / PI_MONITOR_LOG_MAX_MIB / PI_MONITOR_LOG_BUDGET_MIB
+ *     (validated positive integers, independent of Loop).
  */
 
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -15,22 +17,42 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { writeOwnedAtomic } from "./log-store.ts";
 
 export interface PiCcConfig {
 	/** One-line notifications with expandable details instead of the legacy padded card. */
 	compactMessages: boolean;
 	/** Show this extension's summary in Pi's footer. */
 	footer: boolean;
+	/** Retention for ended, delivered task artifacts. */
+	logRetentionDays: number;
+	/** stdout + stderr, including their rotation archives; applies to new tasks. */
+	logMaxMiB: number;
+	/** Soft budget for safely collectible artifacts across local runtimes. */
+	logBudgetMiB: number;
 }
 
 export const DEFAULT_CONFIG: PiCcConfig = {
 	compactMessages: true,
 	footer: true,
+	logRetentionDays: 3,
+	logMaxMiB: 20,
+	logBudgetMiB: 200,
 };
+
+export const NUMBER_SETTINGS = {
+	logRetentionDays: { min: 1, max: 30 },
+	logMaxMiB: { min: 1, max: 1024 },
+	logBudgetMiB: { min: 1, max: 10240 },
+} as const;
+export type NumberSetting = keyof typeof NUMBER_SETTINGS;
 
 const ENV_OVERRIDES: Record<keyof PiCcConfig, string> = {
 	compactMessages: "PI_CC_COMPACT_MESSAGES",
 	footer: "PI_CC_FOOTER",
+	logRetentionDays: "PI_MONITOR_LOG_RETENTION_DAYS",
+	logMaxMiB: "PI_MONITOR_LOG_MAX_MIB",
+	logBudgetMiB: "PI_MONITOR_LOG_BUDGET_MIB",
 };
 
 function envBool(name: string): boolean | undefined {
@@ -39,6 +61,19 @@ function envBool(name: string): boolean | undefined {
 	if (/^(0|false|off|no)$/i.test(raw)) return false;
 	if (/^(1|true|on|yes)$/i.test(raw)) return true;
 	return undefined;
+}
+
+/** Shared by file/environment validation and this package's command, not other plugins. */
+export function numberSettingValue(key: NumberSetting, value: unknown): number | undefined {
+	const { min, max } = NUMBER_SETTINGS[key];
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max ? value : undefined;
+}
+
+function envValue(key: keyof PiCcConfig): boolean | number | undefined {
+	const name = ENV_OVERRIDES[key];
+	if (key === "compactMessages" || key === "footer") return envBool(name);
+	const raw = process.env[name]?.trim();
+	return raw && /^\d+$/.test(raw) ? numberSettingValue(key, Number(raw)) : undefined;
 }
 
 export function configPath(): string {
@@ -61,7 +96,7 @@ function legacyConfig(): Partial<PiCcConfig> {
 		return {};
 	}
 	const inherited: Partial<PiCcConfig> = {};
-	for (const key of Object.keys(DEFAULT_CONFIG) as Array<keyof PiCcConfig>) {
+	for (const key of ["compactMessages", "footer"] as const) {
 		if (typeof raw[key] === "boolean") inherited[key] = raw[key] as boolean;
 	}
 	return inherited;
@@ -70,7 +105,7 @@ function legacyConfig(): Partial<PiCcConfig> {
 /** The environment variable overriding a setting right now, or undefined. */
 export function envOverride(key: keyof PiCcConfig): string | undefined {
 	const name = ENV_OVERRIDES[key];
-	return envBool(name) === undefined ? undefined : `${name}=${process.env[name]}`;
+	return envValue(key) === undefined ? undefined : `${name}=${process.env[name]}`;
 }
 
 function readConfig(): PiCcConfig {
@@ -86,7 +121,10 @@ function readConfig(): PiCcConfig {
 	}
 	const config = { ...DEFAULT_CONFIG };
 	for (const key of Object.keys(config) as Array<keyof PiCcConfig>) {
-		config[key] = envBool(ENV_OVERRIDES[key]) ?? (typeof file[key] === "boolean" ? file[key] as boolean : DEFAULT_CONFIG[key]);
+		const saved = key === "compactMessages" || key === "footer"
+			? typeof file[key] === "boolean" ? file[key] : undefined
+			: numberSettingValue(key, file[key]);
+		Object.assign(config, { [key]: envValue(key) ?? saved ?? DEFAULT_CONFIG[key] });
 	}
 	return config;
 }
@@ -189,13 +227,7 @@ export function saveConfig(patch: Partial<PiCcConfig>): PiCcConfig {
 			if (code === "ENOENT") raw = legacyConfig();
 			else if (!(error instanceof SyntaxError)) throw error;
 		}
-		const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-		try {
-			fs.writeFileSync(temp, `${JSON.stringify({ ...raw, ...patch }, null, 2)}\n`, "utf8");
-			fs.renameSync(temp, file);
-		} finally {
-			fs.rmSync(temp, { force: true });
-		}
+		writeOwnedAtomic(file, `${JSON.stringify({ ...raw, ...patch }, null, 2)}\n`);
 	});
 	cached = undefined;
 	return loadConfig();

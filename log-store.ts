@@ -1,49 +1,25 @@
-/**
- * Ownership of pi-cc-monitor's per-runtime log directory.
- *
- * Node builtins only; no Pi, TUI, timers, locks, supervisors or history
- * store. A Pi runtime allocates the directory lazily, when its first Monitor
- * starts (not at extension factory startup), and closes it when the runtime
- * shuts down. Every runtime owns one private `mkdtemp` directory
- * (0700) under `base` (default os.tmpdir()) with an `owner.json` marker
- * (0600) recording schema, version, kind, pid, hostname, createdAt and,
- * after close(), closedAt.
- *
- * Failure policy:
- * - `createLogDirectory` throws only for an unusable base directory; it
- *   never deletes anything.
- * - `close()` is idempotent and best-effort: it records `closedAt` with a
- *   safe write (temp file + rename) and never deletes data. A runtime is
- *   marked closed independently of whether its pid is still alive.
- * - `cleanOldLogDirectories` never throws and deletes a directory only when
- *   ALL of the following hold:
- *     1. its name carries our mkdtemp prefix (`pi-cc-monitor-`), so legacy
- *        flat `os.tmpdir()/pi-cc-monitor` logs are never touched;
- *     2. its `owner.json` validates as OUR schema/kind/version with a sane
- *        pid and hostname (malformed, unowned or symlinked markers are kept);
- *     3. its latest meaningful activity - createdAt, closedAt, or the mtime
- *        of the directory or any log file in it - is older than 3 days, so
- *        recent writes and recent closes always protect the logs;
- *     4. its owner is closed, or its pid is reliably not alive on this host.
- *        EPERM and unknown kill(pid, 0) results count as alive, a foreign
- *        hostname is uncertain and always skipped, and a live pid never
- *        overrides a closed record - so pid reuse errs toward retaining.
- *   Cleanup uses lstat everywhere and never follows symlinks.
+/** Private runtime/task artifacts, with ownership-checked TTL and quota GC.
+ * A runtime allocates its directory lazily. Each command/socket owns one task
+ * directory; subscriptions share it. A task becomes collectible only after
+ * resource cleanup and terminal handoff, plus a 10-minute read grace.
+ * Other live runtimes, uncertain owners, legacy unmarked paths and symlinked
+ * markers are never reclaimed. Size/TTL pressure only affects eligible data.
  */
-
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-/** mkdtemp prefix: only directories with this prefix are ever cleaned. */
 const DIR_PREFIX = "pi-cc-monitor-";
-/** The ownership marker file inside a runtime's log directory. */
 const METADATA_NAME = "owner.json";
 const OWNER_SCHEMA = "pi-cc-monitor.owner";
-const OWNER_VERSION = 1;
-const OWNER_KIND = "monitor";
-/** Directories with activity older than this are eligible for cleanup. */
+const TASK_SCHEMA = "pi-cc-monitor.task";
+const TASK_MARKER = "task.json";
+const TASK_ID = /^[a-z0-9_-]{1,64}$/;
 export const LOG_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
+export const LOG_BUDGET_BYTES = 200 * 1024 * 1024;
+export const LOG_READ_GRACE_MS = 10 * 60 * 1000;
+export const LOG_CLEANUP_INTERVAL_MS = 30 * 60 * 1000;
 
 interface OwnerMetadata {
 	schema: string;
@@ -53,186 +29,289 @@ interface OwnerMetadata {
 	hostname: string;
 	createdAt: number;
 	closedAt: number | null;
+	ownerToken?: string;
 }
-
 export interface LogDirectory {
-	/** The private directory this runtime writes monitor logs into. */
 	path: string;
-	/** Record that this runtime is done. Idempotent; never deletes data. */
+	token: string;
 	close(): void;
 }
-
+export interface TaskDirectory {
+	id: string;
+	path: string;
+	root: LogDirectory;
+	outputPath: string;
+	stderrPath: string;
+	artifactDir: string;
+}
+interface TaskMetadata {
+	schema: typeof TASK_SCHEMA;
+	version: 1;
+	kind: "task";
+	id: string;
+	ownerToken: string;
+	createdAt: number;
+	endedAt: number | null;
+	readyAt: number | null;
+	resourcePid?: number | null;
+}
+export interface LogCleanupPolicy {
+	retentionMs: number;
+	budgetBytes: number;
+}
+export interface LogCleanupOptions {
+	policy?: LogCleanupPolicy;
+	current?: LogDirectory;
+	protectedIds?: ReadonlySet<string>;
+}
+export interface LogCleanupResult {
+	removedTasks: string[];
+	removedDirectories: string[];
+}
 function chmodOrNull(target: string, mode: number): void {
+	try { fs.chmodSync(target, mode); } catch { /* best effort on Windows */ }
+}
+function writeMetadata(dir: string, name: string, metadata: unknown): void {
+	const temp = path.join(dir, `${name}.tmp-${process.pid}-${randomUUID()}`);
 	try {
-		fs.chmodSync(target, mode);
-	} catch {
-		// best effort; Windows ignores POSIX modes
+		fs.writeFileSync(temp, `${JSON.stringify(metadata, null, "\t")}\n`, { mode: 0o600 });
+		fs.renameSync(temp, path.join(dir, name));
+	} finally {
+		try { fs.rmSync(temp, { force: true }); } catch { /* a later owned-directory GC can recover it */ }
 	}
 }
-
-/** Safe write: a temp file in the same directory, then rename over. */
-function writeOwnerMetadata(dir: string, metadata: OwnerMetadata): void {
-	const temp = path.join(dir, `${METADATA_NAME}.tmp-${process.pid}`);
-	fs.writeFileSync(temp, `${JSON.stringify(metadata, null, "\t")}\n`);
-	chmodOrNull(temp, 0o600);
-	fs.renameSync(temp, path.join(dir, METADATA_NAME));
+function readMetadata(file: string): Record<string, unknown> | undefined {
+	const stat = fs.lstatSync(file);
+	if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024) return;
+	const value: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+	return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
-
-/**
- * Read and validate the ownership marker. Only a marker that is a regular
- * file (lstat, never a symlink), small, well-formed JSON, and exactly our
- * schema/kind/version with a positive integer pid and non-empty hostname
- * counts as owned; everything else returns undefined and is never deleted.
- */
 function readOwnerMetadata(dir: string): OwnerMetadata | undefined {
-	const file = path.join(dir, METADATA_NAME);
-	let stat: fs.Stats;
 	try {
-		stat = fs.lstatSync(file);
-	} catch {
-		return undefined;
-	}
-	if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024) return undefined;
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-	} catch {
-		return undefined;
-	}
-	if (typeof parsed !== "object" || parsed === null) return undefined;
-	const meta = parsed as Record<string, unknown>;
-	if (meta.schema !== OWNER_SCHEMA || meta.kind !== OWNER_KIND || meta.version !== OWNER_VERSION) return undefined;
-	const pid = meta.pid;
-	if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
-	if (typeof meta.hostname !== "string" || meta.hostname.length === 0) return undefined;
-	const closedAt = meta.closedAt ?? null;
-	if (closedAt !== null && !Number.isFinite(closedAt)) return undefined;
-	return {
-		schema: OWNER_SCHEMA,
-		version: OWNER_VERSION,
-		kind: OWNER_KIND,
-		pid,
-		hostname: meta.hostname,
-		createdAt: Number.isFinite(meta.createdAt) ? (meta.createdAt as number) : 0,
-		closedAt: closedAt as number | null,
-	};
+		const meta = readMetadata(path.join(dir, METADATA_NAME));
+		if (!meta || meta.schema !== OWNER_SCHEMA || meta.kind !== "monitor" || meta.version !== 1) return;
+		const pid = meta.pid;
+		if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return;
+		if (typeof meta.hostname !== "string" || !meta.hostname) return;
+		const closedAt = meta.closedAt ?? null;
+		if (closedAt !== null && (typeof closedAt !== "number" || !Number.isFinite(closedAt))) return;
+		if (meta.ownerToken !== undefined && (typeof meta.ownerToken !== "string" || !meta.ownerToken)) return;
+		return {
+			schema: OWNER_SCHEMA, kind: "monitor", version: 1, pid, hostname: meta.hostname,
+			createdAt: typeof meta.createdAt === "number" && Number.isFinite(meta.createdAt) ? meta.createdAt : 0,
+			closedAt, ...(typeof meta.ownerToken === "string" ? { ownerToken: meta.ownerToken } : {}),
+		};
+	} catch { return; }
 }
-
-/**
- * Create this runtime's private log directory. The directory is 0700 and the
- * ownership marker 0600 on POSIX; other users can neither read monitor logs
- * nor forge or read the marker.
- */
+function ourUid(stat: fs.Stats): boolean {
+	const uid = process.geteuid?.() ?? process.getuid?.();
+	return uid === undefined || stat.uid === uid;
+}
+function owns(root: LogDirectory): boolean {
+	try {
+		const stat = fs.lstatSync(root.path);
+		if (!stat.isDirectory() || stat.isSymbolicLink() || !ourUid(stat)) return false;
+		const metadata = readOwnerMetadata(root.path);
+		return metadata?.pid === process.pid && metadata.hostname === os.hostname() && metadata.ownerToken === root.token && metadata.closedAt === null;
+	} catch { return false; }
+}
 export function createLogDirectory(base: string = os.tmpdir()): LogDirectory {
 	const root = typeof base === "string" && base.length > 0 ? base : os.tmpdir();
 	const dir = fs.mkdtempSync(path.join(root, DIR_PREFIX));
 	chmodOrNull(dir, 0o700);
-	writeOwnerMetadata(dir, {
-		schema: OWNER_SCHEMA,
-		version: OWNER_VERSION,
-		kind: OWNER_KIND,
-		pid: process.pid,
-		hostname: os.hostname(),
-		createdAt: Date.now(),
-		closedAt: null,
-	});
+	const token = randomUUID();
+	const metadata: OwnerMetadata = { schema: OWNER_SCHEMA, version: 1, kind: "monitor", pid: process.pid, hostname: os.hostname(), createdAt: Date.now(), closedAt: null, ownerToken: token };
+	try { writeMetadata(dir, METADATA_NAME, metadata); } catch (error) {
+		// This mkdtemp result has not been handed to any caller or process.
+		try { fs.rmSync(dir, { recursive: true, force: true }); } catch {
+			try { fs.writeFileSync(path.join(dir, METADATA_NAME), JSON.stringify({ ...metadata, closedAt: Date.now() }), { mode: 0o600 }); } catch { /* keep anything whose ownership cannot be recovered */ }
+		}
+		throw error;
+	}
 	let closed = false;
-	return {
-		path: dir,
-		close() {
-			if (closed) return;
-			closed = true;
-			try {
-				// Only a marker that still validates as ours is extended, and a
-				// closed marker is never rewritten: close() is idempotent.
-				const metadata = readOwnerMetadata(dir);
-				if (!metadata || metadata.closedAt !== null) return;
-				writeOwnerMetadata(dir, { ...metadata, closedAt: Date.now() });
-			} catch {
-				// close() runs on shutdown paths and must never throw.
-			}
-		},
-	};
+	return { path: dir, token, close() {
+		if (closed) return;
+		closed = true;
+		try {
+			if (!owns({ path: dir, token, close() {} })) return;
+			const meta = readOwnerMetadata(dir);
+			if (!meta || meta.ownerToken !== token || meta.closedAt !== null) return;
+			writeMetadata(dir, METADATA_NAME, { ...meta, closedAt: Date.now() });
+		} catch { /* shutdown must never throw, and close never deletes data */ }
+	} };
+}
+/** Config writes also use marked, private staging directories, never loose *.tmp files. */
+export function writeOwnedAtomic(file: string, text: string): void {
+	const stage = createLogDirectory(path.dirname(file));
+	try {
+		const temp = path.join(stage.path, "config.tmp");
+		fs.writeFileSync(temp, text, { mode: 0o600 });
+		fs.renameSync(temp, file);
+	} finally {
+		stage.close();
+		try { fs.rmSync(stage.path, { recursive: true, force: true }); } catch { /* collectible later; never fail an already-saved setting */ }
+	}
 }
 
-/** Whether a pid is known to be running. EPERM and unknown mean alive. */
-function isPidAlive(pid: number): boolean {
+export function createTaskDirectory(root: LogDirectory, id: string, now = Date.now()): TaskDirectory {
+	if (!TASK_ID.test(id) || !owns(root)) throw new Error("invalid task id or artifact directory ownership");
+	const dir = path.join(root.path, id);
+	fs.mkdirSync(dir, { mode: 0o700 });
+	const task: TaskDirectory = { id, path: dir, root, outputPath: path.join(dir, `${id}.out.log`), stderrPath: path.join(dir, `${id}.err.log`), artifactDir: path.join(dir, "artifacts") };
+	const meta: TaskMetadata = { schema: TASK_SCHEMA, version: 1, kind: "task", id, ownerToken: root.token, createdAt: now, endedAt: null, readyAt: null };
 	try {
-		process.kill(pid, 0);
-		return true;
+		fs.mkdirSync(task.artifactDir, { mode: 0o700 });
+		writeMetadata(dir, TASK_MARKER, meta);
+		return task;
 	} catch (error) {
-		// ESRCH: reliably gone. EPERM (exists, not ours) and anything else
-		// mean "assume alive" so cleanup errs toward retaining.
-		return (error as NodeJS.ErrnoException | undefined)?.code !== "ESRCH";
+		// No command/socket has started yet; never leave an uncollectible half-task.
+		try { fs.rmSync(dir, { recursive: true, force: true }); } catch {
+			try { writeMetadata(dir, TASK_MARKER, { ...meta, endedAt: now, readyAt: now, resourcePid: null }); } catch { /* uncertain leftovers stay protected */ }
+		}
+		throw error;
 	}
 }
-
-/**
- * Remove our own log directories that are old and whose owners are finished.
- * Never throws, never follows symlinks, never deletes anything it cannot
- * positively identify as this package's abandoned data.
+function readTaskMetadata(dir: string, root: LogDirectory): TaskMetadata | undefined {
+	try {
+		const stat = fs.lstatSync(dir);
+		if (!stat.isDirectory() || stat.isSymbolicLink()) return;
+		const meta = readMetadata(path.join(dir, TASK_MARKER));
+		if (!meta || meta.schema !== TASK_SCHEMA || meta.version !== 1 || meta.kind !== "task" || meta.ownerToken !== root.token || meta.id !== path.basename(dir) || typeof meta.id !== "string" || !TASK_ID.test(meta.id)) return;
+		for (const field of ["createdAt", "endedAt", "readyAt"] as const) {
+			if (meta[field] !== null && (typeof meta[field] !== "number" || !Number.isFinite(meta[field]) || meta[field] < 0)) return;
+		}
+		if (meta.resourcePid !== undefined && meta.resourcePid !== null && (typeof meta.resourcePid !== "number" || !Number.isSafeInteger(meta.resourcePid) || meta.resourcePid <= 0)) return;
+		return meta as unknown as TaskMetadata;
+	} catch { return; }
+}
+/** Remember a process group so a dead runtime cannot GC an unconfirmed survivor. */
+export function setTaskProcess(task: TaskDirectory, pid: number | null): void {
+	try {
+		const meta = readTaskMetadata(task.path, task.root);
+		if (meta && meta.resourcePid !== pid && (pid === null || Number.isSafeInteger(pid) && pid > 0)) writeMetadata(task.path, TASK_MARKER, { ...meta, resourcePid: pid });
+	} catch { /* metadata is advisory; never interfere with work */ }
+}
+/** Idempotent: subsequent sweeps must not continually renew the read grace. */
+export function markTaskReady(task: TaskDirectory, endedAt: number, now = Date.now()): boolean {
+	try {
+		const meta = readTaskMetadata(task.path, task.root);
+		if (!meta || !owns(task.root)) return false;
+		if (meta.readyAt !== null) return true;
+		writeMetadata(task.path, TASK_MARKER, { ...meta, endedAt, readyAt: now, resourcePid: null });
+		return true;
+	} catch { return false; /* uncertain/incomplete markers are never reclaimed in a live runtime */ }
+}
+function isPidAlive(pid: number, group = false): boolean {
+	try { process.kill(group && process.platform !== "win32" ? -pid : pid, 0); return true; }
+	catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+}
+interface TreeInfo { bytes: number; latest: number }
+/** lstat only; a symbolic link contributes no external data or activity. */
+function treeInfo(dir: string, omitTaskMarker = false): TreeInfo {
+	const stat = fs.lstatSync(dir);
+	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("not a real artifact directory");
+	// A task marker handoff changes the directory mtime, but retention is
+	// based on the ended task and data writes, not on metadata rewrites.
+	const info = { bytes: 0, latest: omitTaskMarker ? 0 : stat.mtimeMs };
+	for (const name of fs.readdirSync(dir)) {
+		const child = path.join(dir, name), st = fs.lstatSync(child);
+		if (st.isSymbolicLink()) continue;
+		if (st.isDirectory()) {
+			const nested = treeInfo(child);
+			info.bytes += nested.bytes; info.latest = Math.max(info.latest, nested.latest);
+		} else if (st.isFile()) {
+			info.bytes += st.size;
+			if (!(omitTaskMarker && name === TASK_MARKER)) info.latest = Math.max(info.latest, st.mtimeMs);
+		}
+	}
+	return info;
+}
+interface Candidate {
+	path: string;
+	root: string;
+	token?: string;
+	task: boolean;
+	ino: number;
+	bytes: number;
+	latest: number;
+	expired: boolean;
+}
+function hasLiveTaskGroup(dir: string, token: string | undefined): boolean {
+	if (!token) return false; // version-1 flat legacy directories have no per-task markers
+	const root = { path: dir, token, close() {} };
+	for (const name of fs.readdirSync(dir)) {
+		const child = path.join(dir, name), stat = fs.lstatSync(child);
+		if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
+		const meta = readTaskMetadata(child, root);
+		if (meta?.resourcePid && isPidAlive(meta.resourcePid, true)) return true;
+	}
+	return false;
+}
+/** Sweep eligible current tasks and closed/dead local runtimes under one soft quota.
+ * Active/pending/referenced data is deliberately outside the reclaimable pool.
+ * Never throws and never claims a failed removal succeeded.
  */
-export function cleanOldLogDirectories(now: number = Date.now(), base: string = os.tmpdir()): void {
-	const root = typeof base === "string" && base.length > 0 ? base : os.tmpdir();
+export function cleanOldLogDirectories(now = Date.now(), base: string = os.tmpdir(), options: LogCleanupOptions = {}): LogCleanupResult {
+	const result: LogCleanupResult = { removedTasks: [], removedDirectories: [] };
+	const policy = options.policy ?? { retentionMs: LOG_RETENTION_MS, budgetBytes: LOG_BUDGET_BYTES };
+	if (!Number.isFinite(policy.retentionMs) || policy.retentionMs < 0 || !Number.isFinite(policy.budgetBytes) || policy.budgetBytes < 0) return result;
+	const candidates: Candidate[] = [];
 	let names: string[];
 	try {
-		names = fs.readdirSync(root);
-	} catch {
-		return;
-	}
+		// base is the explicitly configured namespace (e.g. macOS /tmp alias),
+		// not a discovered cleanup entry. Entries below it still use lstat only.
+		const stat = fs.statSync(base);
+		if (!stat.isDirectory()) return result;
+		names = fs.readdirSync(base);
+	} catch { return result; }
 	for (const name of names) {
-		// The prefix check also leaves legacy flat "pi-cc-monitor" logs alone.
 		if (!name.startsWith(DIR_PREFIX)) continue;
-		const dir = path.join(root, name);
-		let stat: fs.Stats;
+		const dir = path.join(base, name);
 		try {
-			stat = fs.lstatSync(dir);
-		} catch {
-			continue;
-		}
-		// lstat: a symlink entry is never a directory here, so links to
-		// elsewhere are skipped, not followed.
-		if (!stat.isDirectory()) continue;
+			const stat = fs.lstatSync(dir);
+			if (!stat.isDirectory() || stat.isSymbolicLink() || !ourUid(stat)) continue;
+			const meta = readOwnerMetadata(dir);
+			if (!meta || meta.hostname !== os.hostname()) continue;
+			if (options.current?.path === dir && owns(options.current)) {
+				for (const id of fs.readdirSync(dir)) {
+					if (!TASK_ID.test(id) || options.protectedIds?.has(id)) continue;
+					const taskPath = path.join(dir, id), taskStat = fs.lstatSync(taskPath);
+					if (!taskStat.isDirectory() || taskStat.isSymbolicLink() || !ourUid(taskStat)) continue;
+					const task = readTaskMetadata(taskPath, options.current);
+					if (!task || task.endedAt === null || task.readyAt === null || task.resourcePid && isPidAlive(task.resourcePid, true)) continue;
+					const info = treeInfo(taskPath, true);
+					const latest = Math.max(info.latest, task.endedAt);
+					if (now - Math.max(latest, task.readyAt) < LOG_READ_GRACE_MS) continue;
+					candidates.push({ path: taskPath, root: dir, token: meta.ownerToken, task: true, ino: taskStat.ino, bytes: info.bytes, latest, expired: now - latest >= policy.retentionMs });
+				}
+			} else {
+				if (meta.closedAt === null && isPidAlive(meta.pid) || hasLiveTaskGroup(dir, meta.ownerToken)) continue;
+				const info = treeInfo(dir);
+				const latest = Math.max(info.latest, meta.createdAt, meta.closedAt ?? 0);
+				if (now - latest < LOG_READ_GRACE_MS) continue;
+				candidates.push({ path: dir, root: dir, token: meta.ownerToken, task: false, ino: stat.ino, bytes: info.bytes, latest, expired: now - latest >= policy.retentionMs });
+			}
+		} catch { /* one malformed/unreadable directory never stops the sweep */ }
+	}
+	candidates.sort((a, b) => a.latest - b.latest);
+	let bytes = candidates.reduce((total, item) => total + item.bytes, 0);
+	for (const item of candidates) {
+		if (!item.expired && bytes <= policy.budgetBytes) continue;
 		try {
-			maybeRemove(dir, stat, now);
-		} catch {
-			// one bad directory must not stop the sweep
-		}
+			const stat = fs.lstatSync(item.path);
+			if (!stat.isDirectory() || stat.isSymbolicLink() || stat.ino !== item.ino || !ourUid(stat)) continue;
+			const meta = readOwnerMetadata(item.root);
+			if (!meta || meta.ownerToken !== item.token || meta.hostname !== os.hostname()) continue;
+			if (item.task) {
+				if (!options.current || !owns(options.current) || options.protectedIds?.has(path.basename(item.path))) continue;
+			} else if (meta.closedAt === null && isPidAlive(meta.pid) || hasLiveTaskGroup(item.path, meta.ownerToken)) continue;
+			// Recheck activity in case another process wrote between discovery/removal.
+			const info = treeInfo(item.path, item.task);
+			if (info.latest > item.latest) continue;
+			fs.rmSync(item.path, { recursive: true, force: true });
+			bytes -= item.bytes;
+			(item.task ? result.removedTasks : result.removedDirectories).push(item.path);
+		} catch { /* EACCES/EIO/changed ownership: retain and continue */ }
 	}
-}
-
-function maybeRemove(dir: string, stat: fs.Stats, now: number): void {
-	const metadata = readOwnerMetadata(dir);
-	if (!metadata) return; // malformed or unowned: keep
-	if (metadata.hostname !== os.hostname()) return; // foreign host: uncertain, keep
-	if (metadata.closedAt === null && isPidAlive(metadata.pid)) return; // open and alive: keep
-	if (now - latestActivity(dir, stat, metadata) < LOG_RETENTION_MS) return; // too recent: keep
-	fs.rmSync(dir, { recursive: true, force: true });
-}
-
-/**
- * Latest meaningful activity: creation, the close record, and the mtime of
- * the directory or any log file directly in it (lstat, symlinks excluded).
- * Not just the directory mtime - a live monitor appends to an old file
- * without touching the directory entry.
- */
-function latestActivity(dir: string, stat: fs.Stats, metadata: OwnerMetadata): number {
-	let latest = Math.max(stat.mtimeMs, metadata.createdAt);
-	if (metadata.closedAt !== null) latest = Math.max(latest, metadata.closedAt);
-	let names: string[];
-	try {
-		names = fs.readdirSync(dir);
-	} catch {
-		return latest;
-	}
-	for (const name of names) {
-		let entry: fs.Stats;
-		try {
-			entry = fs.lstatSync(path.join(dir, name));
-		} catch {
-			continue;
-		}
-		if (entry.isFile()) latest = Math.max(latest, entry.mtimeMs);
-	}
-	return latest;
+	return result;
 }

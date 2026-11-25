@@ -592,7 +592,7 @@ test("task tree groups real source subscriptions and local stop confirms subscri
   assert.match(details, new RegExp("Source\\s+build #" + work.details.taskId + " · running"));
   assert.match(details, /subscription only; no process owned/);
   assert.match(details, /Watch errors\s+both · repeat · turn · waiting · ERROR/);
-  assert.match(details, /full source logs, not only matched events/);
+  assert.match(details, /retained logs, not only matches/);
   assert.ok(details.indexOf("State") < details.indexOf("Observation"));
   assert.ok(details.indexOf("Observation") < details.indexOf("Delivery"));
   assert.ok(details.indexOf("Delivery") < details.indexOf("Lifetime"));

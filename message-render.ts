@@ -41,6 +41,13 @@ export interface MonitorMessageDetails {
 	watchCount?: number;
 	outputPath?: string;
 	stderrPath?: string;
+	outputArchivePath?: string;
+	stderrArchivePath?: string;
+	artifactDir?: string;
+	logLimitBytes?: number;
+	logTruncated?: boolean;
+	logRemoved?: boolean;
+	logError?: string;
 	stdoutTail?: string;
 	stderrTail?: string;
 	stdoutTailNote?: string;
@@ -212,6 +219,13 @@ function cardSections(details: MonitorMessageDetails, body: string[]): Notificat
 	const logs: string[] = [];
 	if (details.outputPath) logs.push(`stdout: ${sanitizeDisplay(details.outputPath)}`);
 	if (details.stderrPath) logs.push(`stderr: ${sanitizeDisplay(details.stderrPath)}`);
+	if (details.artifactDir) logs.push(`disposable artifacts: ${sanitizeDisplay(details.artifactDir)}`);
+	if (details.logLimitBytes !== undefined) logs.push(`disk limit: ${details.logLimitBytes / (1024 * 1024)} MiB (archives included)`);
+	if (details.outputArchivePath) logs.push(`previous stdout (if rotated): ${sanitizeDisplay(details.outputArchivePath)}`);
+	if (details.stderrArchivePath) logs.push(`previous stderr (if rotated): ${sanitizeDisplay(details.stderrArchivePath)}`);
+	if (details.logRemoved) logs.push("artifacts reclaimed by retention/quota");
+	else if (details.logTruncated) logs.push("logs truncated; only recent segments retained");
+	if (details.logError) logs.push(`log incomplete: ${sanitizeDisplay(details.logError)}`);
 	if (logs.length) sections.push({ heading: "Logs", lines: logs, color: "dim" });
 	if (details.loopPrompt) {
 		sections.push({ heading: "Loop", lines: [displayLine(details.loopPrompt)], color: "dim" });

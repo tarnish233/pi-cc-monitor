@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-25
+
+### Added
+- Independently configurable artifact retention (3 days), per-task disk-log limit (20 MiB), and collectible-artifact budget (200 MiB) in /monitor_settings.
+- Private per-task artifact directories and PI_MONITOR_ARTIFACT_DIR for disposable helper scripts/intermediate results, without changing the project cwd or TMPDIR.
+
+### Changed
+- Bound command/WebSocket disk logs with two rotating segments per stream and explicit truncation/archive metadata; observation and process lifetime are unchanged.
+- Reclaim delivered, resource-free, unreferenced task artifacts inside live runtimes after a 10-minute read grace, using TTL/oldest-first quota checks at startup, task cleanup, settings changes and 30-minute intervals.
+- Stage config writes in marked private directories and recover only provably owned abandoned data; keep active/uncertain owners, symlink targets, user files and old unmarked paths untouched.
+
+### Fixed
+- Close file descriptors returned after a rotating log was destroyed, preventing late writes or leaked handles.
+- Roll back unpublished runtime/task directories after initialization failure; retain other users' directories and unconfirmed process groups.
+
 ## [0.16.0] - 2026-11-24
 
 ### Changed

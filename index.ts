@@ -39,7 +39,7 @@
  * record exactly once with at most one closing notice. That notice names the
  * outcome \u2014 completed, failed, or stopped at its background time limit \u2014 and
  * carries a bounded tail of both logs, so the model usually need not read
- * them again; the full logs stay on disk. Output is never streamed while a
+ * them again; bounded retained segments stay on disk. Output is never streamed while a
  * completion runs.
  */
 
@@ -48,7 +48,7 @@ import path from "node:path";
 import type { ChildProcess } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { invalidateConfig, loadConfig } from "./config.ts";
+import { configPath, invalidateConfig, loadConfig } from "./config.ts";
 import { CONFIG_CHANNEL, registerSettingsCommand } from "./settings.ts";
 import { killTree, processGroupAlive, spawnMonitor, stopProcessGroup, KILL_CONFIRMATION_MS } from "./process.ts";
 import { MONITOR_DESCRIPTION, MONITOR_LIST_SNIPPET, MONITOR_PROMPT_GUIDELINES, MONITOR_SNIPPET, MONITOR_STOP_SNIPPET, MONITOR_TIMEOUTS } from "./prompts.ts";
@@ -57,7 +57,8 @@ import { capEventLines, LineBatcher, MAX_BATCH_CHARS, MAX_LINE_CHARS, RateLimite
 import { readLogTail, sanitizeDisplay, type LogTail } from "./log-tail.ts";
 import { DEFAULT_NOTIFY, OutputBudget, outputLevel, strongerLevel, type NotifyPolicy, type OutputLevel, type TerminalLevel } from "./notification-budget.ts";
 import { OutputLines, WatchRules, validateWatches, MAX_WATCHES, MAX_WATCH_TEXT, type WatchRule, type WatchState, type OutputStream } from "./watches.ts";
-import { cleanOldLogDirectories, createLogDirectory } from "./log-store.ts";
+import { cleanOldLogDirectories, createLogDirectory, createTaskDirectory, markTaskReady, setTaskProcess, LOG_CLEANUP_INTERVAL_MS, type TaskDirectory } from "./log-store.ts";
+import { createBoundedLog } from "./bounded-log.ts";
 import { registerTaskProvider, type TaskDetail, type TaskItem, type TaskStopResult } from "./tasks.ts";
 import { formatDuration, releaseNotificationHover, setNotificationTui } from "./render.ts";
 import { renderMonitorMessage } from "./message-render.ts";
@@ -101,6 +102,15 @@ export const STOPPED_NOTICE = "[Monitor stopped]";
 export type MonitorStatus = "running" | "stopping" | "stop_timeout" | "stopped" | "exited" | "completed" | "timed_out" | "failed" | "flooded";
 export type MonitorMode = "completion" | "events";
 
+interface ManagedLogs {
+	directory: TaskDirectory;
+	maxBytes: number;
+	truncated: boolean;
+	removed: boolean;
+	ready?: boolean;
+	error?: string;
+}
+
 export interface MonitorRecord {
 	id: string;
 	kind: "command" | "ws" | "source";
@@ -127,6 +137,8 @@ export interface MonitorRecord {
 	loopPrompt?: string;
 	outputPath: string;
 	stderrPath: string;
+	/** Source observers share this object, including truncation/reclamation state. */
+	logs?: ManagedLogs;
 	child?: ChildProcess;
 	socket?: WebSocket;
 	/** Execution/notification state is not the resource-cleanup barrier. */
@@ -175,6 +187,12 @@ export type MonitorSnapshot = {
 	pid?: number;
 	outputPath: string;
 	stderrPath: string;
+	outputArchivePath?: string;
+	stderrArchivePath?: string;
+	artifactDir?: string;
+	logLimitBytes?: number;
+	logTruncated?: boolean;
+	logRemoved?: boolean;
 	logError?: string;
 };
 
@@ -284,7 +302,7 @@ function exitNotice(record: MonitorRecord, signal: NodeJS.Signals | null): strin
  * The bounded tail a completion's terminal notice carries: stdout always, and
  * stderr only when it has output \u2014 an empty stderr says nothing the banner's
  * path has not already named, so it gets no section (a read error is kept:
- * it says the tail is not merely empty). The full logs stay on disk \u2014 this is
+ * it says the tail is not merely empty). Bounded retained segments stay on disk \u2014 this is
  * only enough to usually avoid a second read.
  */
 function completionTailLines(record: MonitorRecord): string[] {
@@ -325,6 +343,30 @@ function suppressionNotice(count: number): string {
 	return `[${eventsText(count)} suppressed \u2014 output rate too high. Consider using monitor_stop to restart this monitor with a more selective filter.]`;
 }
 
+function logDetails(record: MonitorRecord) {
+	const logs = record.logs;
+	return logs ? {
+		outputArchivePath: record.outputPath + ".1",
+		stderrArchivePath: record.stderrPath + ".1",
+		artifactDir: logs.directory.artifactDir,
+		logLimitBytes: logs.maxBytes,
+		logTruncated: logs.truncated,
+		logRemoved: logs.removed,
+		...(record.logError ?? logs.error ? { logError: record.logError ?? logs.error } : {}),
+	} : {};
+}
+
+function logNotice(record: MonitorRecord): string[] {
+	if (record.logs?.removed) return ["[Task artifacts reclaimed by retention/quota; the original log files are no longer available.]"];
+	const notes: string[] = [];
+	const archives = [record.outputPath + ".1", record.stderrPath + ".1"].filter((file) => fs.existsSync(file));
+	if (archives.length) notes.push(`[Rotated logs — read these previous segments before the current paths: ${archives.join("; ")}. A current log path alone is not the whole retained output.]`);
+	if (record.logs?.truncated) notes.push(`[Logs truncated — old output was discarded by the ${record.logs.maxBytes / (1024 * 1024)} MiB task limit. Only recent segments remain; archives (if present): ${record.outputPath}.1; ${record.stderrPath}.1. Do not assume these logs are complete.]`);
+	const error = record.logError ?? record.logs?.error;
+	if (error) notes.push(`[Log incomplete — ${error}]`);
+	return notes;
+}
+
 function snapshotMonitor(record: MonitorRecord): MonitorSnapshot {
 	return {
 		id: record.id,
@@ -350,7 +392,7 @@ function snapshotMonitor(record: MonitorRecord): MonitorSnapshot {
 		...(record.child?.pid !== undefined ? { pid: record.child.pid } : {}),
 		outputPath: record.outputPath,
 		stderrPath: record.stderrPath,
-		...(record.logError !== undefined ? { logError: record.logError } : {}),
+		...logDetails(record),
 	};
 }
 
@@ -369,10 +411,46 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	let summaryTimer: ReturnType<typeof setTimeout> | undefined;
 	let idleFallbackTimer: ReturnType<typeof setTimeout> | undefined;
 	let logDirectory: ReturnType<typeof createLogDirectory> | undefined;
+	let artifactInterval: ReturnType<typeof setInterval> | undefined;
+	let artifactSweepTimer: ReturnType<typeof setTimeout> | undefined;
 	let lastCtx: ExtensionContext | undefined;
 
 	function outputDir(): string {
-		return (logDirectory ??= createLogDirectory()).path;
+		logDirectory ??= createLogDirectory();
+		startArtifactMaintenance();
+		return logDirectory.path;
+	}
+	function protectedArtifacts(): Set<string> {
+		const ids = new Set<string>();
+		for (const record of monitors.values()) {
+			if (record.logs && (!record.finalized || isActive(record) || record.pendingStop || pendingCompletions.has(record.id) || pendingEndings.has(record.id) || observers.get(record.id)?.size)) ids.add(record.logs.directory.id);
+		}
+		return ids;
+	}
+	function sweepArtifacts(): void {
+		if (disposed) return;
+		const config = loadConfig();
+		const policy = { retentionMs: config.logRetentionDays * 86_400_000, budgetBytes: config.logBudgetMiB * 1024 * 1024 };
+		const result = cleanOldLogDirectories(Date.now(), logDirectory ? path.dirname(logDirectory.path) : undefined, { policy, current: logDirectory, protectedIds: protectedArtifacts() });
+		// Config staging is private/marked too, but lives beside the settings
+		// file so rename remains atomic. Never remove unmarked files.
+		const configBase = path.dirname(path.resolve(configPath()));
+		if (!logDirectory || configBase !== path.dirname(logDirectory.path)) cleanOldLogDirectories(Date.now(), configBase, { policy });
+		if (result.removedTasks.length) {
+			const removed = new Set(result.removedTasks);
+			for (const record of monitors.values()) if (record.logs && removed.has(record.logs.directory.path)) record.logs.removed = true;
+			tasks.changed();
+		}
+	}
+	function scheduleArtifactSweep(): void {
+		if (disposed || artifactSweepTimer) return;
+		artifactSweepTimer = setTimeout(() => { artifactSweepTimer = undefined; sweepArtifacts(); }, 100);
+		artifactSweepTimer.unref?.();
+	}
+	function startArtifactMaintenance(): void {
+		if (disposed || artifactInterval) return;
+		artifactInterval = setInterval(sweepArtifacts, LOG_CLEANUP_INTERVAL_MS);
+		artifactInterval.unref?.();
 	}
 	/**
 	 * True once the session is shutting down. Pi invalidates this extension's
@@ -397,6 +475,10 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			!pendingEndings.has(record.id) &&
 			!(observers.get(record.id)?.size),
 		);
+		for (const record of eligible) {
+			if (record.kind !== "source" && record.logs && !record.logs.ready && !record.logs.removed) record.logs.ready = markTaskReady(record.logs.directory, record.endedAt ?? Date.now());
+		}
+		scheduleArtifactSweep();
 		if (eligible.length <= ENDED_MONITOR_HISTORY_LIMIT) return;
 		eligible.sort((a, b) => (a.endedAt ?? a.createdAt) - (b.endedAt ?? b.createdAt));
 		const removeCount = eligible.length - ENDED_MONITOR_HISTORY_LIMIT;
@@ -506,7 +588,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		globallySuppressed.clear();
 		if (summaryTimer) clearTimeout(summaryTimer);
 		summaryTimer = undefined;
-		return `[Session output budget: ${total} events suppressed from ${sources} monitors; raw logs are unchanged. See monitor_list for sources.]`;
+		return `[Session output budget: ${total} events suppressed from ${sources} monitors; event suppression does not alter disk logging. See monitor_list for sources.]`;
 	}
 
 	function scheduleSummary(): void {
@@ -576,6 +658,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				...(final ? { finalLines: body.slice(1) } : {}),
 				outputPath: record.outputPath,
 				stderrPath: record.stderrPath,
+				...logDetails(record),
 				...(record.tails ? {
 					stdoutTail: record.tails.stdout.text,
 					stdoutTailTruncated: record.tails.stdout.truncated,
@@ -667,9 +750,11 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		if (resourceAlive(record)) return false;
 		liveResources.delete(record.id);
 		record.resourceActive = false;
+		if (record.kind === "command" && record.logs) setTaskProcess(record.logs.directory, null);
 		if (record.cleanupTimer) clearTimeout(record.cleanupTimer);
 		record.cleanupTimer = undefined;
 		if (!liveResources.size) removeExitHook();
+		scheduleMonitorPrune();
 		return true;
 	}
 
@@ -729,7 +814,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		if (record.mode === "completion" && (ending.cause === "exit" || ending.cause === "timeout")) captureCompletionTails(record);
 		if (ending.notice) {
 			const global = globallySuppressed.get(record.id);
-			const lines = [ending.notice(), ...(global ? [`[Session budget suppressed ${global} events from this monitor; raw logs are unchanged.]`] : []), ...lastLines];
+			const lines = [ending.notice(), ...logNotice(record), ...(global ? [`[Session budget suppressed ${global} events from this monitor; event suppression does not alter disk logging.]`] : []), ...lastLines];
 			// Context is a hard ceiling; turn is already the strongest level.
 			// Merging the last output cannot change the configured terminal policy.
 			deliver(record, ending.cause, lines, record.notify.terminal, lastLines.length > 0);
@@ -797,7 +882,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 				refreshStatus();
 			}
 			return gone;
-		}).finally(() => { record.pendingStop = undefined; });
+		}).finally(() => { record.pendingStop = undefined; scheduleMonitorPrune(); });
 		record.pendingStop = pending;
 		return pending;
 	}
@@ -897,7 +982,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		logSource?: MonitorRecord,
 	): MonitorRecord {
 		const id = generateId();
-		const dir = outputDir();
+		outputDir();
+		const logs: ManagedLogs = logSource?.logs ?? { directory: createTaskDirectory(logDirectory!, id), maxBytes: loadConfig().logMaxMiB * 1024 * 1024, truncated: false, removed: false };
 		const record: MonitorRecord = {
 			id,
 			kind,
@@ -913,8 +999,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			notify: parseNotify(input.notify),
 			status: "running",
 			loopPrompt: input.loopPrompt,
-			outputPath: logSource?.outputPath ?? path.join(dir, `${id}.out.log`),
-			stderrPath: logSource?.stderrPath ?? path.join(dir, `${id}.err.log`),
+			outputPath: logs.directory.outputPath,
+			stderrPath: logs.directory.stderrPath,
+			logs,
 			limiter: new RateLimiter(),
 		};
 		record.batcher = input.mode === "events" ? new LineBatcher({
@@ -984,7 +1071,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	}
 
 	function receipt(record: MonitorRecord) {
-		return { taskId: record.id, mode: record.mode, timeoutMs: record.timeoutMs, persistent: record.persistent, kind: record.kind, outputPath: record.outputPath, stderrPath: record.stderrPath, notify: { ...record.notify }, ...(record.sourceId ? { sourceId: record.sourceId } : {}), ...(record.matcher ? { watches: record.matcher.snapshot() } : {}) };
+		return { taskId: record.id, mode: record.mode, timeoutMs: record.timeoutMs, persistent: record.persistent, kind: record.kind, outputPath: record.outputPath, stderrPath: record.stderrPath, ...logDetails(record), notify: { ...record.notify }, ...(record.sourceId ? { sourceId: record.sourceId } : {}), ...(record.matcher ? { watches: record.matcher.snapshot() } : {}) };
 	}
 
 	function startTimeout(record: MonitorRecord): void {
@@ -1027,6 +1114,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			throw new Error(`Could not start the monitor: ${error instanceof Error ? error.message : String(error)}`);
 		}
 		record.resourceActive = true;
+		if (record.logs && record.child?.pid) setTaskProcess(record.logs.directory, record.child.pid);
 		liveResources.set(record.id, record);
 		installExitHook();
 		startTimeout(record);
@@ -1042,12 +1130,15 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		return spawnMonitor({
 			command,
 			cwd: ctx.cwd,
-			env: monitorEnv(),
+			env: { ...monitorEnv(), PI_MONITOR_ARTIFACT_DIR: record.logs?.directory.artifactDir },
 			shell: shell.shell,
 			shellArgs: shell.args,
 			commandTransport: shell.commandTransport,
 			stdoutPath: record.outputPath,
 			stderrPath: record.stderrPath,
+			maxLogBytes: record.logs?.maxBytes,
+			onLogTruncated: () => { if (record.logs) record.logs.truncated = true; if (!disposed) tasks.changed(); },
+			onLogError: (error) => { record.logError ??= error.message; if (record.logs) record.logs.error = record.logError; if (!disposed) tasks.changed(); },
 			onStdout: (chunk) => {
 				if (record.mode === "events" && record.status === "running") record.batcher?.push(chunk);
 				forwardOutput(record, "stdout", chunk);
@@ -1102,10 +1193,10 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	function wsLog(record: MonitorRecord): (line: string) => void {
 		// The launch result names the file, and monitor_list reports it as the
 		// place to read the events from: create it now, not at the first frame.
-		const fd = fs.openSync(record.outputPath, "a", 0o600);
-		let stream: ReturnType<typeof fs.createWriteStream>;
+		const fd = fs.openSync(record.outputPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+		let stream: ReturnType<typeof createBoundedLog>;
 		try {
-			stream = fs.createWriteStream(record.outputPath, { fd, flags: "a" });
+			stream = createBoundedLog(record.outputPath, { fd, maxBytes: record.logs?.maxBytes ?? 20 * 1024 * 1024, onTruncate: () => { if (record.logs) record.logs.truncated = true; if (!disposed) tasks.changed(); } });
 		} catch (error) {
 			try { fs.closeSync(fd); } catch { /* already closed */ }
 			throw error;
@@ -1120,6 +1211,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		const degrade = (reason: string) => {
 			if (record.logError !== undefined) return;
 			record.logError = reason;
+			if (record.logs) record.logs.error = reason;
 			record.closeLog = () => {};
 			stream.destroy();
 			if (disposed) return;
@@ -1299,6 +1391,13 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			kind: Type.Union([Type.Literal("command"), Type.Literal("ws"), Type.Literal("source")]),
 			outputPath: Type.String(),
 			stderrPath: Type.String(),
+			outputArchivePath: Type.Optional(Type.String()),
+			stderrArchivePath: Type.Optional(Type.String()),
+			artifactDir: Type.Optional(Type.String()),
+			logLimitBytes: Type.Optional(Type.Number()),
+			logTruncated: Type.Optional(Type.Boolean()),
+			logRemoved: Type.Optional(Type.Boolean()),
+			logError: Type.Optional(Type.String()),
 			updated: Type.Optional(Type.Boolean()),
 			notify: Type.Optional(Type.Object({ output: Type.String(), terminal: Type.String() })),
 			sourceId: Type.Optional(Type.String()),
@@ -1508,6 +1607,12 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					pid: Type.Optional(Type.Number()),
 					outputPath: Type.String(),
 					stderrPath: Type.String(),
+					outputArchivePath: Type.Optional(Type.String()),
+					stderrArchivePath: Type.Optional(Type.String()),
+					artifactDir: Type.Optional(Type.String()),
+					logLimitBytes: Type.Optional(Type.Number()),
+					logTruncated: Type.Optional(Type.Boolean()),
+					logRemoved: Type.Optional(Type.Boolean()),
 					logError: Type.Optional(Type.String()),
 				}),
 			),
@@ -1591,7 +1696,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 						...(record.kind === "source" ? [{ label: "Rules", value: observationLabel(rules) }] : []),
 						...(rules?.map((rule) => ({ label: `Watch ${rule.id}`, value: `${rule.stream} · ${rule.once ? "once" : "repeat"} · ${rule.notify} · ${rule.fired ? rule.once ? "matched (consumed)" : "matched (still active)" : "waiting"} · ${rule.text}` })) ?? []),
 						{ label: "Events", value: `${record.eventCount} delivered${record.suppressedCount ? ` · ${record.suppressedCount} rate-suppressed` : ""}` },
-						...(record.globalSuppressedCount ? [{ label: "Session budget", value: `${record.globalSuppressedCount} events suppressed; raw logs unchanged` }] : []),
+						...(record.globalSuppressedCount ? [{ label: "Session budget", value: `${record.globalSuppressedCount} events suppressed; disk logging is independent` }] : []),
 					] }] : []),
 					{ title: "Delivery", rows: [
 						{ label: "Mode", value: record.mode === "completion" ? "completion · one terminal notification" : record.kind === "source" ? "events · selected future source output" : record.kind === "ws" ? "events · each WebSocket frame" : "events · each stdout line" },
@@ -1605,15 +1710,19 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 						...(record.child?.pid !== undefined ? [{ label: "PID", value: String(record.child.pid) }] : []),
 					] },
 					{ title: "Logs", rows: [
-						...(record.sourceId ? [{ label: "Shared with", value: `source #${record.sourceId}; full source logs, not only matched events` }] : []),
+						...(record.sourceId ? [{ label: "Shared with", value: `source #${record.sourceId}; retained logs, not only matches` }] : []),
 						{ label: "stdout", value: record.outputPath },
 						{ label: "stderr", value: record.stderrPath },
-						...(record.logError ? [{ label: "Log status", value: `incomplete \u2014 ${record.logError}` }] : []),
+						...(record.logs ? [{ label: "Scratch", value: record.logs.directory.artifactDir }, { label: "Disk limit", value: `${record.logs.maxBytes / (1024 * 1024)} MiB (archives included)` }] : []),
+						...(view.logRemoved ? [{ label: "Log status", value: "reclaimed by retention/quota" }] : view.logTruncated ? [{ label: "Log status", value: "truncated; only recent segments retained" }] : []),
+						...(view.logError ? [{ label: "Log error", value: `incomplete \u2014 ${view.logError}` }] : []),
 					] },
 				],
 				logs: [
 					{ label: record.kind === "source" ? "stdout (source log)" : "stdout (log)", path: record.outputPath },
 					{ label: record.kind === "source" ? "stderr (source log)" : "stderr (log)", path: record.stderrPath },
+					...(!view.logRemoved && fs.existsSync(record.outputPath + ".1") ? [{ label: "stdout (previous segment)", path: record.outputPath + ".1" }] : []),
+					...(!view.logRemoved && fs.existsSync(record.stderrPath + ".1") ? [{ label: "stderr (previous segment)", path: record.stderrPath + ".1" }] : []),
 				],
 				note: isActive(record) ? `x: ${stopScope(view)}` : "This monitor has ended; its actions are disabled.",
 			};
@@ -1636,8 +1745,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	// A Monitor setting changed: the footer follows.
 	pi.events.on(CONFIG_CHANNEL, () => {
 		invalidateConfig();
-		// The footer may have been switched on or off.
+		// Footer and retention/budget changes take effect without restarting work.
 		refreshStatus();
+		scheduleArtifactSweep();
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1652,7 +1762,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		}
 		// Another process may have edited the Monitor settings file.
 		invalidateConfig();
-		cleanOldLogDirectories();
+		startArtifactMaintenance();
+		sweepArtifacts();
 	});
 
 	// --------------------------------------------------------------- lifecycle
@@ -1662,6 +1773,10 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		// Set first: the processes killed below exit after Pi has invalidated
 		// this extension's API, and their callbacks must not touch it.
 		disposed = true;
+		if (artifactInterval) clearInterval(artifactInterval);
+		if (artifactSweepTimer) clearTimeout(artifactSweepTimer);
+		artifactInterval = undefined;
+		artifactSweepTimer = undefined;
 		// Close an open task overlay before the context and logs go away.
 		tasks.close();
 		// The idle fallback must not fire on the disposed runtime after an await.
@@ -1692,7 +1807,9 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		globallySuppressed.clear();
 		if (summaryTimer) clearTimeout(summaryTimer);
 		summaryTimer = undefined;
-		logDirectory?.close();
+		// An unconfirmed resource keeps its open owner marker: never reclaim a
+		// directory merely because this runtime tried, but failed, to stop work.
+		if (!liveResources.size) logDirectory?.close();
 		monitors.clear();
 		// Pi clears extension statuses when it unloads, but a reload should not
 		// leave a stale count behind until then.

@@ -27,6 +27,12 @@ export interface MonitorView {
 	suppressedCount?: number;
 	globalSuppressedCount?: number;
 	logError?: string;
+	logTruncated?: boolean;
+	logRemoved?: boolean;
+	logLimitBytes?: number;
+	artifactDir?: string;
+	outputArchivePath?: string;
+	stderrArchivePath?: string;
 	watches?: WatchState[];
 }
 
@@ -64,6 +70,8 @@ export function monitorBadges(view: MonitorView): string[] {
 		if (view.globalSuppressedCount) badges.push(`${view.globalSuppressedCount} session-suppressed`);
 	}
 	if (view.notify.terminal === "context") badges.push("terminal context");
+	if (view.logRemoved) badges.push("artifacts reclaimed");
+	else if (view.logTruncated) badges.push("logs truncated");
 	if (view.logError) badges.push("log incomplete");
 	if (view.resourceActive && view.status && !["running", "stopping", "stop_timeout"].includes(view.status)) badges.push("cleanup pending");
 	return badges;
@@ -81,6 +89,10 @@ export function startReceipt(view: MonitorView): string {
 		lines.push(`notify: output ${view.notify.output} · terminal ${view.notify.terminal}`);
 	}
 	lines.push(`stdout: ${view.outputPath}`, `stderr: ${view.stderrPath}`);
+	if (view.outputArchivePath) lines.push(`previous stdout (if rotated): ${view.outputArchivePath}`);
+	if (view.stderrArchivePath) lines.push(`previous stderr (if rotated): ${view.stderrArchivePath}`);
+	if (view.artifactDir) lines.push(`disposable artifacts: ${view.artifactDir} (commands: $PI_MONITOR_ARTIFACT_DIR; project cwd unchanged)`);
+	if (view.logLimitBytes !== undefined) lines.push(`Logs: at most ${view.logLimitBytes / (1024 * 1024)} MiB per task, archives included. Previous segments use .1; logTruncated marks discarded output. Ended artifacts expire or yield to the quota after terminal handoff and a 10-minute read grace.`);
 	if (view.persistent) lines.push("This instance runs until you stop it or the session ends.");
 	if (view.mode === "completion") {
 		lines.push("No result exists yet. Continue independent work; if only waiting for Monitor, end your turn with one short message: what is running and that you will report when it finishes. Do NOT report results, conclusions or estimates for this task while it is pending. Do not poll, sleep or re-read the logs just to wait. You will be notified once at the next response/tool-batch boundary or from idle. Read and verify the required outputs before using the result; a completed task does not by itself mean the overall report is ready. Notifications are not user replies.");

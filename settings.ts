@@ -8,7 +8,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { SettingsList, truncateToWidth, visibleWidth, type SettingItem, type SettingsListTheme } from "@earendil-works/pi-tui";
 import os from "node:os";
 import path from "node:path";
-import { configPath, envOverride, loadConfig, saveConfig, type PiCcConfig } from "./config.ts";
+import { configPath, envOverride, loadConfig, numberSettingValue, saveConfig, type NumberSetting, type PiCcConfig } from "./config.ts";
 
 export const CONFIG_CHANNEL = "pi-cc-monitor:config";
 const COMMAND = "monitor_settings";
@@ -19,13 +19,19 @@ export interface PanelTheme {
 	bold(text: string): string;
 }
 
-interface SettingSpec {
-	field: keyof PiCcConfig;
+type SettingSpec = {
+	field: "compactMessages" | "footer";
 	label: string;
 	on: string;
 	off: string;
 	description: string;
-}
+} | {
+	field: NumberSetting;
+	label: string;
+	choices: number[];
+	unit: "d" | " MiB";
+	description: string;
+};
 
 const SETTINGS: SettingSpec[] = [
 	{
@@ -42,6 +48,18 @@ const SETTINGS: SettingSpec[] = [
 		off: "off",
 		description: "One line in Pi's footer while monitors run: 2 monitors.",
 	},
+	{
+		field: "logRetentionDays", label: "Artifact retention", choices: [1, 3, 7, 14, 30], unit: "d",
+		description: "Keep ended task logs and disposable artifacts for this many days. Pending results, live resources, subscriptions and the 10-minute read grace are protected.",
+	},
+	{
+		field: "logMaxMiB", label: "Task log limit", choices: [1, 5, 10, 20, 50, 100], unit: " MiB",
+		description: "stdout + stderr, including rotation archives. Applies to newly started tasks; old output is discarded with a visible truncation flag, never by stopping work.",
+	},
+	{
+		field: "logBudgetMiB", label: "Artifact budget", choices: [50, 100, 200, 500, 1000], unit: " MiB",
+		description: "Soft disk budget for safely collectible local artifacts. Oldest ended data goes first; protected data may temporarily exceed the budget.",
+	},
 ];
 
 const KEYS: Record<string, keyof PiCcConfig> = {
@@ -50,6 +68,10 @@ const KEYS: Record<string, keyof PiCcConfig> = {
 	footer: "footer",
 	status: "footer",
 	statusline: "footer",
+	retention: "logRetentionDays",
+	logs: "logMaxMiB",
+	logmax: "logMaxMiB",
+	budget: "logBudgetMiB",
 };
 
 const LABEL_WIDTH = Math.max(...SETTINGS.map((spec) => spec.label.length));
@@ -72,7 +94,14 @@ function displayPath(file: string): string {
 }
 
 function settingValue(spec: SettingSpec): string {
-	return loadConfig()[spec.field] ? spec.on : spec.off;
+	const value = loadConfig()[spec.field];
+	return "on" in spec ? value ? spec.on : spec.off : `${value}${spec.unit}`;
+}
+
+function settingChoices(spec: SettingSpec): string[] {
+	if ("on" in spec) return [spec.on, spec.off];
+	const current = loadConfig()[spec.field];
+	return [...new Set([...spec.choices, current])].sort((a, b) => a - b).map((value) => `${value}${spec.unit}`);
 }
 
 function item(spec: SettingSpec): SettingItem {
@@ -87,7 +116,7 @@ function item(spec: SettingSpec): SettingItem {
 			description: `${spec.description}\n${override} overrides this while set; unset it to change it here.`,
 		};
 	}
-	return { id: spec.field, label, currentValue, values: [spec.on, spec.off], description: spec.description };
+	return { id: spec.field, label, currentValue, values: settingChoices(spec), description: spec.description };
 }
 
 export interface SettingsPanelOptions {
@@ -161,7 +190,7 @@ function showSettings(ctx: ExtensionContext): void {
 		const override = envOverride(spec.field);
 		lines.push(`  ${commandWord(spec.field)}:`.padEnd(13) + settingValue(spec) + (override ? ` (${override})` : ""));
 	}
-	lines.push("", `Usage: /${COMMAND} <item> on|off  (${SETTINGS.map((spec) => commandWord(spec.field)).join(", ")})`);
+	lines.push("", `Usage: /${COMMAND} <item> <value>  (messages/footer: on|off; retention: days; logs/budget: MiB)`);
 	notify(ctx, lines.join("\n"));
 }
 
@@ -203,9 +232,10 @@ function setSetting(ctx: ExtensionContext, apply: ApplySetting, key: string, raw
 		return;
 	}
 	const input = raw.trim().toLowerCase();
-	const value = input === "on" || input === "true" || input === "1" ? spec.on
-		: input === "off" || input === "false" || input === "0" ? spec.off
-		: undefined;
+	const numeric = "on" in spec ? undefined : /^\d+$/.test(input) ? numberSettingValue(spec.field, Number(input)) : undefined;
+	const value = "on" in spec
+		? input === "on" || input === "true" || input === "1" ? spec.on : input === "off" || input === "false" || input === "0" ? spec.off : undefined
+		: numeric === undefined ? undefined : `${numeric}${spec.unit}`;
 	if (value === undefined) {
 		showSettings(ctx);
 		return;
@@ -215,14 +245,17 @@ function setSetting(ctx: ExtensionContext, apply: ApplySetting, key: string, raw
 	if (override && settingValue(spec) !== value) {
 		notify(ctx, `${spec.label} saved as ${value}, but ${override} overrides it while set`, "warning");
 	} else {
-		notify(ctx, `${spec.label} ${value === spec.on ? "enabled" : "disabled"}`);
+		notify(ctx, "on" in spec ? `${spec.label} ${value === spec.on ? "enabled" : "disabled"}` : `${spec.label} ${value}${spec.field === "logMaxMiB" ? " (new tasks)" : ""}`);
 	}
 }
 
 export function registerSettingsCommand(pi: ExtensionAPI): void {
 	const applySetting: ApplySetting = (field, value) => {
 		const spec = SETTINGS.find((candidate) => candidate.field === field);
-		const next = saveConfig({ [field]: value === spec?.on });
+		if (!spec) return;
+		const saved = "on" in spec ? value === spec.on : numberSettingValue(spec.field, Number.parseInt(value, 10));
+		if (saved === undefined) return;
+		const next = saveConfig({ [field]: saved });
 		try {
 			pi.events.emit(CONFIG_CHANNEL, next);
 		} catch {

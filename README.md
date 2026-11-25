@@ -180,7 +180,7 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 - 直接 events 命令：只有 stdout 是事件流；stderr 写进文件，不触发唤醒。source observer 默认只观察未来 stdout；`watches[].stream` 可选 `stdout`/`stderr`/`both`，stderr 命中行在通知中带 `[stderr]` 前缀，但不会改变原命令的 event 语义
 - 退出、停止、超时都只发一条结束通知；completion 的超时通知说明后台时限（不是 `monitor expired`）；停止之后的输出会被丢弃
 - events 模式：空行不算事件；超长内容以 `...(truncated)` 截断
-- 日志按运行时隔离在 `$TMPDIR/pi-cc-monitor-*/`；目录 0700、文件 0600（POSIX）。只清理已关闭或确认所属进程已退出、且最后活动超过 3 天的目录；安静的活跃任务不清理。旧版无归属信息的扁平目录不自动删除
+- 日志和临时产物按运行时／任务隔离在 `<系统临时目录>/pi-cc-monitor-*/<任务ID>/`；目录 0700、文件 0600（POSIX）。每个任务有归属标记，订阅复用源任务目录。活跃、资源清理未确认、终态待交付或仍被订阅引用的产物不清理；旧版无归属信息的扁平目录不自动删除
 - 运行中日志写入错误不会崩溃 Pi；初始化失败会正常收尾，不会遗留假的 running 记录
 - WS 日志写积压超过 **4 MiB** 或发生写错误时，停止该日志流、标记 `logError` / `log incomplete`，但不因日志故障结束 socket 或改变事件观察。已有日志可能不完整，后续帧不再写入；需要恢复日志时请新建 Monitor，update 不会重启日志。4 MiB 限的是待写内存，不是日志文件大小
 - 日志降级只发一次 **context-only 基础设施告警**：即使 `notify.output=none` 也可见，不占普通事件计数/输出预算，不启动模型。`monitor_list` 和 `/tasks` 详情会保留日志不完整标记
@@ -191,6 +191,16 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 - `command` 直接运行主命令，后台化由 Monitor 负责；不要再套 `nohup` / `&`。stdin/PTY 交互、daemon 化或远程进程托管不属于本工具的生命周期保证
 - 父进程已退出但后台子进程继承 stdout/stderr 管道时，会优先等待正常 `close`；若管道在父进程 `exit` 后 5 秒仍未关闭，则脱离管道、flush 已排队日志并上报退出，让上层继续清理进程组。兜底之后到达的输出不保证写入日志
 - Monitor 是真实 Shell 入口，不是沙箱；只匹配 `bash` 工具名的权限插件需要同时覆盖 Monitor。通知和日志是外部数据，不是用户指令或对问题的回答
+
+## 产物回收与日志限额
+
+默认单任务 stdout + stderr **合计最多 20 MiB**（包含归档）。命令的两条流各分一半预算；WebSocket 只有一条日志，使用完整任务预算。每条流最多两个分段：`<ID>.out.log.1` / `<ID>.out.log`（stderr 同理），顺序是 **归档在前、当前在后**。当前路径只代表最新分段；读取保留下来的输出时也要查看 `.1`。轮转不会停止任务，也不会裁剪观察者的事件输入；真正丢弃旧输出时，回执／终态详情和面板显示 `logTruncated`，不能再当作完整日志。
+
+任务结束、资源释放且终态交付后，至少留 **10 分钟读取缓冲期**。默认 **3 天保留**，按任务结束／产物最后写入时间计算，不必等待整个 Pi 会话关闭。安全可回收产物共用 **200 MiB 软预算**：超过预算时先回收最旧的已结束产物。受保护数据不受强制删除，实际磁盘占用可能暂时超过预算。会话启动、任务收尾（合并短时间内的请求）、设置变更及每 **30 分钟**检查一次；关闭／重载时停止检查定时器。
+
+启动回执的 `artifactDir` 是可回收工作区，命令中用 `$PI_MONITOR_ARTIFACT_DIR` 访问。临时验证脚本、中间 JSON 等放在这里，任务工作目录仍是项目目录，`TMPDIR` 也不被改写。**正式构建产物、检查点和用户文件应留在该目录之外。** 回收后 `monitor_list` / `/tasks` 明确显示 `logRemoved` / artifacts reclaimed；清理失败不改变任务结果。
+
+配置原子写入也使用设置文件旁的自有标记目录，正常立即回收；异常残留沿用安全的过期／预算回收。不扫描任意 `*.tmp`，不删除设置文件、Pi 会话记录或其他插件／其他系统用户的数据，不跟随待清理项中的符号链接（配置的临时目录允许系统路径别名，如 macOS 的 `/tmp`）。初始化失败只回滚尚未交给任务使用的新目录。没有启动 Pi 时不会独立运行清理服务；历史目录在下次会话启动时回收。
 
 ## 渲染
 
@@ -220,7 +230,7 @@ completion 的默认期限是 30 分钟。长构建／测试应把 `timeout_ms` 
 │ stdout: Build completed successfully.
 │
 └ Logs
-  stdout: /tmp/pi-cc-monitor/job12345/stdout.log
+  stdout: <tmp>/pi-cc-monitor-XXXXXX/job12345/job12345.out.log
 ```
 
 标题按原因分：`Monitor`（有事件）、`Monitor Ended`（命令退出）、`Monitor Expired`（events 超时；completion 超时改用后台时限措辞，不叫 expired）、
@@ -271,7 +281,15 @@ fullscreen 的 viewport 输入（`tui.handleViewportInput`），在一个只含�
 
 ## /monitor_settings
 
-本包独立提供 `/monitor_settings`，只显示 **Message style** 和 **Footer summary**。TUI 中上下键选择、Enter/空格切换、Esc 关闭，改动立即生效；RPC 中不带参数输出摘要，也可用上述文字命令，不打开终端组件。
+本包独立提供 `/monitor_settings`：**Message style**、**Footer summary**、**Artifact retention**、**Task log limit**、**Artifact budget**。TUI 中上下键选择、Enter/空格切换预设、Esc 关闭；RPC 中不带参数输出摘要，也支持文字命令。保留时间／回收预算即时影响后续清理；单任务日志上限应用于新任务，不重启已有工作。
+
+```text
+/monitor_settings retention 3  # 天，范围 1–30
+/monitor_settings logs 20      # MiB，范围 1–1024
+/monitor_settings budget 200   # MiB，范围 1–10240
+```
+
+对应独立配置字段 `logRetentionDays`、`logMaxMiB`、`logBudgetMiB`；环境覆盖为 `PI_MONITOR_LOG_RETENTION_DAYS`、`PI_MONITOR_LOG_MAX_MIB`、`PI_MONITOR_LOG_BUDGET_MIB`，有效正整数覆盖文件但不保存。Loop 不拥有或读取这些设置。
 
 配置路径跟随 `PI_CODING_AGENT_DIR`。新文件缺失时继承旧 `pi-cc.json` 中本包的有效字段，首次保存把这些选择带入新文件；已有新文件不会被旧值覆盖，旧文件不修改、不删除。`PI_CC_CONFIG_FILE` 显式指定路径时不回读旧文件。
 

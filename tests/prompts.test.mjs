@@ -5,7 +5,9 @@ import { loadModule } from "./helpers.mjs";
 const { MONITOR_DESCRIPTION, MONITOR_PROMPT_GUIDELINES, MONITOR_TIMEOUTS } = await loadModule("prompts.ts");
 
 test("completion contract keeps strong waiting and verification rules without unconditional handoff", () => {
-	assert.equal(MONITOR_PROMPT_GUIDELINES.length, 5);
+	assert.equal(MONITOR_PROMPT_GUIDELINES.length, 6);
+	assert.match(MONITOR_DESCRIPTION, /logTruncated/);
+	assert.match(MONITOR_PROMPT_GUIDELINES[5], /disposable helper scripts/);
 	assert.match(MONITOR_DESCRIPTION, /LAUNCH RECEIPT, not a result/);
 	assert.match(MONITOR_DESCRIPTION, /Continue independent work/);
 	assert.match(MONITOR_DESCRIPTION, /If only waiting for Monitor, end your turn/);

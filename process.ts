@@ -9,7 +9,7 @@
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { finished } from "node:stream/promises";
-import fs from "node:fs";
+import { createBoundedLog } from "./bounded-log.ts";
 
 export interface SpawnOptions {
 	command: string;
@@ -21,6 +21,10 @@ export interface SpawnOptions {
 	commandTransport: "argv" | "stdin";
 	stdoutPath: string;
 	stderrPath: string;
+	/** Combined stdout/stderr disk limit, including rotation archives. */
+	maxLogBytes?: number;
+	onLogTruncated?: () => void;
+	onLogError?: (error: Error) => void;
 	onStdout: (chunk: Buffer) => void;
 	onStderr: (chunk: Buffer) => void;
 	onExit: (code: number | null, signal: NodeJS.Signals | null) => void;
@@ -36,13 +40,15 @@ export const KILL_CONFIRMATION_MS = 1000;
 export const EXIT_STDIO_GRACE_MS = 5000;
 
 export function spawnMonitor(options: SpawnOptions): ChildProcess {
-	const stdoutStream = fs.createWriteStream(options.stdoutPath, { flags: "a", mode: 0o600 });
-	const stderrStream = fs.createWriteStream(options.stderrPath, { flags: "a", mode: 0o600 });
+	const maxBytes = Math.max(2, Math.floor((options.maxLogBytes ?? 20 * 1024 * 1024) / 2));
+	const stdoutStream = createBoundedLog(options.stdoutPath, { maxBytes, onTruncate: options.onLogTruncated });
+	const stderrStream = createBoundedLog(options.stderrPath, { maxBytes, onTruncate: options.onLogTruncated });
 	// The logs are a copy for the read tool; losing them (a full disk, a deleted
 	// temp dir, too many open files) must not end the watch. A stream "error"
 	// without a listener is an uncaught exception, and Pi exits on those.
-	stdoutStream.on("error", () => {});
-	stderrStream.on("error", () => {});
+	const logError = (error: Error) => { try { options.onLogError?.(error); } catch { /* logging cannot fail the process */ } };
+	stdoutStream.on("error", logError);
+	stderrStream.on("error", logError);
 
 	const useStdin = options.commandTransport === "stdin";
 	let child: ChildProcess;

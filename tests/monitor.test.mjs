@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Writable } from "node:stream";
 import test from "node:test";
 import { assertJsonRoundTrip, jsonSchemaProblems, loadModule, loadValidators, unsupportedTypeboxUsages } from "./helpers.mjs";
 
 const mod = await loadModule("index.ts");
 const stream = await loadModule("stream.ts");
+const { BoundedLog } = await loadModule("bounded-log.ts");
 const factory = mod.default;
 // Use the installation's engine: TypeBox before 1.5.0, pi-schema since 1.5.0.
 const { compile, validateToolArguments, engine } = await loadValidators();
@@ -446,23 +446,9 @@ test("a completion's terminal tail waits for log writes that lag behind the chil
 	// queued in its log streams. The old code called onExit synchronously on
 	// `close` and read a mid-stream file as the final tail, losing the last
 	// lines; the fix waits for both streams to finish before reporting.
-	const savedCreate = fs.createWriteStream;
-	fs.createWriteStream = (...args) => {
-		const real = savedCreate.apply(fs, args);
-		real.on("error", () => {});
-		const slow = new Writable({
-			write(chunk, _encoding, callback) {
-				setTimeout(() => {
-					real.write(chunk, () => {});
-					callback();
-				}, 5);
-			},
-			final(callback) {
-				real.end(() => callback());
-			},
-		});
-		slow.on("error", () => {});
-		return slow;
+	const savedWrite = BoundedLog.prototype._write;
+	BoundedLog.prototype._write = function (chunk, encoding, callback) {
+		setTimeout(() => savedWrite.call(this, chunk, encoding, callback), 5);
 	};
 	try {
 		const armed = await h.tools.get("Monitor").execute(
@@ -487,7 +473,7 @@ test("a completion's terminal tail waits for log writes that lag behind the chil
 			"the exit was reported only after the log was fully written",
 		);
 	} finally {
-		fs.createWriteStream = savedCreate;
+		BoundedLog.prototype._write = savedWrite;
 	}
 });
 
@@ -659,29 +645,30 @@ test("a WebSocket log-open failure is failed, never a zombie running record", as
 
 test("a ws monitor's log is closed when the watch ends, or never starts", async () => {
 	const saved = globalThis.WebSocket;
-	const savedCreate = fs.createWriteStream;
+	const savedConstruct = BoundedLog.prototype._construct;
 	const streams = [];
-	fs.createWriteStream = (...args) => {
-		const stream = savedCreate.apply(fs, args);
-		streams.push(stream);
-		return stream;
+	BoundedLog.prototype._construct = function (callback) {
+		streams.push(this);
+		savedConstruct.call(this, callback);
 	};
 	try {
 		const fake = fakeWebSocket();
 		globalThis.WebSocket = fake.WebSocket;
 		const h = await start(makeHarness());
-		await h.tools.get("Monitor").execute("c", { ws: { url: "ws://x.example/feed" }, description: "feed" }, undefined, undefined, h.ctx);
-		assert.equal(streams.length, 1);
-		assert.equal(streams[0].writableEnded, false, "open while the watch runs");
+		const armed = await h.tools.get("Monitor").execute("c", { ws: { url: "ws://x.example/feed" }, description: "feed" }, undefined, undefined, h.ctx);
+		const root = path.dirname(path.dirname(armed.details.outputPath));
+		const own = () => streams.filter((item) => path.dirname(path.dirname(item.file)) === root);
+		assert.ok(await waitFor(() => own().length === 1), "this runtime's Writable construction completed");
+		assert.equal(own()[0].writableEnded, false, "open while the watch runs");
 		fake.sockets[0].close();
-		assert.equal(streams[0].writableEnded, true, "closed with the socket");
+		assert.equal(own()[0].writableEnded, true, "closed with the socket");
 
 		globalThis.WebSocket = fakeWebSocket({ constructError: new Error("bad url") }).WebSocket;
 		await assert.rejects(() => h.tools.get("Monitor").execute("c", { ws: { url: "ws://x.example/feed" }, description: "feed" }, undefined, undefined, h.ctx));
-		assert.equal(streams.length, 2);
-		assert.equal(streams[1].writableEnded, true, "a socket that never opened leaves no log open");
+		assert.ok(await waitFor(() => own().length === 2));
+		assert.equal(own()[1].writableEnded, true, "a socket that never opened leaves no log open");
 	} finally {
-		fs.createWriteStream = savedCreate;
+		BoundedLog.prototype._construct = savedConstruct;
 		globalThis.WebSocket = saved;
 	}
 });
@@ -1236,7 +1223,7 @@ test("another runtime never cleans up old-looking logs of a live persistent moni
 		command: "echo early; sleep 30", description: "quiet live owner", mode: "completion", persistent: true,
 	}, undefined, undefined, h.ctx);
 	assert.ok(await waitFor(() => fs.existsSync(armed.details.outputPath) && fs.readFileSync(armed.details.outputPath, "utf8").includes("early")));
-	const dir = path.dirname(armed.details.outputPath);
+	const dir = path.dirname(path.dirname(armed.details.outputPath));
 	const old = new Date(Date.now() - 4 * 86_400_000);
 	const ownerPath = path.join(dir, "owner.json");
 	const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
@@ -1277,7 +1264,8 @@ test("the tool description carries Claude Code's usage guidance", async () => {
 	for (const name of ["Monitor", "monitor_stop", "monitor_list"]) {
 		assert.ok(h.tools.get(name).promptSnippet, `${name} has a prompt snippet`);
 	}
-	assert.equal(tool.promptGuidelines.length, 5);
+	assert.equal(tool.promptGuidelines.length, 6);
+	assert.ok(tool.promptGuidelines[5].includes("PI_MONITOR_ARTIFACT_DIR"));
 	assert.ok(tool.promptGuidelines[0].includes("instead of foreground bash"));
 	assert.ok(tool.description.includes("cover the expected runtime"), "deadline guidance belongs to the tool contract");
 	assert.ok(!tool.promptGuidelines.join(" ").includes("1800000"), "the deadline is not duplicated in selection guidelines");
