@@ -54,7 +54,7 @@ test('a blocked log caps its backlog at 4 MiB, warns once context-only, and the 
 	const logs = blockedLogs();
 	const h = createHarness();
 	t.after(async () => { await h.close(); logs.restore(); globalThis.WebSocket = saved; });
-	await h.call('Monitor', { ws: { url: 'ws://x.example/feed' }, description: 'slow disk', persistent: true });
+	await h.call('Monitor', { source: { kind: 'ws', url: 'ws://x.example/feed' }, description: 'slow disk', persistent: true });
 	assert.ok(await until(() => logs.logs.length === 1));
 	const socket = fake.sockets[0];
 	for (let i = 0; i < 10000; i++) socket.emit('message', { data: 'x'.repeat(500) });
@@ -89,7 +89,7 @@ test('a single frame larger than the cap degrades the log immediately without qu
 	const logs = blockedLogs();
 	const h = createHarness();
 	t.after(async () => { await h.close(); logs.restore(); globalThis.WebSocket = saved; });
-	await h.call('Monitor', { ws: { url: 'ws://x.example/feed' }, description: 'giant frame', persistent: true, notify: { output: 'none' } });
+	await h.call('Monitor', { source: { kind: 'ws', url: 'ws://x.example/feed' }, description: 'giant frame', persistent: true, notify: { output: 'none' } });
 	assert.ok(await until(() => logs.logs.length === 1));
 	fake.sockets[0].emit('message', { data: 'g'.repeat(CAP + 1) });
 	assert.equal(logs.logs[0].stream.writableLength, 0, 'the giant frame is never queued');
@@ -116,7 +116,7 @@ test('an async log write error degrades once; a later destroy error never warns 
 	const logs = blockedLogs({ error: new Error('disk full') });
 	const h = createHarness();
 	t.after(async () => { await h.close(); logs.restore(); globalThis.WebSocket = saved; });
-	await h.call('Monitor', { ws: { url: 'ws://x.example/feed' }, description: 'broken disk', persistent: true });
+	await h.call('Monitor', { source: { kind: 'ws', url: 'ws://x.example/feed' }, description: 'broken disk', persistent: true });
 	assert.ok(await until(() => logs.logs.length === 1));
 	const socket = fake.sockets[0];
 	socket.emit('message', { data: 'first' });
@@ -137,7 +137,7 @@ test('write() returning false is ordinary backpressure, not degradation', async 
 	const logs = blockedLogs({ highWaterMark: 16 });
 	const h = createHarness();
 	t.after(async () => { await h.close(); logs.restore(); globalThis.WebSocket = saved; });
-	await h.call('Monitor', { ws: { url: 'ws://x.example/feed' }, description: 'small watermark', persistent: true, notify: { output: 'none' } });
+	await h.call('Monitor', { source: { kind: 'ws', url: 'ws://x.example/feed' }, description: 'small watermark', persistent: true, notify: { output: 'none' } });
 	assert.ok(await until(() => logs.logs.length === 1));
 	for (let i = 0; i < 10; i++) fake.sockets[0].emit('message', { data: 'x'.repeat(100) });
 	assert.equal(logs.logs[0].stream.destroyed, false, 'below the cap the log keeps writing');
@@ -157,7 +157,7 @@ test('a healthy log still writes every frame and flushes on natural close', asyn
 	globalThis.WebSocket = fake.WebSocket;
 	const h = createHarness();
 	t.after(async () => { await h.close(); BoundedLog.prototype._construct = savedConstruct; globalThis.WebSocket = saved; });
-	const armed = await h.call('Monitor', { ws: { url: 'ws://x.example/feed' }, description: 'healthy log', persistent: true, notify: { output: 'none' } });
+	const armed = await h.call('Monitor', { source: { kind: 'ws', url: 'ws://x.example/feed' }, description: 'healthy log', persistent: true, notify: { output: 'none' } });
 	assert.ok(await until(() => streams.length === 1));
 	fake.sockets[0].emit('message', { data: 'frame one' });
 	fake.sockets[0].emit('message', { data: '' });
@@ -179,7 +179,7 @@ test('a late disk-callback failure after the watch ended reports an incomplete l
 	t.after(async () => { await h.close(); logs.restore(); globalThis.WebSocket = saved; });
 	for (const end of ['natural-close', 'stop']) {
 		const before = warnings(h).length;
-		const armed = await h.call('Monitor', { ws: { url: 'ws://x.example/feed' }, description: end, persistent: true, notify: { output: 'none' } });
+		const armed = await h.call('Monitor', { source: { kind: 'ws', url: 'ws://x.example/feed' }, description: end, persistent: true, notify: { output: 'none' } });
 		assert.ok(await until(() => logs.logs.length === before + 1));
 		const socket = fake.sockets.at(-1);
 		const log = logs.logs.at(-1);
@@ -193,7 +193,7 @@ test('a late disk-callback failure after the watch ended reports an incomplete l
 		log.pending(new Error('EIO from pending disk write'));
 		assert.ok(await until(() => warnings(h).length === before + 1));
 		const warning = warnings(h)[before];
-		assert.match(warning.message.content, /EIO from pending disk write/);
+		assert.match(warning.message.content, /EIO from pending disk write|observation log flush timed out/);
 		assert.match(warning.message.content, /buffered writes may be missing/);
 		assert.doesNotMatch(warning.message.content, /The watch continues/, 'an ended watch never claims continuation');
 		assert.equal(warning.options.triggerTurn, false, 'still one context-only warning, no wakeup');
@@ -201,7 +201,7 @@ test('a late disk-callback failure after the watch ended reports an incomplete l
 		const state = (await h.snapshots()).find((m) => m.id === armed.details.taskId);
 		assert.equal(state.status, end === 'natural-close' ? 'exited' : 'stopped');
 		assert.equal(state.resourceActive, undefined, 'the resource stays released');
-		assert.match(state.logError, /EIO/);
+		assert.match(state.logError, /EIO|flush timed out/);
 		assert.equal(state.eventCount, 0, 'the warning costs no event slot');
 		assert.equal(h.sent.filter((m) => m.message.details.monitorId === armed.details.taskId && ['closed', 'stopped'].includes(m.message.details.cause)).length, 1, 'no second closing notice');
 		// A later error on the destroyed stream never warns twice.

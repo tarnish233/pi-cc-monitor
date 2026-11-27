@@ -363,6 +363,39 @@ test("a long multi-byte description rides in the one collapsed row", () => {
 	}
 });
 
+test("an external job's result is titled as the Monitor observation, not as the job", () => {
+	const job = state => ({
+		jobId: "train-01", runId: "attempt-1", runner: { name: "tmux", id: "train-01" },
+		manifestPath: "/runs/train-01/job.json", statusPath: "/runs/train-01/status.json", createdAt: 0, state,
+		...(state === "succeeded" ? { endedAt: 200000, exitCode: 0 } : { endedAt: 200000, exitCode: state === "cancelled" ? 0 : 7 }),
+	});
+	const cases = [
+		[{ state: "succeeded", icon: "\u2713", label: "Monitor Completed", stat: "job succeeded \u00b7 exit 0" }],
+		[{ state: "failed", icon: "\u2717", label: "Monitor Failed", stat: "job failed \u00b7 exit 7" }],
+		[{ state: "cancelled", icon: "\u26a0", label: "Monitor Cancelled", stat: "job cancelled \u00b7 exit 0" }],
+	];
+	for (const [{ state, icon, label, stat }] of cases) {
+		const { text } = render(eventMessage("monitor mon1 \u00b7 training result\n[external job report]", {
+			kind: "job", mode: "completion", cause: "job", status: "completed", job: job(state), createdAt: 0, endedAt: 200000,
+		}));
+		assert.match(text, new RegExp(`^ ${icon} ${label} mon1`), `${state}: ${text}`);
+		assert.doesNotMatch(text, /Job (Succeeded|Failed|Cancelled)/, `${state}: no job-as-monitor title`);
+		assert.ok(text.includes(stat), `${state}: the external job result stays data (${text})`);
+		// The narrow one-row card clips the duration, so only its start must remain.
+		assert.match(text, /observed 3m/);
+	}
+});
+
+test("a source gap is a live diagnostic, never a finished card", () => {
+	const { text } = render(eventMessage("monitor mon1 \u00b7 gap demo\n[Observation has source gaps]", {
+		kind: "file", mode: "events", cause: "source_gap", status: "running", createdAt: 0, endedAt: 60000,
+		notifyLevel: "context", sourceGap: true, outputPath: "/tmp/gap.log", stderrPath: "/tmp/gap.err",
+	}), true);
+	assert.match(text.trimStart(), /^\u26a0 Observation Gap mon1/);
+	assert.doesNotMatch(text, /observed 1m/, "the observation is still running, so it has no elapsed total");
+	assert.doesNotMatch(text, /cleanup pending at report/);
+});
+
 test("an exit code is the verdict, whichever mode reported it", () => {
 	// The same exit 0 must not be a green check in one mode and a square in another.
 	const exit = (mode, exitCode, extra = {}) =>
@@ -467,4 +500,59 @@ test("Monitor tools expose no custom shell or call/result renderer", () => {
 		assert.equal(tool.renderCall, undefined);
 		assert.equal(tool.renderResult, undefined);
 	}
+});
+
+for (const kind of ["file", "job"]) test(kind + " cards preserve different hosts for the same remote path", () => {
+	const cards = ["gpu-a", "gpu-b"].map(host => {
+		const source = kind === "file" ? { kind, host, stdout: "/work/run/stdout.log" } : { kind, host, manifest: "/work/run/job.json" };
+		const job = { jobId: "run", runId: "attempt", host, runner: { name: "tmux", id: "run" }, manifestPath: "/work/run/job.json", statusPath: "/work/run/status.json", state: "succeeded", exitCode: 0, createdAt: 0 };
+		const details = { kind, source, mode: kind === "job" ? "completion" : "events", cause: kind === "job" ? "job" : "output", ...(kind === "job" ? { job, stdoutTail: "RESULT", stderrTail: "" } : {}) };
+		const card = render(eventMessage("monitor mon1 · remote result\n[terminal]\nStatus: " + host + ":/work/run/status.json", details), true);
+		assert.ok(card.text.includes(host), card.text);
+		assert.match(card.text, /Source/);
+		assert.ok(card.text.includes(kind === "job" ? "/work/run/job.json" : "/work/run/stdout.log"), card.text);
+		return card.text;
+	});
+	assert.notEqual(cards[0], cards[1]);
+});
+
+test("bracketed user output stays in Output and DCS/APC control payloads are stripped", () => {
+	const structured = render(eventMessage("monitor mon1 · json feed\n[1, 2, 3]\n[PASS]\n\x1bPhidden-dcs\x1b\\[{\"ok\":true}]", {
+		kind: "ws",
+		mode: "events",
+		cause: "output",
+		notices: [],
+		outputLines: ["[1, 2, 3]", "[PASS]", "\x1bPhidden-dcs\x1b\\[{\"ok\":true}]"],
+	}), true);
+	const status = structured.text.slice(structured.text.indexOf("Status"), structured.text.indexOf("Events"));
+	const output = structured.text.slice(structured.text.indexOf("Output"));
+	assert.doesNotMatch(status, /\[1, 2, 3\]|\[PASS\]/);
+	assert.match(output, /\[1, 2, 3\]/);
+	assert.match(output, /\[PASS\]/);
+	assert.match(output, /\[\{"ok":true\}\]/);
+	assert.doesNotMatch(structured.text, /hidden-dcs/);
+
+	const legacy = render(eventMessage("monitor mon1 · legacy json\n[1, 2, 3]\n[PASS]", {
+		kind: "file",
+		mode: "events",
+		cause: "output",
+	}), true);
+	assert.match(legacy.text.slice(legacy.text.indexOf("Output")), /\[1, 2, 3\]/);
+});
+
+test("job terminal notices in events mode stay in Status rather than Output", () => {
+	const card = render(eventMessage("monitor mon1 · job watch\n[External job j1 / r1: succeeded, exit code 0.]\nThis is a validated status-file report, not an independent OS audit.\nStatus: /runs/j1/status.json", {
+		kind: "job",
+		mode: "events",
+		cause: "job",
+		status: "completed",
+		notices: [
+			"[External job j1 / r1: succeeded, exit code 0.]",
+			"This is a validated status-file report, not an independent OS audit.",
+			"Status: /runs/j1/status.json",
+		],
+		outputLines: [],
+	}), true);
+	assert.match(card.text, /validated status-file report/);
+	assert.equal(card.text.includes("Output"), false, "status-file prose must not appear as job Output");
 });

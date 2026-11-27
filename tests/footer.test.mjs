@@ -1,157 +1,51 @@
-/**
- * The footer chip: `N monitor(s)` while monitors run, in the format of
- * pi-cc-loop's chip (`2 loops · next 3m`). Claude Code shows the same count in
- * its footer pill ("2 monitors") and nothing when none is running. It shares
- * one line with every other extension's status, so it is plain text and only
- * repainted when the count changes.
- *
- * Every test shuts the session down at the end: it kills the monitors' child
- * processes, which would otherwise outlive the test run.
- */
-import assert from "node:assert";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import test from "node:test";
-import { loadModule } from "./helpers.mjs";
-
-const mod = await loadModule("index.ts");
-
-function makeHarness() {
-	const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cc-monitor-footer-"));
-	const tools = new Map();
-	const commands = new Map();
-	const handlers = new Map();
-	const bus = new Map();
-	const statusCalls = [];
-	const pi = {
-		registerCommand(name, command) { commands.set(name, command); },
-		registerTool(tool) {
-			tools.set(tool.name, tool);
-		},
-		registerMessageRenderer() {},
-		registerToolRenderer() {},
-		on(event, handler) {
-			handlers.set(event, handler);
-			return () => handlers.delete(event);
-		},
-		appendEntry() {},
-		sendUserMessage() {},
-		sendMessage() {},
-		events: {
-			emit(channel, data) { bus.get(channel)?.(data); },
-			on(channel, handler) {
-				bus.set(channel, handler);
-				return () => bus.delete(channel);
-			},
-		},
-		getAllTools() {
-			return [...tools.keys()].map((name) => ({ name }));
-		},
-	};
-	const ctx = {
-		ui: {
-			notify() {},
-			setWidget() {},
-			setStatus: (key, text) => statusCalls.push([key, text]),
-			theme: { fg: (_c, t) => t },
-		},
-		hasUI: true,
-		cwd: workdir,
-		sessionManager: { getEntries: () => [] },
-		isIdle: () => true,
-		hasPendingMessages: () => false,
-	};
-	mod.default(pi);
-	const monitorCalls = () => statusCalls.filter(([key]) => key === "monitor");
-	return {
-		bus,
-		monitorCalls,
-		exec: (name, params) => tools.get(name).execute("c", params, undefined, undefined, ctx),
-		/** What the footer shows for this extension right now. */
-		status: () => monitorCalls().at(-1)?.[1],
-		command: (args) => commands.get("monitor_settings").handler(args, ctx),
-		start: () => handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx),
-		shutdown: () => handlers.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, ctx),
-	};
+/** Existing footer behavior, exercised through observation-only sources. */
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { loadModule } from './helpers.mjs';
+import { createJob } from './observation-fixtures.mjs';
+const { default: factory } = await loadModule('index.ts');
+function harness(t) {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-footer-'));
+  const tools = new Map(), commands = new Map(), handlers = new Map(), calls = [], bus = new Map();
+  const pi = { registerTool: tool => tools.set(tool.name, tool), registerCommand: (name, spec) => commands.set(name, spec), registerMessageRenderer() {}, registerToolRenderer() {}, appendEntry() {}, sendMessage() {},
+    getAllTools: () => [...tools.keys()].map(name => ({ name })), getCommands: () => [],
+    on(name, fn) { const list = handlers.get(name) ?? []; list.push(fn); handlers.set(name, list); return () => { const index = list.indexOf(fn); if (index >= 0) list.splice(index, 1); }; },
+    events: { on(name, fn) { bus.set(name, fn); return () => { if (bus.get(name) === fn) bus.delete(name); }; }, emit: (name, value) => bus.get(name)?.(value) } };
+  const ctx = { cwd, hasUI: true, mode: 'rpc', ui: { notify() {}, setStatus: (key, value) => calls.push([key, value]) }, isIdle: () => true, sessionManager: { getEntries: () => [] } };
+  factory(pi);
+  const emit = async name => { for (const fn of handlers.get(name) ?? []) await fn({ reason: name === 'session_start' ? 'startup' : 'quit' }, ctx); };
+  const call = (name, args) => tools.get(name).execute('fixture', args, undefined, undefined, ctx);
+  t.after(async () => { await emit('session_shutdown'); fs.rmSync(cwd, { recursive: true, force: true }); });
+  return { cwd, calls, call, emit, bus, status: () => calls.filter(([key]) => key === 'monitor').at(-1)?.[1], count: () => calls.filter(([key]) => key === 'monitor').length,
+    settings: args => commands.get('monitor_settings').handler(args, ctx), source: () => createJob(cwd).fileSource };
 }
-
-async function waitFor(predicate, timeoutMs = 5000) {
-	const start = Date.now();
-	while (Date.now() - start < timeoutMs) {
-		if (predicate()) return true;
-		await new Promise((resolve) => setTimeout(resolve, 25));
-	}
-	return false;
-}
-
-const forever = (description) => ({ command: "sleep 30", description, persistent: true });
-
-test("the footer counts running monitors with CC-style pluralization and disappears at zero", async () => {
-	const h = makeHarness();
-	await h.start();
-	try {
-		assert.equal(h.monitorCalls().length, 0, "nothing running, nothing shown");
-		const first = await h.exec("Monitor", forever("first"));
-		assert.equal(h.status(), "1 monitor");
-		const second = await h.exec("Monitor", forever("second"));
-		assert.equal(h.status(), "2 monitors");
-		await h.exec("monitor_stop", { id: first.details.taskId });
-		assert.equal(h.status(), "1 monitor");
-		await h.exec("monitor_stop", { id: second.details.taskId });
-		assert.equal(h.status(), undefined, "cleared when the last one stops");
-
-		await h.exec("Monitor", { command: "printf 'done\\n'", description: "short" });
-		assert.equal(h.status(), "1 monitor");
-		assert.ok(await waitFor(() => h.status() === undefined), "a monitor that exits on its own drops out");
-	} finally {
-		await h.shutdown();
-	}
+async function until(predicate) { const end = Date.now() + 5000; while (Date.now() < end) { if (predicate()) return true; await new Promise(r => setTimeout(r, 10)); } return false; }
+test('footer counts observations and disappears after the last observation ends', async t => {
+  const h = harness(t); await h.emit('session_start'); assert.equal(h.count(), 0);
+  const a = (await h.call('Monitor', { source: h.source(), description: 'first', persistent: true })).details; assert.equal(h.status(), '1 monitor');
+  const b = (await h.call('Monitor', { source: h.source(), description: 'second', persistent: true })).details; assert.equal(h.status(), '2 monitors');
+  await h.call('monitor_stop', { id: a.taskId }); assert.equal(h.status(), '1 monitor'); await h.call('monitor_stop', { id: b.taskId }); assert.equal(h.status(), undefined);
+  await h.call('Monitor', { source: createJob(h.cwd, { state: 'succeeded' }).source, description: 'finished run' }); assert.ok(await until(() => h.status() === undefined));
 });
-
-test("the chip repaints only when the count changes", async () => {
-	const h = makeHarness();
-	await h.start();
-	try {
-		await h.exec("Monitor", {
-			command: "for i in 1 2 3; do echo line$i; sleep 0.1; done; sleep 30",
-			description: "chatty",
-			persistent: true,
-		});
-		const calls = h.monitorCalls().length;
-		await new Promise((resolve) => setTimeout(resolve, 800));
-		await h.exec("monitor_list", {});
-		assert.equal(h.monitorCalls().length, calls, "events and listing leave the footer alone");
-	} finally {
-		await h.shutdown();
-	}
+test('output and listing do not repaint an unchanged footer count', async t => {
+  const h = harness(t); await h.emit('session_start'); const job = createJob(h.cwd, { stdout: 'one\ntwo\n' });
+  await h.call('Monitor', { source: job.fileSource, description: 'chatty', persistent: true }); const count = h.count();
+  await new Promise(r => setTimeout(r, 600)); await h.call('monitor_list', {}); assert.equal(h.count(), count);
 });
-
-test("/monitor_settings footer changes the live chip immediately", async () => {
-	const file = process.env.PI_CC_CONFIG_FILE;
-	const before = fs.readFileSync(file, "utf8");
-	const h = makeHarness();
-	await h.start();
-	try {
-		await h.exec("Monitor", forever("first"));
-		assert.equal(h.status(), "1 monitor");
-		await h.command("footer off");
-		assert.equal(h.status(), undefined, "footer off hides it");
-		await h.exec("Monitor", forever("second"));
-		assert.equal(h.status(), undefined, "and keeps it hidden");
-		await h.command("footer on");
-		assert.equal(h.status(), "2 monitors", "back on, with the current count");
-	} finally {
-		fs.writeFileSync(file, before);
-		await h.shutdown();
-	}
+test('footer settings immediately affect the active observation count', async t => {
+  const file = process.env.PI_CC_CONFIG_FILE, before = fs.readFileSync(file, 'utf8'); t.after(() => fs.writeFileSync(file, before));
+  const h = harness(t); await h.emit('session_start'); await h.call('Monitor', { source: h.source(), description: 'first', persistent: true }); assert.equal(h.status(), '1 monitor');
+  await h.settings('footer off'); assert.equal(h.status(), undefined); await h.call('Monitor', { source: h.source(), description: 'second', persistent: true }); assert.equal(h.status(), undefined);
+  await h.settings('footer on'); assert.equal(h.status(), '2 monitors');
 });
-
-test("shutdown clears the chip, so a reload leaves no stale count", async () => {
-	const h = makeHarness();
-	await h.start();
-	await h.exec("Monitor", forever("first"));
-	assert.equal(h.status(), "1 monitor");
-	await h.shutdown();
-	assert.equal(h.status(), undefined);
+test('shutdown clears the footer without cancelling the source', async t => {
+  const h = harness(t); await h.emit('session_start'); const source = h.source(); await h.call('Monitor', { source, description: 'active', persistent: true }); assert.equal(h.status(), '1 monitor');
+  assert.equal(h.bus.has('loop:stopped'), true); assert.equal(h.bus.has('loop:adopt-observations'), true);
+  assert.equal(h.bus.has('pi-cc:monitor:observation-link'), true);
+  await h.emit('session_shutdown'); assert.equal(h.status(), undefined); assert.equal(fs.existsSync(source.stdout), true);
+  assert.equal(h.bus.has('loop:stopped'), false); assert.equal(h.bus.has('loop:adopt-observations'), false);
+  assert.equal(h.bus.has('pi-cc:monitor:observation-link'), false);
 });

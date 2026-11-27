@@ -1,6 +1,44 @@
 # Changelog — pi-cc-monitor
 
-## [Unreleased]
+## [0.18.0] - 2026-11-27
+
+### Breaking
+- Make Monitor observation-only: typed file, external job manifest/status and WebSocket sources replace command execution, top-level ws and source.monitorId inputs. No legacy execution bridge or automatic task handoff.
+- Separate observation status/IDs from the external writer's job/run identity, state and exit result; stop, timeout, loop retirement, reload and process exit close only observation resources.
+
+### Added
+- Runner-neutral pi-cc-job v1 manifest/status contract, immutable attempt IDs, bounded regular-file readers and a fixed read-only SSH transport with stdin data, deadlines and idle lease.
+- Native-runner usage examples and an optional ordinary exit/status recorder, not a runner or daemon. Business scripts/logs/checkpoints remain outside disposable Monitor storage.
+
+### Changed
+- Advertise the private observation-only link by version, require a real binding reply instead of detecting `cron_delete`, and stop new observations by activity ID only. A peer that cannot bind leaves the observation independent.
+- Share the session-local terminal outbox source with Loop. Extract the task panel projection and label observation status separately from reported job state.
+- Preserve the existing panel/layout, notifications, output budgets, bounded copy logs and ownership-checked GC; adapt only data fields and stop vocabulary to observations.
+- Keep tool schemas and runtime validation in one contract: the timeout maximum follows the selected mode, completion requires a job source, updates cannot carry a source, and WebSocket URLs carry the same length/ASCII/userinfo rules the runtime enforces. A completion job is labelled `task` in the task panel again; events sources stay `watcher`.
+- Derive receipts and `monitor_list` snapshots from one shared field set, stop allocating event line buffers in completion mode, share the observation-copy backlog constant, and collapse the always-true ending flag plus the duplicate stop path.
+- Document the bounded polling/catch-up behaviour and the few seconds a remote `monitor_stop` may take while it confirms local cleanup.
+- Update core/static tool contracts and unit fixtures; no Runner settings, shared configuration registry, automatic job restart or Pi background-session supervisor.
+- Keep cards and the task panel unchanged while showing external job exit results, prioritizing failed-job stderr and labelling connection duration as observed time; add an isolated offline TUI lifecycle fixture excluded from npm packages.
+- Title a job-result card `Monitor Completed`, `Monitor Failed` or `Monitor Cancelled` like every other card: the observation owns the notification, and the external job state/exit remain visible in its stats and sections. Legacy completion records read the same `Monitor Completed`, so a successful finish is one word from new cards through saved history; a watcher's own process exit stays `Monitor Ended` because that is not a task result.
+- Treat `sourceGap` as a mid-observation diagnostic in both the card and the expanded identity line: it no longer gets a finished card's elapsed time or cleanup state.
+- Yield about 15 ms before re-arming a stream that is still catching up, so sustained fast logs cannot spin the event loop; document that `from: "now"` skips only bytes that existed when the observation was armed.
+
+### Fixed
+- Keep retrying terminal handoffs after a synchronous publish rejection even without a lifecycle event. An explicitly idle batch whose final handoff failed gets one guarded wake retry; all other fallback deliveries only append context.
+- Stop new Loop-bound observations by stable activity identity only; task text alone cannot stop a new observation. Encode deliberate no-affinity as null in private asynchronous details, so independent/detached observations cannot borrow another Loop through task text. Preserve the existing binding channels, tool parameters/receipts, notification policy and external-job lifecycle.
+- Retain and grow the verified 64-byte cursor window across short appends, so same-inode rewrites cannot evade the guard merely because the most recent chunk was small; cover local/SSH and terminal drain paths.
+- Ignore stdin errors from closed or released SSH helpers rather than rejecting a new connection's read or signalling its helper.
+- Honor Loop's internal initial-attempt binding and group-only stops before a wakeup exists, carry ownership in asynchronous messages, reject retired rebindings before allocating resources, and unsubscribe inter-extension callbacks on shutdown. External jobs remain untouched.
+- Preserve pending tail relocations across drain-budget yields, so slow SSH/filesystem reads recover from rewrite, rotation, truncation and excessive backlog and still deliver terminal results.
+- Reject permission/transport failures that prevent a from:now baseline; only confirmed missing files may later replay from their start.
+- Keep validated job results in model-visible content when observation cleanup is unconfirmed, preserve the original outcome on cleanup retries, and release disposed runtime ownership/backstops on late I/O or copy-close completion.
+- Forward cancellation received during recorder startup after the child is assigned, so TERM/checkpoint handling runs before grace escalation.
+- Include remote host and source identity in cards, task details, receipts and list text; accept safe compressed IPv6 SSH destinations.
+- Add offline slow-read, cleanup-failure, late-shutdown, host-display and recorder-startup regressions.
+- Drain a burst instead of jumping to the tail: each stream may read up to 8 chunks (512 KiB, ~50 ms) per tick, an unfinished stream is re-armed immediately, and terminal reports finish the remaining tail before publishing. Only a backlog above 8 MiB resumes from the retained tail, which now also raises one immediate throttled context notice so the observer learns about `sourceGap` before the observation ends.
+- Remove an unpublished observation whose setup failed once its resources are actually released; keep it listed with its real status only while cleanup is unconfirmed, and close a failed WebSocket copy before discarding the record.
+- Report missing, malformed, replaced, stale or mismatched metadata as unknown instead of inferring a job result from EOF or an observation failure.
+- Mark timed-out copy flushes incomplete and keep lifecycle callbacks/SSH helper cleanup safe after shutdown or PID release.
 
 ## [0.17.0] - 2026-11-25
 

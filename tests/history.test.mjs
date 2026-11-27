@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { loadModule } from "./helpers.mjs";
 import { createHarness, startReady, until } from "./runtime-harness.mjs";
+import { createJob } from "./observation-fixtures.mjs";
 
 const { ENDED_MONITOR_HISTORY_LIMIT } = await loadModule("index.ts");
 
@@ -10,7 +11,7 @@ test("terminal history is bounded only after every outcome is delivered, without
 	t.after(() => h.close());
 	const active = await startReady(h);
 	const receipts = await Promise.all(Array.from({ length: ENDED_MONITOR_HISTORY_LIMIT + 1 }, (_, index) =>
-		h.call("Monitor", { command: ":", description: `history ${index}`, mode: "completion" }).then((result) => result.details),
+		h.call("Monitor", { source: createJob(h.cwd, { state: "succeeded" }).source, description: `history ${index}`, mode: "completion" }).then((result) => result.details),
 	));
 
 	const completedBeforeFlush = await until(async () => {

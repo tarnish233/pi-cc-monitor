@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 import { findPiInstall, loadModule } from "./helpers.mjs";
+import { createJob } from "./observation-fixtures.mjs";
 
 const { default: factory } = await loadModule("index.ts");
 const installed = findPiInstall();
@@ -51,7 +52,7 @@ function harness(t) {
 		registerMessageRenderer: () => {},
 		registerToolRenderer: () => {},
 		getSettings: () => ({ shellPath: process.platform === "win32" ? undefined : "/bin/bash" }),
-		getAllTools: () => [...tools.keys(), "cron_delete"].map(name => ({ name })),
+		getAllTools: () => [...tools.keys()].map(name => ({ name })),
 		on: (key, fn) => add(handlers, key, fn),
 		events: {
 			on: (key, fn) => add(bus, key, fn),
@@ -71,6 +72,7 @@ function harness(t) {
 		// Pi's public helper counts user queues, not custom messages.
 		hasPendingMessages: () => session.pendingMessageCount > 0,
 	};
+	pi.events.on("loop:bind-observation", request => { request.acceptedVersion = 1; request.observationGroup = "completion-fixture-loop"; });
 	factory(pi);
 	const errors = [];
 	// Exercise Pi's actual boundary composition, validation and persistence,
@@ -133,17 +135,17 @@ function harness(t) {
 }
 
 async function finished(h, extra = {}) {
-	const receipt = await h.tools.get("Monitor").execute("run", {
-		command: "echo done", mode: "completion", description: "delivery regression", ...extra,
+	const job = createJob(h.ctx.cwd, { state: "succeeded", stdout: "done\n" });
+	const receipt = await h.tools.get("Monitor").execute("observe", {
+		source: job.source, mode: "completion", description: "delivery regression", ...extra,
 	}, undefined, undefined, h.ctx);
-	const until = Date.now() + 5000;
-	while (Date.now() < until) {
+	const deadline = Date.now() + 5000;
+	while (Date.now() < deadline) {
 		const list = await h.tools.get("monitor_list").execute("list", {}, undefined, undefined, h.ctx);
-		const expected = extra.mode === "events" ? "exited" : "completed";
-		if (list.details.monitors.find(item => item.id === receipt.details.taskId)?.status === expected) return receipt;
+		if (list.details.monitors.find(item => item.id === receipt.details.taskId)?.status === "completed") return receipt;
 		await new Promise(resolve => setTimeout(resolve, 10));
 	}
-	throw new Error("The command did not finish");
+	throw new Error("The external result was not observed");
 }
 
 test("events terminal outbox survives real Pi clearQueue and aborted settlement", async t => {
@@ -302,6 +304,54 @@ test("a failed boundary publish stays protected and never requests an empty cont
 	assert.equal(h.entries().length, 1);
 });
 
+test("an idle completion retries repeated synchronous rejections with no lifecycle event", async t => {
+	const h = harness(t);
+	h.session._isAgentRunActive = false;
+	const send = h.pi.sendMessage;
+	const attempts = [];
+	h.pi.sendMessage = (message, options) => {
+		attempts.push(options.triggerTurn);
+		if (attempts.length <= 2) throw new Error("fixture: host temporarily unavailable");
+		send(message, options);
+	};
+	await finished(h);
+	assert.equal(await delivered(h), 1);
+	assert.deepEqual(attempts, [true, false, false]);
+	assert.equal(h.starts.length, 0, "retry appends context without starting a turn");
+	assert.equal(h.entries().length, 1);
+});
+
+for (const boundary of ["idle", "new run", "abort", "cancelled tree", "cancelled compaction"]) test(`Monitor’s rejected batch wake respects the ${boundary} boundary`, async t => {
+	const h = harness(t);
+	const first = (await finished(h)).details.taskId;
+	const last = (await finished(h)).details.taskId;
+	const send = h.pi.sendMessage, attempts = [];
+	h.pi.sendMessage = (message, options) => {
+		attempts.push([message.details.monitorId, options.triggerTurn]);
+		if (attempts.length === 2) throw new Error("transient failure of the batch wake");
+		send(message, options);
+	};
+	h.session._isAgentRunActive = false;
+	await h.emit("agent_settled", { aborted: false });
+	assert.deepEqual(attempts, [[first, false], [last, true]]);
+	assert.equal(h.entries().length, 1);
+	assert.equal(h.starts.length, 0);
+	if (boundary === "abort" || boundary === "new run") {
+		await h.emit("agent_start", {});
+		if (boundary === "abort") await h.emit("agent_settled", { aborted: true });
+	} else if (boundary === "cancelled tree") {
+		await h.emit("session_before_tree", {});
+	} else if (boundary === "cancelled compaction") {
+		await h.emit("session_before_compact", { reason: "manual" });
+	}
+	const end = Date.now() + 3000;
+	while (h.entries().length < 2 && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 10));
+	assert.deepEqual(h.entries().map(entry => entry.details.monitorId), [first, last], "both facts are in Pi’s tree once, in order");
+	assert.deepEqual(attempts, [[first, false], [last, true], [last, boundary === "idle"]]);
+	assert.equal(h.starts.length, boundary === "idle" ? 1 : 0);
+	assert.equal(h.session.agent.peekQueuedMessages().length, 0);
+});
+
 test("events terminal results use the same safe boundary, leaving live output routing unchanged", async t => {
 	const h = harness(t);
 	await finished(h, { mode: "events" });
@@ -315,7 +365,7 @@ test("events terminal results use the same safe boundary, leaving live output ro
 test("a stopped loop cannot be revived by the next boundary", async t => {
 	const h = harness(t);
 	await finished(h, { loopPrompt: "check the deploy" });
-	h.pi.events.emit("loop:stopped", { prompt: "check the deploy", reason: "stopped" });
+	h.pi.events.emit("loop:stopped", { observationGroups: ["completion-fixture-loop"], reason: "stopped" });
 	assert.equal(await h.finishTurn(), false);
 	assert.equal(h.sent.length, 0);
 	assert.equal(h.entries().length, 0);
@@ -358,7 +408,7 @@ test("failed manual compaction also preserves the pending result without a new t
 test("a stopped loop discards its unsent completion instead of resurrecting the loop", async t => {
 	const h = harness(t);
 	await finished(h, { loopPrompt: "check the deploy" });
-	h.pi.events.emit("loop:stopped", { prompt: "check the deploy", reason: "stopped" });
+	h.pi.events.emit("loop:stopped", { observationGroups: ["completion-fixture-loop"], reason: "stopped" });
 	h.session._isAgentRunActive = false;
 	await h.emit("agent_settled", { aborted: false });
 	assert.equal(h.sent.length, 0);

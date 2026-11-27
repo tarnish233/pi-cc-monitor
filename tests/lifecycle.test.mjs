@@ -1,156 +1,72 @@
+/** Owned observation resources are cleaned; native runner jobs are never signalled. */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import test from 'node:test';
 import { pathToFileURL } from 'node:url';
+import test from 'node:test';
 import { loadModule } from './helpers.mjs';
 import { createHarness, startReady, groupAlive, until, sleep } from './runtime-harness.mjs';
-
+import { createJob, startExternal } from './observation-fixtures.mjs';
+import { fakeSsh } from './ssh-fixtures.mjs';
 const proc = await loadModule('process.ts');
+const { FileObservation } = await loadModule('observation-source.ts');
 
-test('stop waits for TERM-ignoring owned process; simultaneous requests share one closing outcome', async (t) => {
-  const h = createHarness(); t.after(() => h.close());
-  const job = await startReady(h);
-  const a = h.call('monitor_stop', { id: job.taskId });
-  const b = h.call('monitor_stop', { id: job.taskId });
-  assert.equal((await h.snapshots())[0].status, 'stopping');
-  assert.equal((await h.snapshots())[0].endedAt, undefined);
-  const results = await Promise.all([a, b]);
-  assert.ok(results.every((r) => r.details.stopped));
-  assert.equal(groupAlive(job.pid), false);
-  assert.equal((await h.snapshots())[0].status, 'stopped');
-  assert.equal(h.sent.filter((r) => r.message.details.cause === 'stopped').length, 1);
-});
-
-test('permission failure is not disappearance; failed stop stays listed and retryable', async (t) => {
-  const h = createHarness(); t.after(() => h.close());
-  const job = await startReady(h);
-  const kill = process.kill, childKill = ChildProcess.prototype.kill;
-  try {
-    process.kill = function(pid, signal) {
-      if (pid === -job.pid && signal !== 0) throw Object.assign(new Error('injected signal denial'), { code: 'EPERM' });
-      return kill.call(process, pid, signal);
-    };
-    ChildProcess.prototype.kill = function(signal) { return this.pid === job.pid ? false : childKill.call(this, signal); };
-    const result = await h.call('monitor_stop', { id: job.taskId });
-    assert.equal(result.details.stopped, false);
-    assert.equal(result.details.status, 'stop_timeout');
-    assert.equal(result.isError, true);
-    const record = (await h.snapshots())[0];
-    assert.equal(record.status, 'stop_timeout');
-    assert.equal(record.endedAt, undefined);
-    assert.equal(groupAlive(job.pid), true);
-  } finally { process.kill = kill; ChildProcess.prototype.kill = childKill; }
-  // Let the owned resource disappear without a retry: status converges, but
-  // this same logical stop must not deliver a second terminal notice.
-  assert.equal(h.sent.filter((m) => m.message.details.cause === 'stopped' || m.message.details.cause === 'stop_timeout').length, 1);
-  process.kill(-job.pid, 'SIGKILL');
-  assert.ok(await until(async () => (await h.snapshots())[0].status === 'stopped'));
-  assert.equal(h.sent.filter((m) => m.message.details.cause === 'stopped' || m.message.details.cause === 'stop_timeout').length, 1);
-  assert.equal((await h.call('monitor_stop', { id: job.taskId })).details.stopped, false);
-  assert.equal(groupAlive(job.pid), false);
-});
-
-test('stop of an exited command with a living background group reports the real record status', async (t) => {
-  const h = createHarness(); t.after(() => h.close());
-  // The parent waits for the grandchild's SIGTERM handler before exiting, so
-  // the exit-path cleanup cannot win the race against the grandchild's boot.
-  const marker = path.join(h.cwd, 'grandchild-up');
-  const inner = `process.on('SIGTERM',()=>{});setInterval(()=>{},1000);require('fs').writeFileSync(${JSON.stringify(marker)},'up')`;
-  const code = `const fs=require('fs');const c=require('child_process').spawn(process.execPath,['-e',${JSON.stringify(inner)}],{stdio:'ignore'});const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(marker)})){clearInterval(t);c.unref();console.log('SPAWNED')}},10)`;
-  const kill = process.kill, childKill = ChildProcess.prototype.kill;
-  let pid;
-  try {
-    const result = await h.call('Monitor', { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(code)}`, description: 'exits leaving a grandchild', persistent: true });
-    pid = (await h.snapshots()).find((r) => r.id === result.details.taskId).pid;
-    // Deny signals so neither the exit-path cleanup nor the stop can reap the group.
-    process.kill = function(target, signal) {
-      if (target === -pid && signal !== 0) throw Object.assign(new Error('injected signal denial'), { code: 'EPERM' });
-      return kill.call(process, target, signal);
-    };
-    ChildProcess.prototype.kill = function(signal) { return this.pid === pid ? false : childKill.call(this, signal); };
-    const view = async () => (await h.snapshots()).find((r) => r.id === result.details.taskId);
-    assert.ok(await until(async () => (await view()).status === 'exited'));
-    assert.equal((await view()).resourceActive, true);
-    assert.equal(groupAlive(pid), true);
-    const stop = await h.call('monitor_stop', { id: result.details.taskId });
-    assert.equal(stop.details.stopped, false);
-    assert.equal(stop.isError, true);
-    // The record finalized as exited; the tool must not contradict monitor_list.
-    assert.equal(stop.details.status, 'exited');
-    assert.equal((await view()).status, 'exited');
-  } finally {
-    process.kill = kill; ChildProcess.prototype.kill = childKill;
-    if (pid) try { kill.call(process, -pid, 'SIGKILL'); } catch { /* already gone */ }
-  }
-});
-
-test('shutdown clears cleanup polling and a disposed runtime never re-arms it', async (t) => {
-  const h = createHarness();
-  const job = await startReady(h);
-  const kill = process.kill, childKill = ChildProcess.prototype.kill;
-  const setT = globalThis.setTimeout, clearT = globalThis.clearTimeout;
-  // Track the 100 ms cleanup polls: removed when they fire or are cleared.
-  const polls = new Set();
-  globalThis.setTimeout = function(fn, ms, ...rest) {
-    const wrapped = typeof fn === 'function' ? (...args) => { polls.delete(timer); fn(...args); } : fn;
-    const timer = setT.call(globalThis, wrapped, ms, ...rest);
-    if (ms === 100) polls.add(timer);
-    return timer;
-  };
-  globalThis.clearTimeout = function(timer) { polls.delete(timer); return clearT.call(globalThis, timer); };
-  let closed = false;
-  const close = async () => { if (!closed) { closed = true; await h.close(); } };
-  t.after(close);
-  try {
-    process.kill = function(target, signal) {
-      if (target === -job.pid && signal !== 0) throw Object.assign(new Error('injected signal denial'), { code: 'EPERM' });
-      return kill.call(process, target, signal);
-    };
-    ChildProcess.prototype.kill = function(signal) { return this.pid === job.pid ? false : childKill.call(this, signal); };
-    const stop = await h.call('monitor_stop', { id: job.taskId });
-    assert.equal(stop.details.status, 'stop_timeout');
-    assert.ok(polls.size > 0, 'the unconfirmed stop armed a cleanup poll');
-    await close();
-    assert.equal(polls.size, 0, 'shutdown must clear outstanding cleanup timers');
-    await sleep(250);
-    assert.equal(polls.size, 0, 'a disposed runtime must not re-arm cleanup polling');
-  } finally {
-    globalThis.setTimeout = setT; globalThis.clearTimeout = clearT;
-    process.kill = kill; ChildProcess.prototype.kill = childKill;
-    try { kill.call(process, -job.pid, 'SIGKILL'); } catch { /* already gone */ }
-  }
-});
-
-test('group probe distinguishes ESRCH from EPERM without root/permission-dependent skips', () => {
-  if (process.platform === 'win32') {
-    assert.equal(proc.processGroupAlive({ pid: 987654, exitCode: 0, signalCode: null }), false);
-    return;
-  }
-  const original = process.kill;
-  try {
-    process.kill = () => { throw Object.assign(new Error('injected'), { code: 'EPERM' }); };
-    assert.equal(proc.processGroupAlive({ pid: 987654 }), true);
-    process.kill = () => { throw Object.assign(new Error('injected'), { code: 'ESRCH' }); };
-    assert.equal(proc.processGroupAlive({ pid: 987654 }), false);
-  } finally { process.kill = original; }
-});
-
-for (const shutdown of ['graceful', 'exit-while-stopping']) {
-  test(`${shutdown}: host exit cannot lose the SIGKILL backstop`, async (t) => {
-    const h = createHarness(); t.after(() => h.close());
-    const file = path.join(h.cwd, 'owner.mjs');
-    const harnessUrl = pathToFileURL(path.resolve(import.meta.dirname, 'runtime-harness.mjs')).href;
-    fs.writeFileSync(file, `import {createHarness,startReady} from ${JSON.stringify(harnessUrl)};\nconst h=createHarness(); const j=await startReady(h); console.log(JSON.stringify(j));\n${shutdown === 'graceful' ? "await h.close();" : "void h.call('monitor_stop',{id:j.taskId});"}\nprocess.exit(0);\n`);
-    const owner = spawn(process.execPath, [file], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let output = '', errors = '', pid;
-    owner.stdout.on('data', (b) => { output += b; }); owner.stderr.on('data', (b) => { errors += b; });
-    t.after(() => { owner.kill('SIGKILL'); if (pid && groupAlive(pid)) process.kill(-pid, 'SIGKILL'); });
-    const [code] = await once(owner, 'exit');
-    const job = JSON.parse(output.trim()); pid = job.pid;
-    assert.equal(code, 0, errors);
-    assert.ok(await until(() => !groupAlive(pid)), 'owned group must not survive host exit');
-  });
+async function remoteReady(h, host) {
+  const job = createJob(h.cwd, { stdout: 'READY\n' });
+  const receipt = (await h.call('Monitor', { source: { ...job.fileSource, host }, description: 'owned read-only helper', persistent: true })).details;
+  // Allow the transport's 10s read deadline plus one poll/backoff under parallel cold starts.
+  // The real READY bytes and the owned helper PID are still required before testing cleanup.
+  const ready = await until(async () => Boolean((await h.snapshots())[0].observationPid) && fs.readFileSync(receipt.outputPath, 'utf8').includes('READY'), 15000);
+  assert.ok(ready, `read-only helper did not deliver READY: ${JSON.stringify(await h.snapshots())}`);
+  return { ...receipt, pid: (await h.snapshots())[0].observationPid, fixture: job };
 }
+test('simultaneous stops share one closing outcome and reap a TERM-ignoring SSH helper', { skip: process.platform === 'win32' }, async t => {
+  const h = createHarness(); const ssh = fakeSsh(t, h.cwd, { ignoreTerm: true }); t.after(() => h.close());
+  const observer = await remoteReady(h, ssh.host); const a = h.call('monitor_stop', { id: observer.taskId }), b = h.call('monitor_stop', { id: observer.taskId });
+  assert.equal((await h.snapshots())[0].status, 'stopping'); assert.equal((await h.snapshots())[0].endedAt, undefined);
+  assert.ok((await Promise.all([a, b])).every(r => r.details.stopped)); assert.equal(groupAlive(observer.pid), false); assert.equal((await h.snapshots())[0].status, 'stopped');
+  assert.equal(h.sent.filter(m => m.message.details.cause === 'stopped').length, 1); assert.equal(fs.readFileSync(observer.fixture.stdout, 'utf8'), 'READY\n');
+});
+test('permission-denied helper cleanup remains listed/retryable and converges without a second notice', { skip: process.platform === 'win32' }, async t => {
+  const h = createHarness(); const ssh = fakeSsh(t, h.cwd, { ignoreTerm: true }); t.after(() => h.close()); const observer = await remoteReady(h, ssh.host);
+  const kill = process.kill, childKill = ChildProcess.prototype.kill;
+  try {
+    process.kill = (pid, signal) => { if (pid === -observer.pid && signal !== 0) throw Object.assign(new Error('signal denied'), { code: 'EPERM' }); return kill.call(process, pid, signal); };
+    ChildProcess.prototype.kill = function(signal) { return this.pid === observer.pid ? false : childKill.call(this, signal); };
+    const stopped = await h.call('monitor_stop', { id: observer.taskId }); assert.equal(stopped.details.stopped, false); assert.equal(stopped.details.status, 'stop_timeout'); assert.equal(stopped.isError, true); assert.equal(groupAlive(observer.pid), true);
+  } finally { process.kill = kill; ChildProcess.prototype.kill = childKill; }
+  kill.call(process, -observer.pid, 'SIGKILL'); assert.ok(await until(async () => (await h.snapshots())[0].status === 'stopped'));
+  assert.equal(h.sent.filter(m => ['stopped', 'stop_timeout'].includes(m.message.details.cause)).length, 1); assert.equal(fs.existsSync(observer.fixture.manifestPath), true);
+});
+test('shutdown clears cleanup polls and the disposed runtime never rearms them', async t => {
+  const h = createHarness(); const observer = await startReady(h); const stop = FileObservation.prototype.stop;
+  const set = globalThis.setTimeout, clear = globalThis.clearTimeout, polls = new Set();
+  globalThis.setTimeout = function(fn, ms, ...args) { const timer = set(() => { polls.delete(timer); fn(...args); }, ms); if (ms === 100) polls.add(timer); return timer; };
+  globalThis.clearTimeout = timer => { polls.delete(timer); return clear(timer); };
+  FileObservation.prototype.stop = async function(force) { return force ? stop.call(this, force) : false; };
+  try { const result = await h.call('monitor_stop', { id: observer.taskId }); assert.equal(result.details.status, 'stop_timeout'); assert.ok(polls.size > 0); await h.close(); assert.equal(polls.size, 0); await sleep(250); assert.equal(polls.size, 0); }
+  finally { FileObservation.prototype.stop = stop; globalThis.setTimeout = set; globalThis.clearTimeout = clear; await h.close(); }
+});
+test('group probe treats EPERM as alive and only ESRCH as gone', () => {
+  if (process.platform === 'win32') { assert.equal(proc.processGroupAlive({ pid: 987654, exitCode: 0, signalCode: null }), false); return; }
+  const kill = process.kill; try {
+    process.kill = () => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); }; assert.equal(proc.processGroupAlive({ pid: 987654 }), true);
+    process.kill = () => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }); }; assert.equal(proc.processGroupAlive({ pid: 987654 }), false);
+  } finally { process.kill = kill; }
+});
+for (const shutdown of ['graceful', 'exit-while-stopping']) test(shutdown + ': process exit reaps only the helper, leaving an independent business process alive', { skip: process.platform === 'win32' }, async t => {
+  const h = createHarness(); fakeSsh(t, h.cwd, { ignoreTerm: true });
+  let external, owner, helperPid;
+  try {
+    external = await startExternal(h.cwd, "setInterval(()=>process.stdout.write('BUSINESS-ALIVE\\n'),50)");
+    const program = path.join(h.cwd, 'observer-owner.mjs'); const harnessUrl = pathToFileURL(path.resolve(import.meta.dirname, 'runtime-harness.mjs')).href;
+    const source = { ...external.source, host: 'fixture-host' };
+    fs.writeFileSync(program, `import fs from 'node:fs';import {createHarness,until} from ${JSON.stringify(harnessUrl)};\nconst h=createHarness();const r=(await h.call('Monitor',{source:${JSON.stringify(source)},description:'read-only helper',persistent:true})).details;\nawait until(async()=>Boolean((await h.snapshots())[0].observationPid)&&fs.readFileSync(r.outputPath,'utf8').includes('BUSINESS-ALIVE'));\nconsole.log(JSON.stringify({pid:(await h.snapshots())[0].observationPid}));\n${shutdown === 'graceful' ? "await h.emit('session_shutdown',{reason:'quit'});" : "void h.call('monitor_stop',{id:r.taskId});"}\nprocess.exit(0);\n`);
+    owner = spawn(process.execPath, [program], { stdio: ['ignore', 'pipe', 'pipe'] }); let output = '', errors = ''; owner.stdout.on('data', b => output += b); owner.stderr.on('data', b => errors += b);
+    const [code] = await once(owner, 'close'); assert.equal(code, 0, errors); helperPid = JSON.parse(output.trim()).pid;
+    assert.ok(await until(() => !groupAlive(helperPid)), 'only the allocated helper group is reaped'); assert.equal(groupAlive(external.pid), true);
+    const before = fs.statSync(external.stdout).size; await sleep(150); assert.ok(fs.statSync(external.stdout).size > before);
+  } finally { if (owner && owner.exitCode === null) owner.kill('SIGKILL'); if (helperPid && groupAlive(helperPid)) process.kill(-helperPid, 'SIGKILL'); if (external) await external.stop(); await h.close(); }
+});

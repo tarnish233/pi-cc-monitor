@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { loadModule } from './helpers.mjs';
+import { createJob } from './observation-fixtures.mjs';
 
 const factory = (await loadModule('index.ts')).default;
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -14,6 +15,15 @@ export async function until(predicate, timeout = 5000) {
   return false;
 }
 export const groupAlive = (pid) => { try { process.kill(process.platform === 'win32' ? pid : -pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
+export const fixtureGroup = prompt => 'fixture-activity:' + prompt;
+export function bindFixtureLoop(pi) {
+  return pi.events.on('loop:bind-observation', request => {
+    if (request.version !== 1) return;
+    request.acceptedVersion = 1;
+    request.canonicalPrompt = request.prompt;
+    request.observationGroup = fixtureGroup(request.prompt);
+  });
+}
 export function createHarness({ idle = true, loop = false, send } = {}) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-contract-'));
   const tools = new Map(), handlers = new Map(), bus = new Map(), sent = [], statuses = [];
@@ -21,7 +31,7 @@ export function createHarness({ idle = true, loop = false, send } = {}) {
     registerTool(t) { tools.set(t.name, t); },
     registerCommand() {}, registerMessageRenderer() {}, registerToolRenderer() {}, appendEntry() {},
     getCommands() { return []; },
-    getAllTools() { return [...tools.keys(), ...(loop ? ['cron_delete'] : [])].map((name) => ({ name })); },
+    getAllTools() { return [...tools.keys()].map((name) => ({ name })); },
     on(name, handler) { const h = handlers.get(name) ?? []; h.push(handler); handlers.set(name, h); return () => h.splice(h.indexOf(handler), 1); },
     sendMessage(message, options) { send?.(message, options); sent.push({ message, options }); },
     events: {
@@ -32,6 +42,7 @@ export function createHarness({ idle = true, loop = false, send } = {}) {
   const ctx = { cwd, hasUI: false, mode: 'print', isIdle: () => idle,
     ui: { notify() {}, setStatus(key, value) { statuses.push({ key, value }); } },
     sessionManager: { getEntries: () => [] }, hasPendingMessages: () => false };
+  if (loop) bindFixtureLoop(pi);
   factory(pi);
   return { pi, ctx, tools, handlers, sent, statuses, cwd,
     setIdle(v) { idle = v; },
@@ -43,9 +54,8 @@ export function createHarness({ idle = true, loop = false, send } = {}) {
   };
 }
 export async function startReady(h, extra = {}) {
-  const code = "process.on('SIGTERM',()=>{});process.stdout.write('READY\\n');setInterval(()=>{},1000)";
-  const result = await h.call('Monitor', { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(code)}`, description: 'owned resource', mode: 'completion', persistent: true, ...extra });
-  if (!await until(() => fs.existsSync(result.details.outputPath) && fs.readFileSync(result.details.outputPath, 'utf8').includes('READY'))) throw Error('Owned fixture never became ready');
-  const record = (await h.snapshots()).find((r) => r.id === result.details.taskId);
-  return { ...result.details, pid: record.pid };
+  const fixture = createJob(h.cwd, { stdout: 'READY\n' });
+  const result = await h.call('Monitor', { source: fixture.source, description: 'observed resource', mode: 'completion', persistent: true, ...extra });
+  if (!await until(() => fs.existsSync(result.details.outputPath) && fs.readFileSync(result.details.outputPath, 'utf8').includes('READY'))) throw Error('Observation fixture never became ready');
+  return { ...result.details, fixture };
 }

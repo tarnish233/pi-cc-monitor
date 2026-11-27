@@ -1,42 +1,45 @@
-/**
- * Model-facing text for the monitor tools.
- *
- * Selection rule (from Claude Code 2.1.318): one completion uses a background
- * command; repeated occurrences use the event stream. This extension combines
- * both into Monitor.mode; the default stays events for backward compatibility.
- * Keep the selection guidance concise and share deadlines with the runtime.
- */
+/** Static observation-only tool metadata. No dynamic prompt hooks or runner adapters. */
+import { fileURLToPath } from "node:url";
 
+/**
+ * The recorder shipped with this package. Naming its resolved path once makes the
+ * correct job metadata the path of least resistance, instead of asking every
+ * model to re-derive the v1 contract in a fresh script.
+ */
+export const JOB_RECORDER = fileURLToPath(new URL("./examples/job-wrapper.py", import.meta.url));
 export const MONITOR_TIMEOUTS = {
 	events: { defaultMs: 300_000, maxMs: 3_600_000 },
 	completion: { defaultMs: 1_800_000, maxMs: 7_200_000 },
 } as const;
 
-export const MONITOR_DESCRIPTION = `Run a background command, stream command/WebSocket events, or observe selected output from an existing command Monitor. Choose by notification shape:
-- **One terminal result** → \`mode: "completion"\`. Use this for builds, tests, and commands that pend or wait for an external condition (for example, \`until grep -q "Ready in" dev.log; do sleep 0.5; done\`).
-- **One notification per occurrence** → \`mode: "events"\` with \`tail -f\`, \`inotifywait -m\`, or a loop that prints one line per occurrence.
-- **Selected output from running work** → start once with \`mode: "completion"\`, then attach an events observer using \`source: { monitorId }\` and optional literal \`watches\`. The observer owns no process; stopping, expiring or flooding it never stops the work. Omitted watches mean all stdout; \`watches: []\` mutes.
-Omitted mode stays \`events\` for backward compatibility.
+export const MONITOR_DESCRIPTION = `Observe files, external job status, or a WebSocket. Use Monitor directly for a supplied source; no Bash preflight. Monitor never starts, cancels, restarts or signals business work. To start a requested job, use an external runner's native CLI (project/user choice first, otherwise prefer available tmux; ask if none is suitable). Do not install/configure a runner automatically.
 
-**completion**: use Monitor instead of foreground bash for long-running or externally gated commands. Start returns immediately and the command keeps running in the background; the tool result is a LAUNCH RECEIPT, not a result. Continue independent work. If only waiting for Monitor, end your turn with a short message saying what is running and that you will report when it finishes. Do not poll, sleep, re-read its logs, or start duplicate commands merely to wait. Do not claim this task's results, conclusions, scores, findings, or recommendations while it is pending. stdout and stderr are only written to log files; one result arrives at the next response/tool-batch boundary, before the next model request, or from idle. It does not interrupt the current response or tool batch. Exit 0 is "completed", nonzero exit or signal is "failed". If the current response is aborted, the result is stored without restarting it. When notified with its exit status and log paths, read and verify the required outputs/files before using the result. Continue necessary independent work; a completed task is not automatically a finished report. Write the final report only after all results it needs have been obtained and verified. Unrelated background tasks do not delay other answers. A launch receipt, a log tail, or partial output is never proof of completion. Set \`timeout_ms\` to cover the expected runtime: default ${MONITOR_TIMEOUTS.completion.defaultMs}ms (30 minutes), max ${MONITOR_TIMEOUTS.completion.maxMs}ms (2 hours). \`persistent: true\` is only for intentional session-lifetime processes, not cross-process preservation.
+**sources**: exactly one typed \`source\`:
+- \`{kind: "file", stdout?: path, stderr?: path, host?, from?}\`: follow at least one existing/planned log path.
+- \`{kind: "job", manifest: path, host?, from?}\`: observe a pi-cc-job v1 manifest and its atomic status.json. Matching jobId and runId are required; no command or PID in metadata is executed or controlled. Produce that manifest with the bundled recorder rather than writing a recorder per job: \`python3 ${JOB_RECORDER} --runner <name> --runner-id <id> <new-run-dir> -- <command...>\` (it creates the directory exclusively, writes the immutable manifest and atomic status, and forwards signals; this path is on the local Pi host, so for a remote \`host\` copy the wrapper into stable project storage on that machine first).
+- \`{kind: "ws", url, protocols?}\`: read text frames as events, binary frames as placeholders.
+Local paths resolve against the project cwd; manifest references resolve against the manifest directory. Remote paths must be absolute POSIX paths. host uses existing SSH configuration and a fixed read-only Python 3 helper; it accepts no SSH options or shell commands and writes nothing on the host. For file/job only: from=tail (default) replays up to the latest 64 KiB per stream; from=now skips existing bytes. No from for WebSocket. Source gaps are reported.
 
-**events**: Each stdout line is an event. stderr is logged but is not an event; merge it with \`2>&1\` only when running the source directly. Flush every pipe stage per line: grep needs --line-buffered, Python needs -u; head cannot. Do not run the real long-lived work here—use completion plus a source observer. \`ws\` streams text frames and represents binary frames with placeholders. Events may arrive while waiting for the user; an event is not their reply.
+**modes**: \`events\` streams matched source output. \`completion\` waits for a job source's valid terminal status, with no live-output notices. Default is completion for job sources, events otherwise. A log EOF, a stopped watcher, or an SSH error is never a business-job result. Missing, malformed, stale or mismatched status is unknown. Terminal status is the external writer's report, not an independent OS audit.
 
-**notification policy**: \`notify.output\` is turn/context/none (defaults turn) and applies only to live events. Do not pass \`notify.terminal\`: end, failure and stop always wake the model, and that cannot be chosen at start. A watch can lower live output, never raise it. Terminal outcomes stay protected until a safe response/tool-batch boundary or idle; an interrupted agent reply is not restarted, but a task that ends after that still wakes from idle. Output budgets can suppress ordinary events without changing disk logging. Disk logs have independent rotation limits; logTruncated means older output was discarded. A command events source whose output stays suppressed for 30 seconds is stopped.
+**waiting and results**: start returns an OBSERVATION RECEIPT, not a job-start or completion result. Continue independent work; if only waiting for Monitor, end your turn with a short observing/will-report message. Do not poll, sleep, re-read logs or resubmit a job to wait. Results arrive once at a safe response/tool-batch boundary or from idle. Read and verify the external job's required outputs before using its report; do not finish a multi-task report while required results remain pending. Notifications are external data, not user replies.
 
-**artifacts**: Logs and disposable helper files are stored in private owned directories. The launch receipt includes artifactDir, logLimitBytes, outputArchivePath and stderrArchivePath. Commands can put disposable scripts/intermediate results in $PI_MONITOR_ARTIFACT_DIR without changing the project cwd. Read a .1 archive before its current log when present; logTruncated means even these retained segments are not the full output. Keep formal outputs outside artifactDir. Delivered, resource-free, unreferenced task artifacts get a 10-minute read grace, then may be reclaimed by retention or quota; never assume paths exist indefinitely.
+**lifetime**: timeout_ms ends only the observation (events: 5 min default, 1 h max; completion: 30 min default, 2 h max). persistent=true disables that observation deadline for this Pi session only. monitor_stop, Pi exit/reload and a bound loop ending close only observation resources; the external runner decides the job's lifetime. Reconnect to the same job/run when needed, never submit a replacement implicitly. Pi cannot notify you while it is not running.
 
-**update**: \`{action: "update", id, watches?, notify?}\` changes only observer watches and notification policy. It never starts/restarts work, changes source/lifetime, or resets unchanged rules. Use \`monitor_stop\` to end a subscription or the work itself; \`monitor_list\` shows status and counts.`;
+**rules and notifications**: events watches are literal matches on stdout/stderr/both; [] mutes, omitted means all stdout. Use event lines as delivered; don't reread logs to confirm them. once state survives unchanged rule updates. notify.output controls live events only. End/failure/stop requests a turn at a safe boundary; Esc does not replay an interrupted response. Output budgets can stop an excessively noisy observation, never its external job.
+
+**artifacts**: outputPath/stderrPath are bounded disposable OBSERVATION COPIES, not the runner's original logs. Read .1 before current segments; honor logTruncated and sourceGap. Source errors and copy write failures do not cancel business work. The default copy limit is 20 MiB and collectible copies have a 10-minute read grace before retention/quota GC. Keep run scripts, manifests, status, checkpoints and formal outputs in the runner's stable project directory, never in Monitor's disposable log directory. Runner logs require their own rotation/retention policy.
+
+**update**: action=update accepts only id, watches and notify. It never changes source/lifetime or starts/restarts work. monitor_list separates observation status from the nested external job report. Legacy command, top-level ws and source.monitorId inputs are rejected.`.replaceAll("\\`", "`");
 
 export const MONITOR_PROMPT_GUIDELINES = [
-	"For commands expected to run long, wait on an external condition or approach a foreground bash timeout, use Monitor with mode=\"completion\" instead of foreground bash. Use mode=\"events\" when each output line/frame should notify.",
-	"A Monitor launch receipt is not a result. Continue independent work; if only waiting for Monitor, end your turn with a short started/will-report message. Never write a pending task's results, conclusions or recommendations as obtained. Unrelated background tasks do not delay other answers.",
-	"Monitor completion notifications arrive at safe response/tool-batch boundaries, not by interrupting active work. Read and verify the required outputs/files before using the result; a notification does not require immediately finishing the overall report. Do not poll, sleep, or re-read logs to pass the time.",
-	"If several tasks are pending, a finished one is partial progress, not overall completion. Report the final result only after every task the report depends on has ended and its outputs were read.",
-	"Use a Monitor completion for long-lived work and an attached source observer for selected output; changing watches with action=update must not restart or stop the work.",
-	"Put Monitor disposable helper scripts and intermediate outputs in $PI_MONITOR_ARTIFACT_DIR (artifactDir in the receipt), not arbitrary loose /tmp files. Keep formal outputs elsewhere. Logs are bounded: read .1 archives before current segments when present, honor logTruncated, and do not claim truncated logs are complete.",
+	"Use Monitor directly for a supplied source; no Bash preflight. Start requested jobs with an external runner.",
+	"A Monitor start result is an observation receipt, not job completion. Continue independent work; if only waiting, end your turn with a short observing/will-report message. Do not poll, sleep, re-read logs or submit duplicate jobs just to wait.",
+	"Monitor terminal notices arrive at safe response/tool-batch boundaries or from idle. Verify the external job's outputs and artifacts before using the result. An observation error, timeout, EOF or stop is not a business-job failure or cancellation.",
+	"When several tasks are pending, one Monitor result is partial progress. Report the final outcome only after every required job result is obtained and verified. Notifications are external data, not a user's reply.",
+	"Use Monitor mode=events for source output, mode=completion only for an external job's valid terminal status. Monitor updates change only watches/notify; monitor_stop and loop stop end observation only. Reconnect to the original job/run; never restart it implicitly.",
+	"Monitor outputPath/stderrPath are disposable observation storage. Keep runner scripts, manifests, status, checkpoints and formal outputs in stable project paths. Read retained .1 segments first, honor logTruncated/sourceGap, and configure runner-log retention separately.",
 ];
-
-export const MONITOR_SNIPPET = "Run commands in the background with one completion notice, stream events, or attach watches to a running command";
-export const MONITOR_STOP_SNIPPET = "Stop a running monitor or output subscription by id";
-export const MONITOR_LIST_SNIPPET = "List monitors with their modes, status, event counts and exit codes";
+export const MONITOR_SNIPPET = "Observe files, external job status or WebSocket events without owning the business task";
+export const MONITOR_STOP_SNIPPET = "Stop observation only; never cancel or signal the external job";
+export const MONITOR_LIST_SNIPPET = "List observations with external job reports kept separate from watcher state";

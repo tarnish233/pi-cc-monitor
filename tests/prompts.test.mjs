@@ -1,40 +1,37 @@
-import assert from "node:assert/strict";
-import test from "node:test";
-import { loadModule } from "./helpers.mjs";
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import test from 'node:test';
+import { loadModule } from './helpers.mjs';
+const { MONITOR_DESCRIPTION: description, MONITOR_PROMPT_GUIDELINES: guidelines, MONITOR_TIMEOUTS: deadlines, JOB_RECORDER: recorderPath } = await loadModule('prompts.ts');
 
-const { MONITOR_DESCRIPTION, MONITOR_PROMPT_GUIDELINES, MONITOR_TIMEOUTS } = await loadModule("prompts.ts");
-
-test("completion contract keeps strong waiting and verification rules without unconditional handoff", () => {
-	assert.equal(MONITOR_PROMPT_GUIDELINES.length, 6);
-	assert.match(MONITOR_DESCRIPTION, /logTruncated/);
-	assert.match(MONITOR_PROMPT_GUIDELINES[5], /disposable helper scripts/);
-	assert.match(MONITOR_DESCRIPTION, /LAUNCH RECEIPT, not a result/);
-	assert.match(MONITOR_DESCRIPTION, /Continue independent work/);
-	assert.match(MONITOR_DESCRIPTION, /If only waiting for Monitor, end your turn/);
-	assert.match(MONITOR_DESCRIPTION, /Do not poll, sleep, re-read its logs/);
-	assert.match(MONITOR_DESCRIPTION, /while it is pending/);
-	assert.ok(MONITOR_DESCRIPTION.includes("read and verify the required outputs/files before using the result"));
-	assert.match(MONITOR_DESCRIPTION, /all results it needs have been obtained and verified/);
-	assert.match(MONITOR_DESCRIPTION, /Unrelated background tasks do not delay other answers/);
-	assert.doesNotMatch(MONITOR_DESCRIPTION, /MUST end your turn|end your turn immediately|never in the launch turn/);
+test('metadata directs business execution to native runners and exposes observation sources only', () => {
+  assert.equal(guidelines.length, 6); assert.ok(guidelines.every(rule => rule.includes('Monitor')));
+  assert.match(description, /never starts, cancels, restarts/); assert.match(description, /external runner/); assert.match(description, /kind: "file"/); assert.match(description, /kind: "job"/); assert.match(description, /kind: "ws"/);
+  assert.match(description, /Legacy command, top-level ws and source.monitorId inputs are rejected/);
+  // A live run showed a model hand-writing a recorder per job (with its argv in
+  // the manifest and a reused run directory). The description names the bundled
+  // recorder instead, so the correct metadata is one command away.
+  const recorder = /python3 (\S+\/examples\/job-wrapper\.py)/.exec(description)?.[1];
+  assert.ok(recorder, 'the description names the bundled recorder');
+  assert.equal(recorder, recorderPath);
+  assert.ok(fs.existsSync(recorderPath), `${recorderPath} ships with the package`);
+  assert.match(description, /creating the directory exclusively|creates the directory exclusively/); assert.match(description, /Do not install\/configure a runner automatically/);
 });
-
-test("notification timing and no-turn policy match the boundary runtime", () => {
-	assert.ok(MONITOR_DESCRIPTION.includes("next response/tool-batch boundary"));
-	assert.match(MONITOR_DESCRIPTION, /does not interrupt the current response or tool batch/);
-	assert.match(MONITOR_DESCRIPTION, /end, failure and stop always wake the model/);
-	assert.match(MONITOR_DESCRIPTION, /cannot be chosen at start/);
-	assert.match(MONITOR_DESCRIPTION, /stored without restarting/);
-	assert.doesNotMatch(MONITOR_DESCRIPTION, /protected settled delivery|result arrives after the active turn/);
-	assert.match(MONITOR_PROMPT_GUIDELINES[2], /does not require immediately finishing the overall report/);
-	assert.match(MONITOR_PROMPT_GUIDELINES[3], /every task the report depends on/);
+test('supplied sources go straight to Monitor and WebSockets have no replay field', () => {
+  assert.match(description.split('\n')[0], /supplied source; no Bash preflight/);
+  assert.match(guidelines[0], /supplied source; no Bash preflight/);
+  assert.match(description, /No from for WebSocket/);
+  assert.match(description, /Use event lines as delivered; don't reread logs/);
 });
-
-test("per-mode deadlines remain shared and unchanged", () => {
-	assert.deepEqual(MONITOR_TIMEOUTS, {
-		events: { defaultMs: 300_000, maxMs: 3_600_000 },
-		completion: { defaultMs: 1_800_000, maxMs: 7_200_000 },
-	});
-	assert.ok(MONITOR_DESCRIPTION.includes(String(MONITOR_TIMEOUTS.completion.defaultMs)));
-	assert.ok(MONITOR_DESCRIPTION.includes(String(MONITOR_TIMEOUTS.completion.maxMs)));
+test('waiting/result verification remains strong without unconditional final handoff', () => {
+  const text = guidelines.join('\n'); assert.match(text, /observation receipt/); assert.match(text, /Continue independent work/); assert.match(text, /Do not poll, sleep/); assert.match(text, /Verify the external job/); assert.match(text, /every required job result/); assert.match(text, /not a user's reply/);
+  assert.match(description, /safe response\/tool-batch boundary/); assert.match(description, /from idle/); assert.match(description, /not an independent OS audit/); assert.match(description, /Esc does not replay/);
+});
+test('observer deadlines keep existing values but cannot control job lifetime', () => {
+  assert.deepEqual(deadlines, { events: { defaultMs: 300000, maxMs: 3600000 }, completion: { defaultMs: 1800000, maxMs: 7200000 } });
+  assert.match(description, /timeout_ms ends only the observation/); assert.match(description, /persistent=true/); assert.match(description, /Reconnected|Reconnect to the same job\/run/); assert.match(description, /never submit a replacement implicitly/);
+});
+test('artifact and source-error guidance prevents accidental cleanup or false job results', () => {
+  assert.match(description, /OBSERVATION COPIES/); assert.match(description, /read|Read/); assert.match(description, /\.1/); assert.match(description, /logTruncated and sourceGap/); assert.match(description, /Runner logs require their own/);
+  assert.match(description, /Keep run scripts, manifests, status, checkpoints and formal outputs/); assert.match(description, /A log EOF, a stopped watcher, or an SSH error is never a business-job result/);
 });

@@ -13,12 +13,19 @@ import {
 	type NotificationTone,
 } from "./render.ts";
 import { sanitizeDisplay } from "./log-tail.ts";
-import { displayLine, monitorRole } from "./monitor-view.ts";
+import { displayLine, monitorRole, sourceDescription } from "./monitor-view.ts";
 import type { NotifyPolicy } from "./notification-budget.ts";
+import type { JobSnapshot } from "./job-protocol.ts";
+import type { ObservationSource } from "./observation-source.ts";
 
 export interface MonitorMessageDetails {
 	monitorId?: string;
-	kind?: "command" | "ws" | "source";
+	/** Old command/source details are display-only history, never resumable work. */
+	kind?: "file" | "job" | "ws" | "command" | "source";
+	source?: ObservationSource;
+	job?: JobSnapshot;
+	sourceGap?: boolean;
+	sourceError?: string;
 	mode?: "completion" | "events";
 	description?: string;
 	cause?: string;
@@ -39,11 +46,12 @@ export interface MonitorMessageDetails {
 	notify?: NotifyPolicy;
 	notifyLevel?: string;
 	watchCount?: number;
+	notices?: string[];
+	outputLines?: string[];
 	outputPath?: string;
 	stderrPath?: string;
 	outputArchivePath?: string;
 	stderrArchivePath?: string;
-	artifactDir?: string;
 	logLimitBytes?: number;
 	logTruncated?: boolean;
 	logRemoved?: boolean;
@@ -58,11 +66,21 @@ export interface MonitorMessageDetails {
 }
 
 const LABELS: Record<string, string> = {
-	output: "Monitor", exit: "Monitor Ended", timeout: "Monitor Expired", error: "Monitor Failed",
+	output: "Monitor", source_gap: "Observation Gap", exit: "Monitor Ended", timeout: "Monitor Expired", error: "Monitor Failed",
 	closed: "Monitor Closed", stopped: "Monitor Stopped", flooded: "Monitor Stopped", stop_timeout: "Monitor Stop Failed",
 };
 
+/** A lifecycle end, not a mid-observation diagnostic (a source gap is not an outcome). */
+function isTerminalCause(cause: string | undefined): boolean {
+	return cause !== undefined && cause !== "output" && cause !== "source_gap";
+}
+
 export function messageLabel(details: MonitorMessageDetails): string {
+	// The card belongs to the observation, so its title says Monitor even when the
+	// result it reports comes from the external job's status file. A finished
+	// observation is `completed`, so a successful job reads the same way here and
+	// in saved history.
+	if (details.cause === "job" && details.job) return details.job.state === "succeeded" ? "Monitor Completed" : details.job.state === "failed" ? "Monitor Failed" : "Monitor Cancelled";
 	if (details.mode === "completion" && details.cause === "exit" && details.status) {
 		return details.status === "completed" ? "Monitor Completed" : "Monitor Failed";
 	}
@@ -71,10 +89,11 @@ export function messageLabel(details: MonitorMessageDetails): string {
 }
 
 export function messageTone(details: MonitorMessageDetails): ThemeColor {
+	if (details.cause === "job" && details.job) return details.job.state === "succeeded" ? "success" : details.job.state === "failed" ? "error" : "warning";
 	// A stop we could not confirm is a failed stop, not a warning: the label already
 	// says "Stop Failed" and the resource is still alive.
 	if (details.cause === "stop_timeout") return "error";
-	if (details.cause === "timeout" || details.cause === "flooded") return "warning";
+	if (details.cause === "timeout" || details.cause === "flooded" || details.cause === "source_gap") return "warning";
 	if (details.cause === "error" || details.status === "failed") return "error";
 	// The exit code is the command's own verdict, whichever mode reported it: a
 	// successful watcher and a successful completion are the same fact.
@@ -92,23 +111,27 @@ function cardTone(details: MonitorMessageDetails): NotificationTone {
 	return tone === "success" || tone === "error" || tone === "warning" ? tone : "accent";
 }
 
-/** What the card watched: a command task, a watcher, a socket or a subscription. */
+/** What the card watched, including historical command/subscription entries in saved transcripts. */
 function messageRoleOf(details: MonitorMessageDetails): string {
 	if (!details.monitorId) return "notification summary";
 	const kind = details.kind ?? (details.sourceId ? "source" : details.wsUrl ? "ws" : details.mode ? "command" : undefined);
-	return kind ? monitorRole({ kind, mode: details.mode ?? "events" }) : "monitor";
+	if (!kind) return "monitor";
+	if (kind === "source") return "subscription";
+	if (kind === "command") return details.mode === "completion" ? "task" : "watcher";
+	return monitorRole({ kind, mode: details.mode ?? "events" });
 }
 
 export function messageIdentity(details: MonitorMessageDetails): string {
 	const parts = [messageRoleOf(details) + (details.monitorId ? ` #${details.monitorId}` : "")];
 	if (details.sourceId) parts[0] += ` → ${details.sourceDescription ? `${displayLine(details.sourceDescription)} ` : ""}#${details.sourceId}`;
-	const terminal = details.cause !== undefined && details.cause !== "output";
+	const terminal = isTerminalCause(details.cause);
 	if (terminal && details.resourceActive) parts.unshift("cleanup pending at report");
 	if (terminal && details.exitCode !== undefined && details.exitCode !== null) parts.push(`${details.sourceId ? "source exit" : "exit"} ${details.exitCode}`);
 	if (terminal && details.createdAt !== undefined && details.endedAt !== undefined) {
-		parts.push(formatDuration(Math.max(0, details.endedAt - details.createdAt)));
+		parts.push(`${details.kind === "file" || details.kind === "job" || details.kind === "ws" ? "observed " : ""}${formatDuration(Math.max(0, details.endedAt - details.createdAt))}`);
 	}
-	if (!terminal && details.kind === "command") parts.push("stdout");
+	if (details.job) parts.push(`job ${details.job.jobId} · ${details.job.state}${terminal && details.job.exitCode !== undefined ? ` · job exit ${details.job.exitCode}` : ""}`);
+	if (!terminal && (details.kind === "command" || details.kind === "file")) parts.push("stdout");
 	if (!terminal && details.kind === "ws") parts.push("frames");
 	if (details.notifyLevel === "context") parts.push("context only");
 	return parts.join(" · ");
@@ -128,13 +151,13 @@ export function messageBody(content: unknown, details: MonitorMessageDetails): s
 	const raw = contentText(content).replace(/^monitor \S+ ·[^\n]*\n?/, "");
 	const lines = withoutBannerPaths(bodyLines(sanitizeDisplay(raw)));
 	const hasTails = typeof details.stdoutTail === "string" || typeof details.stderrTail === "string";
-	if (details.mode === "completion" && hasTails && (details.cause === "exit" || details.cause === "timeout")) {
+	if (details.mode === "completion" && hasTails && (details.cause === "job" || details.cause === "exit" || details.cause === "timeout")) {
 		const result: string[] = [];
 		// A deadline, signal, or missing code needs its actual reason, not just log output.
 		if (details.cause === "timeout" || details.exitCode === null || details.exitCode === undefined) {
 			if (lines[0]) result.push(lines[0]);
 		}
-		const streams = details.status === "failed" ? ["stderr", "stdout"] as const : ["stdout", "stderr"] as const;
+		const streams = details.job?.state === "failed" || details.status === "failed" ? ["stderr", "stdout"] as const : ["stdout", "stderr"] as const;
 		for (const stream of streams) {
 			const text = stream === "stdout" ? details.stdoutTail : details.stderrTail;
 			const note = stream === "stdout" ? details.stdoutTailNote : details.stderrTailNote;
@@ -165,9 +188,10 @@ export function messageBody(content: unknown, details: MonitorMessageDetails): s
 /** The one-line collapsed facts: an observable exit and how long the work took. */
 function terminalStats(details: MonitorMessageDetails): string[] {
 	const stats: string[] = [];
-	if (details.exitCode !== undefined && details.exitCode !== null) stats.push(`exit ${details.exitCode}`);
+	if (details.job) stats.push(`job ${details.job.state}${details.job.exitCode !== undefined && details.job.exitCode !== null ? ` · exit ${details.job.exitCode}` : ""}`);
+	else if (details.exitCode !== undefined && details.exitCode !== null) stats.push(`exit ${details.exitCode}`);
 	if (details.createdAt !== undefined && details.endedAt !== undefined) {
-		stats.push(formatDuration(Math.max(0, details.endedAt - details.createdAt)));
+		stats.push(`${details.kind === "file" || details.kind === "job" || details.kind === "ws" ? "observed " : ""}${formatDuration(Math.max(0, details.endedAt - details.createdAt))}`);
 	}
 	return stats;
 }
@@ -181,18 +205,29 @@ function eventStats(details: MonitorMessageDetails): string[] {
 }
 
 /**
- * Protocol notices (`[Monitor stopped]`) and the "the source kept running"
- * caveats are statements about the monitor, not captured output.
+ * Fallback notice detector for historical persisted messages without structured
+ * `details.notices`. Matches only known Monitor protocol prefixes so bracketed
+ * user output (e.g. `[1, 2, 3]` or `[PASS]`) is never misclassified as Status.
  */
+const HISTORICAL_NOTICE =
+	/^\[(?:Monitor |External job |external job |Observation |Rotated logs |Logs truncated |Log incomplete |Task artifacts |Session |WebSocket |\d+ events? suppressed|terminal|exit|timeout|error|closed|stopped|flooded|stop_timeout)/;
+
 function isNotice(line: string): boolean {
-	return /^\[.*\]$/.test(line) || line.endsWith("was not stopped by this operation.");
+	return HISTORICAL_NOTICE.test(line) || line.endsWith("was not stopped by this operation.");
 }
 
 /** Everything the folded card cannot show, split into the sections a reader looks for. */
 function cardSections(details: MonitorMessageDetails, body: string[]): NotificationSection[] {
 	const sections: NotificationSection[] = [];
-	const notices = body.filter(isNotice);
-	const output = body.filter((line) => !isNotice(line));
+	const structured = Array.isArray(details.notices);
+	const notices = structured
+		? details.notices!.flatMap((line) => bodyLines(sanitizeDisplay(line)))
+		: body.filter(isNotice);
+	const output = structured
+		? details.mode === "completion"
+			? body
+			: (details.outputLines ?? []).flatMap((line) => bodyLines(sanitizeDisplay(line)))
+		: body.filter((line) => !isNotice(line));
 	if (details.description) {
 		sections.push({ heading: "Description", lines: [displayLine(details.description)], color: "text" });
 	}
@@ -201,6 +236,9 @@ function cardSections(details: MonitorMessageDetails, body: string[]): Notificat
 		const rules = details.watchCount !== undefined ? `${details.watchCount} rules` : "all stdout";
 		sections.push({ heading: "Source", lines: [`#${details.sourceId} · ${rules}`], color: "dim" });
 	}
+	if (details.source) sections.push({ heading: "Source", lines: [sourceDescription(details.source)], color: "dim" });
+	if (details.job) sections.push({ heading: "External job", lines: [displayLine(`${details.job.jobId} / ${details.job.runId} · ${details.job.runner.name} #${details.job.runner.id}`), ...(details.job.host ? [`host: ${displayLine(details.job.host)}`] : []), `reported state: ${details.job.state}`, ...(details.job.exitCode !== undefined ? [`job exit: ${details.job.exitCode}`] : []), `status: ${displayLine(details.job.statusPath)}`], color: "dim" });
+	if (details.sourceError) sections.push({ heading: "Observation error", lines: [displayLine(details.sourceError), "External work was not cancelled."], color: "warning" });
 	const events = eventStats(details);
 	if (events.length) sections.push({ heading: "Events", lines: events, color: "dim" });
 	if (output.length) sections.push({ heading: "Output", lines: output, color: "toolOutput" });
@@ -219,12 +257,12 @@ function cardSections(details: MonitorMessageDetails, body: string[]): Notificat
 	const logs: string[] = [];
 	if (details.outputPath) logs.push(`stdout: ${sanitizeDisplay(details.outputPath)}`);
 	if (details.stderrPath) logs.push(`stderr: ${sanitizeDisplay(details.stderrPath)}`);
-	if (details.artifactDir) logs.push(`disposable artifacts: ${sanitizeDisplay(details.artifactDir)}`);
 	if (details.logLimitBytes !== undefined) logs.push(`disk limit: ${details.logLimitBytes / (1024 * 1024)} MiB (archives included)`);
 	if (details.outputArchivePath) logs.push(`previous stdout (if rotated): ${sanitizeDisplay(details.outputArchivePath)}`);
 	if (details.stderrArchivePath) logs.push(`previous stderr (if rotated): ${sanitizeDisplay(details.stderrArchivePath)}`);
 	if (details.logRemoved) logs.push("artifacts reclaimed by retention/quota");
 	else if (details.logTruncated) logs.push("logs truncated; only recent segments retained");
+	if (details.sourceGap) logs.push("source gaps; this copy is not the entire external log");
 	if (details.logError) logs.push(`log incomplete: ${sanitizeDisplay(details.logError)}`);
 	if (logs.length) sections.push({ heading: "Logs", lines: logs, color: "dim" });
 	if (details.loopPrompt) {
@@ -257,11 +295,12 @@ export function renderMonitorMessage(
 			expanded: options.expanded,
 			outputPad: options.outputPad,
 			theme,
+			keyHint: options.keyHint,
 		});
 	}
 	// Process and outcome share one collapsed line; the difference is the icon
 	// and what the expansion holds.
-	const terminal = details.cause !== undefined && details.cause !== "output";
+	const terminal = isTerminalCause(details.cause);
 	return renderNotificationCard(message, options, theme, {
 		title: messageLabel(details),
 		id: details.monitorId,

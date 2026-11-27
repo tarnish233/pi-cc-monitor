@@ -1,4 +1,4 @@
-/** Only rendering and task-panel sources remain shared between Loop and Monitor. */
+/** Check bundled sources that must agree across independent installations. */
 import assert from "node:assert";
 import fs from "node:fs";
 import path from "node:path";
@@ -11,6 +11,11 @@ const SHARED = {
 	"render.ts": SIBLINGS,
 	"tasks.ts": SIBLINGS,
 	"log-tail.ts": SIBLINGS,
+	"observation-link.ts": SIBLINGS,
+	"terminal-outbox.ts": SIBLINGS,
+	"plugin-settings.ts": SIBLINGS,
+	"scripts/host-paths.mjs": SIBLINGS,
+	"scripts/typecheck.mjs": SIBLINGS,
 };
 
 for (const [file, siblings] of Object.entries(SHARED)) {

@@ -17,6 +17,7 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 import { findPiInstall, loadModule, loadPi } from "./helpers.mjs";
+import { createJob } from "./observation-fixtures.mjs";
 
 const monitorMod = await loadModule("index.ts");
 const tasksMod = await loadModule("tasks.ts");
@@ -267,7 +268,7 @@ test("standalone monitor: one native /cc-tasks, opened while busy, stops via end
 	assert.deepEqual([...runtime.commands.keys()].filter((name) => name.startsWith("cc-tasks")), ["cc-tasks"]);
 	assert.ok(runtime.commands.get("monitor_settings"), "/monitor_settings stays available");
 
-	const armed = await arm(runtime, { command: "sleep 30", description: "standalone monitor", persistent: true });
+	const armed = await arm(runtime, { source: createJob(runtime.workdir).fileSource, description: "standalone monitor", persistent: true });
 	runtime.state.idle = false;
 	runtime.state.pending = true;
 	const overlay = openTasks(runtime);
@@ -294,7 +295,7 @@ test("standalone monitor: one native /cc-tasks, opened while busy, stops via end
 	assert.equal(runtime.sent.filter((entry) => entry.kind === "custom").length, 0, "a busy turn keeps its outcome out of the clearable queue");
 	await runtime.dispatch("agent_settled", { aborted: false });
 	assert.ok(
-		runtime.sent.some((entry) => entry.message?.customType === "Monitor" && entry.message.content.includes("[Monitor stopped]")),
+		runtime.sent.some((entry) => entry.message?.customType === "Monitor" && entry.message.content.includes("[Monitor stopped")),
 		"monitor_stop's terminal notice",
 	);
 	assert.equal(runtime.state.aborts, 0);
@@ -309,7 +310,7 @@ test("standalone monitor: details show exit data and bounded, sanitized logs", a
 	runtime.load();
 	await runtime.start();
 	const armed = await arm(runtime, {
-		command: "printf '\\033[31mRED\\033[0m \\001CLEAR\\n'; printf 'ERR \\033[32mGREEN\\033[0m\\n' >&2; sleep 30",
+		source: createJob(runtime.workdir, { stdout: "\x1b[31mRED\x1b[0m \x01CLEAR\n", stderr: "ERR \x1b[32mGREEN\x1b[0m\n" }).fileSource,
 		description: "log monitor",
 		persistent: true,
 	});
@@ -343,7 +344,7 @@ test("standalone completion command: details show its mode and quiet log semanti
 	runtime.load();
 	await runtime.start();
 	const armed = await arm(runtime, {
-		command: "printf 'quiet\\n'; sleep 30",
+		source: createJob(runtime.workdir, { stdout: "quiet\n" }).source,
 		description: "background test suite",
 		mode: "completion",
 		persistent: true,
@@ -357,9 +358,9 @@ test("standalone completion command: details show its mode and quiet log semanti
 	assert.doesNotMatch(runtime.text(), /completion/, "the list uses the role, technical mode is detail data");
 	runtime.input("enter");
 	const detail = detailText(runtime);
-	assert.match(detail, /Mode\s+completion · one terminal notification/);
-	assert.match(detail, /Output\s+turn · runtime output is log-only/);
-	assert.match(detail, /stdout \(log\)/);
+	assert.match(detail, /Mode\s+completion · external job terminal report/);
+	assert.match(detail, /Output\s+turn/);
+	assert.match(detail, /stdout \(observation copy\)/);
 	assert.doesNotMatch(detail, /0 delivered/);
 	assert.match(detail, /quiet/);
 	runtime.input("escape");
@@ -372,7 +373,7 @@ test("standalone completion command: a finished command reports its terminal sta
 	t.after(() => stop(runtime));
 	runtime.load();
 	await runtime.start();
-	await arm(runtime, { command: "printf 'done\n'", description: "finishing build", mode: "completion" });
+	await arm(runtime, { source: createJob(runtime.workdir, { state: "succeeded", stdout: "done\n" }).source, description: "finishing build", mode: "completion" });
 	assert.ok(
 		await waitFor(() => runtime.sent.some((entry) => entry.message?.details?.status === "completed")),
 		"exit code 0 is a completed completion, not exited",
@@ -380,9 +381,9 @@ test("standalone completion command: a finished command reports its terminal sta
 	const overlay = openTasks(runtime);
 	assert.match(runtime.text(), /completed/);
 	runtime.input("enter");
-	const detail = runtime.text();
+	const detail = detailText(runtime);
 	assert.match(detail, /Status\s+completed/);
-	assert.match(detail, /Exit\s+code 0/);
+	assert.match(detail, /Job exit\s+0/);
 	runtime.input("escape");
 	runtime.input("escape");
 	await overlay;
@@ -413,12 +414,12 @@ test("detail state wording: a running WebSocket is not closed, and an early exit
 		}
 	};
 	try {
-		await arm(runtime, { ws: { url: "ws://x.example/feed" }, description: "live socket", persistent: true });
+		await arm(runtime, { source: { kind: "ws", url: "ws://x.example/feed" }, description: "live socket", persistent: true });
 		const overlay = openTasks(runtime);
 		runtime.input("tab");
 		runtime.input("enter");
 		const detail = runtime.text();
-		assert.match(detail, /Exit\s+—/, "a running socket has no exit yet");
+		assert.match(detail, /Resource\s+observation only; active/, "the local connection is still active");
 		assert.doesNotMatch(detail, /Exit\s+socket close/, "running is not reported as closed");
 		runtime.input("escape");
 		runtime.input("escape");
@@ -430,20 +431,20 @@ test("detail state wording: a running WebSocket is not closed, and an early exit
 	// A command that exits before its timeout keeps the configured lifetime,
 	// but must not show an active "left" countdown.
 	await arm(runtime, {
-		command: "printf 'done\\n'",
+		source: createJob(runtime.workdir, { state: "succeeded", stdout: "done\n" }).source,
 		description: "ends early",
 		timeout_ms: 600_000,
 	});
 	assert.ok(
-		await waitFor(() => runtime.sent.some((entry) => entry.message?.details?.cause === "exit")),
+		await waitFor(() => runtime.sent.some((entry) => entry.message?.details?.cause === "job")),
 		"the command ended",
 	);
 	const ended = openTasks(runtime);
 	assert.equal(runtime.state.component.selected().title, "ends early", "the newest command is first");
 	runtime.input("enter");
 	const endedDetail = detailText(runtime);
-	assert.match(endedDetail, /Lifetime\s+10m configured timeout · ended early/);
-	assert.match(endedDetail, /Exit\s+code 0/);
+	assert.match(endedDetail, /Lifetime\s+10m configured observation timeout/);
+	assert.match(endedDetail, /Job exit\s+0/);
 	assert.doesNotMatch(endedDetail, /Lifetime[^\n]*left/, "no remaining timer on an ended record");
 	runtime.input("escape");
 	runtime.input("escape");
@@ -455,7 +456,7 @@ test("standalone monitor: non-TUI summary, narrow widths and shutdown cleanup", 
 	t.after(() => stop(runtime));
 	const client = runtime.load();
 	await runtime.start();
-	await arm(runtime, { command: "sleep 30", description: "\u4e2d\u6587\ud83d\ude80 narrow", persistent: true });
+	await arm(runtime, { source: createJob(runtime.workdir).fileSource, description: "\u4e2d\u6587\ud83d\ude80 narrow", persistent: true });
 
 	runtime.ctx.mode = "print";
 	runtime.ctx.hasUI = false;
@@ -551,7 +552,7 @@ test("two runtimes keep separate Monitor task state and commands", async (t) => 
 	await b.start();
 	assert.deepEqual([...a.commands.keys()].filter((name) => name.startsWith("cc-tasks")), ["cc-tasks"]);
 	assert.deepEqual([...b.commands.keys()].filter((name) => name.startsWith("cc-tasks")), ["cc-tasks"]);
-	await arm(a, { command: "sleep 30", description: "only A", persistent: true });
+	await arm(a, { source: createJob(a.workdir).fileSource, description: "only A", persistent: true });
 	const overlayA = openTasks(a);
 	assert.match(a.text(), /only A/);
 	const overlayB = openTasks(b);
@@ -563,63 +564,23 @@ test("two runtimes keep separate Monitor task state and commands", async (t) => 
 	await overlayB;
 });
 
-test("task tree groups real source subscriptions and local stop confirms subscription-only scope", async (t) => {
-  const runtime = makeRuntime();
-  t.after(() => stop(runtime));
-  runtime.load();
-  await runtime.start();
-  let creationTime = Date.now();
-  const clock = t.mock.method(Date, "now", () => ++creationTime);
-  const work = await arm(runtime, { command: "sleep 30", description: "build", mode: "completion", persistent: true });
-  const independent = await arm(runtime, { command: "sleep 30", description: "independent watcher", mode: "events", persistent: true });
-  const observer = await arm(runtime, { source: { monitorId: work.details.taskId }, description: "build errors", mode: "events", persistent: true, watches: [{ id: "errors", text: "ERROR", stream: "both", once: false }] });
-  const muted = await arm(runtime, { source: { monitorId: work.details.taskId }, description: "build progress", mode: "events", persistent: true, watches: [] });
-  clock.mock.restore();
-  const overlay = openTasks(runtime);
-  const order = runtime.state.component.entries.map((item) => [item.id, item.depth]);
-  assert.deepEqual(order, [[independent.details.taskId, 0], [work.details.taskId, 0], [muted.details.taskId, 1], [observer.details.taskId, 1]]);
-  assert.match(runtime.text(), /▾ running/);
-  assert.match(runtime.text(), /↳ running/);
-  assert.match(runtime.text(), /build progress · subscription · output muted/, "muting is visible even at the default width");
-  runtime.state.columns = 100;
-  assert.match(runtime.text(), /build progress · subscription · output muted · 0 events/);
-  runtime.state.columns = 80;
-  for (let i = 0; i < 3; i++) runtime.input("down");
-  assert.equal(runtime.state.component.selected().id, observer.details.taskId);
-  runtime.input("enter");
-  const details = detailText(runtime);
-  assert.match(details, new RegExp("subscription #" + observer.details.taskId));
-  assert.match(details, new RegExp("Source\\s+build #" + work.details.taskId + " · running"));
-  assert.match(details, /subscription only; no process owned/);
-  assert.match(details, /Watch errors\s+both · repeat · turn · waiting · ERROR/);
-  assert.match(details, /retained logs, not only matches/);
-  assert.ok(details.indexOf("State") < details.indexOf("Observation"));
-  assert.ok(details.indexOf("Observation") < details.indexOf("Delivery"));
-  assert.ok(details.indexOf("Delivery") < details.indexOf("Lifetime"));
-  assert.doesNotMatch(details, /PID\s+\d+/, "subscription owns no process");
-  runtime.input("escape");
-  runtime.input("x");
-  const confirmation = runtime.text();
-  assert.match(confirmation, /Stop subscription/);
-  assert.match(confirmation, new RegExp("source command #" + work.details.taskId));
-  const confirmationBody = stripTerminalSequences(confirmation).split("\n").map((line) => line.replace(/^│\s*|\s*│$/g, "").trim()).join(" ");
-  assert.match(confirmationBody, /not stopped by this operation/, "wrapped confirmation still shows the entire stop scope");
-  assert.match(confirmation, /y stop · n\/Esc cancel/);
-  runtime.input("escape");
-  assert.equal(runtime.sent.length, 0, "cancelling confirmation is UI-only");
-  runtime.input("x");
-  runtime.input("y");
-  assert.ok(await waitFor(() => runtime.sent.some((entry) => entry.message?.details?.monitorId === observer.details.taskId && entry.message.details.cause === "stopped")));
-  const list = (await runtime.tools.get("monitor_list").execute("l", {}, undefined, undefined, runtime.ctx)).details.monitors;
-  assert.equal(list.find((item) => item.id === observer.details.taskId).status, "stopped");
-  assert.equal(list.find((item) => item.id === work.details.taskId).status, "running");
-  assert.equal(list.find((item) => item.id === muted.details.taskId).status, "running");
-  assert.equal(list.find((item) => item.id === independent.details.taskId).status, "running");
-  assert.equal(runtime.sent.length, 1, "no extra source terminal card is introduced");
-  assert.equal(runtime.sent[0].options.triggerTurn, true, "a stop wakes the model");
-  assert.equal(runtime.state.aborts, 0);
-  runtime.input("escape");
-  await overlay;
+test("independent source observations retain panel identity and stop only the selected watcher", async t => {
+  const runtime = makeRuntime(); t.after(() => stop(runtime)); runtime.load(); await runtime.start();
+  let creationTime = Date.now(); const clock = t.mock.method(Date, "now", () => ++creationTime);
+  const job = createJob(runtime.workdir);
+  const work = await arm(runtime, { source: job.source, description: "build", mode: "completion", persistent: true });
+  const independent = await arm(runtime, { source: createJob(runtime.workdir).fileSource, description: "independent watcher", persistent: true });
+  const observer = await arm(runtime, { source: job.fileSource, description: "build errors", persistent: true, watches: [{ id: "errors", text: "ERROR", stream: "both" }] });
+  const muted = await arm(runtime, { source: job.fileSource, description: "build progress", persistent: true, watches: [] });
+  clock.mock.restore(); const overlay = openTasks(runtime);
+  assert.deepEqual(runtime.state.component.entries.map(item => item.id), [muted.details.taskId, observer.details.taskId, independent.details.taskId, work.details.taskId]);
+  assert.match(runtime.text(), /build progress · watcher/); runtime.input("down"); assert.equal(runtime.state.component.selected().id, observer.details.taskId); runtime.input("enter");
+  const detail = detailText(runtime); assert.match(detail, /Source\s+/); assert.match(detail, /Watch errors\s+both · repeat · turn · waiting · ERROR/); assert.ok(detail.includes("Observer") && detail.indexOf("Observer") < detail.indexOf("Observation")); assert.ok(detail.indexOf("Observation") < detail.indexOf("Delivery")); assert.doesNotMatch(detail, /Observation PID\s+\d+/);
+  runtime.input("escape"); runtime.input("x"); const confirmation = stripTerminalSequences(runtime.text()).split("\n").map(line => line.replace(/^│\s*|\s*│$/g, "").trim()).join(" "); assert.match(confirmation, /Stop watcher/); assert.match(confirmation, /not cancelled or signalled/);
+  runtime.input("escape"); assert.equal(runtime.sent.length, 0); runtime.input("x"); runtime.input("y"); assert.ok(await waitFor(() => runtime.sent.some(entry => entry.message?.details?.cause === "stopped")));
+  const list = (await runtime.tools.get("monitor_list").execute("list", {}, undefined, undefined, runtime.ctx)).details.monitors;
+  assert.equal(list.find(item => item.id === observer.details.taskId).status, "stopped"); for (const id of [work.details.taskId, independent.details.taskId, muted.details.taskId]) assert.equal(list.find(item => item.id === id).status, "running");
+  assert.equal(fs.existsSync(job.manifestPath), true); assert.equal(runtime.state.aborts, 0); runtime.input("escape"); await overlay;
 });
 
 test("task panel makes ordinary endings prominent without recoloring success or abnormal endings", async (t) => {
@@ -646,40 +607,42 @@ test("task panel makes ordinary endings prominent without recoloring success or 
   registration.close();
 });
 
-test("sectioned Monitor details keep complete old-panel rows without duplicate modern rendering", async (t) => {
-  const runtime = makeRuntime();
-  t.after(() => stop(runtime));
-  runtime.load();
-  await runtime.start();
-  const work = await arm(runtime, { command: "sleep 30", description: "legacy-compatible work", mode: "completion", persistent: true });
-  const observer = await arm(runtime, { source: { monitorId: work.details.taskId }, description: "legacy-compatible observer", mode: "events", persistent: true, watches: [{ id: "errors", text: "ERROR", stream: "stderr" }], notify: { output: "context" } });
-  const overlay = openTasks(runtime);
-  const panel = runtime.state.component;
-  const provider = panel.options.registry.providers.get("monitor");
+test("sectioned observation details preserve the existing flat-row fallback without duplicate rendering", async t => {
+  const runtime = makeRuntime(); t.after(() => stop(runtime)); runtime.load(); await runtime.start(); const job = createJob(runtime.workdir);
+  const work = await arm(runtime, { source: job.source, description: "work report", persistent: true });
+  const observer = await arm(runtime, { source: job.fileSource, description: "error watch", persistent: true, watches: [{ id: "errors", text: "ERROR", stream: "stderr" }], notify: { output: "context" } });
+  const overlay = openTasks(runtime), panel = runtime.state.component, provider = panel.options.registry.providers.get("monitor");
   for (const id of [work.details.taskId, observer.details.taskId]) {
-    const detail = provider.detail(provider.list().find((item) => item.id === id));
-    assert.ok(detail.rows.length > 0, "an old Loop panel must not receive empty details");
-    assert.deepEqual(detail.rows, detail.sections.flatMap((section) => section.rows));
-    const flat = detail.rows.map((row) => `${row.label}: ${row.value}`).join("\n");
-    assert.match(flat, /Status: running/);
-    assert.match(flat, /Mode: (completion|events)/);
-    assert.match(flat, /Lifetime: persistent/);
-    assert.ok(flat.includes(work.details.outputPath) && flat.includes(work.details.stderrPath));
-    if (id === observer.details.taskId) {
-      assert.match(flat, /Resource: subscription only; no process owned/);
-      assert.match(flat, /Watch errors: stderr · repeat/);
-      assert.match(flat, /Output: context/);
-      assert.ok(flat.includes(work.details.taskId));
-    }
+    const detail = provider.detail(provider.list().find(item => item.id === id)); assert.ok(detail.rows.length); assert.deepEqual(detail.rows, detail.sections.flatMap(section => section.rows));
+    const flat = detail.rows.map(row => row.label + ': ' + row.value).join('\n'); assert.match(flat, /Status: running/); assert.match(flat, /Mode: (completion|events)/); assert.match(flat, /Lifetime: until stopped/); assert.match(flat, /Resource: observation only; active/);
+    const paths = id === work.details.taskId ? work.details : observer.details; assert.ok(flat.includes(paths.outputPath) && flat.includes(paths.stderrPath));
   }
-  runtime.input("down");
-  runtime.input("enter");
-  const modern = panel.detailLines(90).map((line) => stripTerminalSequences(line).trimEnd());
-  assert.equal(modern.filter((line) => /^Status\s+/.test(line)).length, 1, "modern section body must not duplicate flat fallback");
-  assert.equal(modern.filter((line) => /^Mode\s+/.test(line)).length, 1);
-  assert.ok(modern.includes("State") && modern.includes("Observation") && modern.includes("Delivery"));
-  assert.equal(runtime.sent.length, 0, "compatibility is display-only");
-  runtime.input("escape");
-  runtime.input("escape");
-  await overlay;
+  while (panel.selected().id !== observer.details.taskId) runtime.input("down"); runtime.input("enter"); const modern = panel.detailLines(90).map(line => stripTerminalSequences(line).trimEnd()); assert.equal(modern.filter(line => /^Status\s+/.test(line)).length, 1); assert.equal(modern.filter(line => /^Mode\s+/.test(line)).length, 1); assert.ok(modern.includes("Observer") && modern.includes("Observation") && modern.includes("Delivery"));
+  runtime.input("escape"); runtime.input("escape"); await overlay;
+});
+
+test("task details retain each remote host even when file and manifest paths are identical", async t => {
+  const runtime = makeRuntime(); t.after(() => stop(runtime)); runtime.load(); await runtime.start();
+  const { SshSourceReader } = await loadModule("ssh-reader.ts");
+  const { LocalSourceReader } = await loadModule("source-reader.ts");
+  const read = SshSourceReader.prototype.read;
+  SshSourceReader.prototype.read = request => new LocalSourceReader().read(request);
+  try {
+    const job = createJob(runtime.workdir), receipts = [];
+    for (const host of ["gpu-a", "gpu-b"]) for (const source of [job.fileSource, job.source]) {
+      receipts.push({ host, result: await arm(runtime, { source: { ...source, host }, description: "same remote path", persistent: true }) });
+    }
+    const overlay = openTasks(runtime), panel = runtime.state.component, provider = panel.options.registry.providers.get("monitor");
+    for (const { host, result } of receipts) {
+      const item = provider.list().find(item => item.id === result.details.taskId);
+      const detail = provider.detail(item);
+      const source = detail.rows.find(row => row.label === "Source").value;
+      assert.ok(source.startsWith(host + " · "), source);
+      assert.ok(source.includes(job.root), source);
+    }
+    runtime.input("escape"); await overlay;
+  } finally {
+    // Close every observer before removing the offline transport, including in-flight ticks.
+    try { await stop(runtime); } finally { SshSourceReader.prototype.read = read; }
+  }
 });

@@ -26,17 +26,16 @@ const policy = { retentionMs: 3 * DAY, budgetBytes: 200 * 1024 * 1024 };
 function finish(root, id, now, age = 5 * DAY) {
 	const task = createTaskDirectory(root, id, now - age - DAY);
 	fs.writeFileSync(task.outputPath, "retained output");
-	fs.writeFileSync(path.join(task.artifactDir, "verify.py"), "print('ok')");
+	fs.writeFileSync(task.stderrPath, "retained stderr");
 	markTaskReady(task, now - age, now - age);
 	backdate(task.path, now - age);
 	return task;
 }
 
-test("task directories own logs and scratch files without changing the project cwd", (t) => {
+test("task directories own log copies without changing the project cwd", (t) => {
 	const { root } = fixture(t), task = createTaskDirectory(root, "abc12345");
 	assert.equal(path.dirname(task.path), root.path);
 	assert.ok(task.outputPath.endsWith("abc12345.out.log"));
-	assert.ok(fs.statSync(task.artifactDir).isDirectory());
 	if (process.platform !== "win32") assert.equal(fs.statSync(task.path).mode & 0o777, 0o700);
 	assert.throws(() => createTaskDirectory(root, "../escape"));
 });
@@ -92,7 +91,7 @@ test("recent nested writes protect old closed runtimes", (t) => {
 	const metaFile = path.join(root.path, "owner.json"), meta = JSON.parse(fs.readFileSync(metaFile, "utf8"));
 	meta.createdAt = now - 6 * DAY; meta.closedAt = now - 5 * DAY;
 	fs.writeFileSync(metaFile, JSON.stringify(meta)); backdate(root.path, now - 5 * DAY);
-	fs.writeFileSync(path.join(task.artifactDir, "recent.txt"), "recent result");
+	fs.writeFileSync(path.join(task.path, "recent.log"), "recent result");
 	cleanOldLogDirectories(now, base, { policy });
 	assert.ok(fs.existsSync(root.path));
 });
@@ -104,7 +103,7 @@ test("symlink targets and directories with invalid task ownership remain untouch
 	const outside = fs.mkdtempSync(path.join(os.tmpdir(), "monitor-gc-victim-"));
 	t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
 	fs.writeFileSync(path.join(outside, "keep"), "important");
-	fs.symlinkSync(outside, path.join(old.artifactDir, "link"));
+	fs.symlinkSync(outside, path.join(old.path, "link"));
 	backdate(old.path, now - 5 * DAY);
 	cleanOldLogDirectories(now, base, { policy, current: root });
 	assert.equal(fs.existsSync(old.path), false);

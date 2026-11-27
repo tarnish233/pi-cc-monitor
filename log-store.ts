@@ -9,6 +9,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isPidAlive, writeAtomic } from "./plugin-settings.ts";
 
 const DIR_PREFIX = "pi-cc-monitor-";
 const METADATA_NAME = "owner.json";
@@ -42,7 +43,6 @@ export interface TaskDirectory {
 	root: LogDirectory;
 	outputPath: string;
 	stderrPath: string;
-	artifactDir: string;
 }
 interface TaskMetadata {
 	schema: typeof TASK_SCHEMA;
@@ -72,13 +72,7 @@ function chmodOrNull(target: string, mode: number): void {
 	try { fs.chmodSync(target, mode); } catch { /* best effort on Windows */ }
 }
 function writeMetadata(dir: string, name: string, metadata: unknown): void {
-	const temp = path.join(dir, `${name}.tmp-${process.pid}-${randomUUID()}`);
-	try {
-		fs.writeFileSync(temp, `${JSON.stringify(metadata, null, "\t")}\n`, { mode: 0o600 });
-		fs.renameSync(temp, path.join(dir, name));
-	} finally {
-		try { fs.rmSync(temp, { force: true }); } catch { /* a later owned-directory GC can recover it */ }
-	}
+	writeAtomic(path.join(dir, name), `${JSON.stringify(metadata, null, "\t")}\n`);
 }
 function readMetadata(file: string): Record<string, unknown> | undefined {
 	const stat = fs.lstatSync(file);
@@ -140,31 +134,17 @@ export function createLogDirectory(base: string = os.tmpdir()): LogDirectory {
 		} catch { /* shutdown must never throw, and close never deletes data */ }
 	} };
 }
-/** Config writes also use marked, private staging directories, never loose *.tmp files. */
-export function writeOwnedAtomic(file: string, text: string): void {
-	const stage = createLogDirectory(path.dirname(file));
-	try {
-		const temp = path.join(stage.path, "config.tmp");
-		fs.writeFileSync(temp, text, { mode: 0o600 });
-		fs.renameSync(temp, file);
-	} finally {
-		stage.close();
-		try { fs.rmSync(stage.path, { recursive: true, force: true }); } catch { /* collectible later; never fail an already-saved setting */ }
-	}
-}
-
 export function createTaskDirectory(root: LogDirectory, id: string, now = Date.now()): TaskDirectory {
 	if (!TASK_ID.test(id) || !owns(root)) throw new Error("invalid task id or artifact directory ownership");
 	const dir = path.join(root.path, id);
 	fs.mkdirSync(dir, { mode: 0o700 });
-	const task: TaskDirectory = { id, path: dir, root, outputPath: path.join(dir, `${id}.out.log`), stderrPath: path.join(dir, `${id}.err.log`), artifactDir: path.join(dir, "artifacts") };
+	const task: TaskDirectory = { id, path: dir, root, outputPath: path.join(dir, `${id}.out.log`), stderrPath: path.join(dir, `${id}.err.log`) };
 	const meta: TaskMetadata = { schema: TASK_SCHEMA, version: 1, kind: "task", id, ownerToken: root.token, createdAt: now, endedAt: null, readyAt: null };
 	try {
-		fs.mkdirSync(task.artifactDir, { mode: 0o700 });
 		writeMetadata(dir, TASK_MARKER, meta);
 		return task;
 	} catch (error) {
-		// No command/socket has started yet; never leave an uncollectible half-task.
+		// No observer/socket has started yet; never leave an uncollectible half-task.
 		try { fs.rmSync(dir, { recursive: true, force: true }); } catch {
 			try { writeMetadata(dir, TASK_MARKER, { ...meta, endedAt: now, readyAt: now, resourcePid: null }); } catch { /* uncertain leftovers stay protected */ }
 		}
@@ -200,10 +180,6 @@ export function markTaskReady(task: TaskDirectory, endedAt: number, now = Date.n
 		writeMetadata(task.path, TASK_MARKER, { ...meta, endedAt, readyAt: now, resourcePid: null });
 		return true;
 	} catch { return false; /* uncertain/incomplete markers are never reclaimed in a live runtime */ }
-}
-function isPidAlive(pid: number, group = false): boolean {
-	try { process.kill(group && process.platform !== "win32" ? -pid : pid, 0); return true; }
-	catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
 interface TreeInfo { bytes: number; latest: number }
 /** lstat only; a symbolic link contributes no external data or activity. */

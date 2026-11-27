@@ -1,86 +1,41 @@
+/** PID ownership is limited to the fixed local SSH observation helper. */
 import assert from 'node:assert/strict';
 import cp from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
+import { loadModule } from './helpers.mjs';
 
-// jiti captures the named spawn import when process.ts first loads, so the
-// fake must be reachable through a delegate installed before that load.
-const realSpawn = cp.spawn;
-let spawnImpl = realSpawn;
-cp.spawn = (...args) => spawnImpl(...args);
-syncBuiltinESMExports();
-const { createHarness, until, sleep } = await import('./runtime-harness.mjs');
-
-const FAKE_PID = 424242;
-function fakeChild() {
-  return Object.assign(new EventEmitter(), {
-    pid: FAKE_PID, stdout: new PassThrough(), stderr: new PassThrough(),
-    exitCode: null, signalCode: null,
-    kill() { throw new Error('no direct child fallback expected'); },
-  });
+const realSpawn = cp.spawn; let spawnImpl = realSpawn;
+cp.spawn = (...args) => spawnImpl(...args); syncBuiltinESMExports();
+const { SshSourceReader } = await loadModule('ssh-reader.ts');
+const PID = 424242;
+function child() {
+  const value = Object.assign(new EventEmitter(), { pid: PID, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), exitCode: null, signalCode: null, killed: false, kill() { throw new Error('no direct fallback expected'); } });
+  value.stdin.write = line => { const request = JSON.parse(line); queueMicrotask(() => value.stdout.write(JSON.stringify({ requestId: request.requestId, identity: '1:1', size: 0, offset: request.offset ?? 0, data: '', guard: '' }) + '\n')); return true; };
+  return value;
 }
-
-// These fakes model POSIX process groups; Windows would use real taskkill.
-test('late close after a confirmed stop never probes or signals a reused PID', { skip: process.platform === 'win32' }, async (t) => {
-  const h = createHarness();
-  const child = fakeChild();
-  const kill = process.kill;
-  let live = true, phase = 'owned';
-  const requests = [];
-  spawnImpl = () => child;
-  process.kill = (pid, signal) => {
-    assert.equal(pid, -FAKE_PID, 'no real PID may be signalled');
-    requests.push({ phase, signal });
-    if (signal === 0) { if (!live) throw Object.assign(new Error('gone'), { code: 'ESRCH' }); return true; }
-    live = false; return true;
+function fixture(t) {
+  const helper = child(), originalKill = process.kill; let live = true, phase = 'owned'; const requests = [];
+  spawnImpl = () => helper; process.kill = (pid, signal) => {
+    assert.equal(pid, -PID, 'only the allocated observation helper group can be probed/signalled'); requests.push({ phase, signal });
+    if (signal === 0) { if (!live) throw Object.assign(new Error('gone'), { code: 'ESRCH' }); return true; } live = false; return true;
   };
-  syncBuiltinESMExports();
-  t.after(() => { spawnImpl = realSpawn; process.kill = kill; syncBuiltinESMExports(); child.stdout.destroy(); child.stderr.destroy(); });
-  try {
-    const job = (await h.call('Monitor', { mode: 'completion', command: ':', description: 'fake PID lifetime', persistent: true })).details;
-    const stopped = await h.call('monitor_stop', { id: job.taskId });
-    assert.equal(stopped.details.stopped, true);
-    assert.equal((await h.snapshots())[0].resourceActive, undefined);
-    // The stopped group is gone and a different group has reused the ID.
-    phase = 'reused'; live = true;
-    child.stdout.end(); child.stderr.end(); child.emit('close', 0, null);
-    assert.ok(await until(async () => (await h.snapshots())[0].exitCode === 0), 'the late exit code still corrects the record');
-    await sleep(50);
-    assert.equal(requests.filter((r) => r.phase === 'reused').length, 0, 'a released resource must not be probed or signalled again');
-    const record = (await h.snapshots())[0];
-    assert.equal(record.status, 'stopped');
-    assert.equal(h.sent.filter((m) => m.message.details.cause === 'stopped').length, 1, 'exactly one closing notice');
-    assert.equal(h.sent.length, 1);
-  } finally { await h.close(); }
+  t.after(() => { spawnImpl = realSpawn; process.kill = originalKill; helper.stdin.destroy(); helper.stdout.destroy(); helper.stderr.destroy(); });
+  const reader = new SshSourceReader('fixture-host');
+  return { helper, reader, requests, reuse() { live = true; phase = 'reused'; }, live() { return live; } };
+}
+test('late close after confirmed observation stop never probes/signals a reused PID', { skip: process.platform === 'win32' }, async t => {
+  const f = fixture(t); await f.reader.read({ path: '/literal/source', maxBytes: 10 }); assert.equal(await f.reader.stop(), true); assert.equal(f.reader.pid, undefined);
+  f.reuse(); f.helper.emit('close', 0); await new Promise(r => setTimeout(r, 30)); assert.equal(f.requests.filter(r => r.phase === 'reused').length, 0); assert.equal(f.reader.active, false);
 });
-
-test('natural exit with a living same-group child still cleans the group up', { skip: process.platform === 'win32' }, async (t) => {
-  const h = createHarness();
-  const child = fakeChild();
-  const kill = process.kill;
-  let live = true;
-  const requests = [];
-  spawnImpl = () => child;
-  process.kill = (pid, signal) => {
-    assert.equal(pid, -FAKE_PID, 'no real PID may be signalled');
-    requests.push({ signal });
-    if (signal === 0) { if (!live) throw Object.assign(new Error('gone'), { code: 'ESRCH' }); return true; }
-    live = false; return true;
-  };
-  syncBuiltinESMExports();
-  t.after(() => { spawnImpl = realSpawn; process.kill = kill; syncBuiltinESMExports(); child.stdout.destroy(); child.stderr.destroy(); });
-  try {
-    const job = (await h.call('Monitor', { mode: 'completion', command: ':', description: 'natural exit, living group', persistent: true })).details;
-    // The shell exits but a background child keeps the group alive.
-    child.stdout.end(); child.stderr.end(); child.emit('close', 0, null);
-    assert.ok(await until(async () => (await h.snapshots())[0].resourceActive === undefined), 'the living group must be released');
-    assert.ok(requests.some((r) => r.signal === 'SIGTERM'), 'exit-path cleanup must still signal the owned group');
-    const record = (await h.snapshots())[0];
-    assert.equal(record.status, 'completed');
-    assert.equal(record.exitCode, 0);
-    assert.equal(h.sent.length, 1);
-    assert.equal(job.taskId, record.id);
-  } finally { await h.close(); }
+test('an ended SSH helper with a living owned proxy group is still cleaned up', { skip: process.platform === 'win32' }, async t => {
+  const f = fixture(t); await f.reader.read({ path: '/literal/source', maxBytes: 10 }); f.helper.emit('close', 0);
+  const end = Date.now() + 1000; while (f.reader.pid !== undefined && Date.now() < end) await new Promise(r => setTimeout(r, 10));
+  assert.equal(f.reader.active, false); assert.ok(f.requests.some(r => r.signal === 'SIGTERM')); assert.equal(f.reader.pid, undefined);
+});
+test('helper stop does not accept or consult any business job PID', { skip: process.platform === 'win32' }, async t => {
+  const f = fixture(t); await f.reader.read({ path: '/literal/source', maxBytes: 10 }); await f.reader.stop();
+  assert.ok(f.requests.length > 0); assert.ok(f.requests.every(r => r.signal === 0 || r.signal === 'SIGTERM' || r.signal === 'SIGKILL'));
 });

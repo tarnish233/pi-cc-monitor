@@ -18,6 +18,6 @@ test("every source module is in the npm package", { skip: pack.status !== 0 && "
 	const sources = fs.readdirSync(extensionDir).filter((name) => name.endsWith(".ts"));
 	assert.ok(sources.length > 0);
 	for (const source of sources) assert.ok(packed.has(source), `${source} is missing from the package`);
-	for (const required of ["package.json", "README.md", "LICENSE", "scripts/typecheck.mjs", "scripts/host-paths.mjs"]) assert.ok(packed.has(required), required);
-	assert.ok(![...packed].some((file) => file.startsWith("tests/")), "tests are not shipped");
+	for (const required of ["package.json", "README.md", "LICENSE", "docs/OBSERVATION_PROTOCOL.md", "docs/RUNNERS.md", "examples/job-wrapper.py"]) assert.ok(packed.has(required), required);
+	assert.ok(![...packed].some((file) => file.startsWith("tests/") || file.startsWith("scripts/")), "dev scripts and tests are not shipped");
 });

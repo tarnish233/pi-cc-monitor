@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadModule } from "./helpers.mjs";
-const { createLogDirectory, createTaskDirectory, markTaskReady, setTaskProcess, writeOwnedAtomic, cleanOldLogDirectories } = await loadModule("log-store.ts");
+const { createLogDirectory, createTaskDirectory, markTaskReady, setTaskProcess, cleanOldLogDirectories } = await loadModule("log-store.ts");
+const { writeAtomic } = await loadModule("plugin-settings.ts");
 const DAY=86400000;
 function fixture(t) {
 	const base=fs.mkdtempSync(path.join(os.tmpdir(),"artifact-safety-"));
@@ -21,12 +22,12 @@ test("runtime-marker initialization failure rolls back its unpublished directory
 });
 
 test("failed task initialization rolls back only the newly allocated task",(t)=>{
-	const base=fixture(t), root=createLogDirectory(base), kept=createTaskDirectory(root,"keep1234"), original=fs.mkdirSync;
+	const base=fixture(t), root=createLogDirectory(base), kept=createTaskDirectory(root,"keep1234"), original=fs.writeFileSync;
 	fs.writeFileSync(kept.outputPath,"keep me");
 	try {
-		fs.mkdirSync=(file,...args)=>{if(file===path.join(root.path,"fail1234","artifacts"))throw new Error("artifact mkdir failed");return original(file,...args);};
-		assert.throws(()=>createTaskDirectory(root,"fail1234"),/artifact mkdir failed/);
-	} finally {fs.mkdirSync=original;}
+		fs.writeFileSync=(file,...args)=>{if(String(file).startsWith(path.join(root.path,"fail1234")+path.sep)&&path.basename(String(file)).startsWith("task.json.tmp-"))throw new Error("task marker failed");return original(file,...args);};
+		assert.throws(()=>createTaskDirectory(root,"fail1234"),/task marker failed/);
+	} finally {fs.writeFileSync=original;}
 	assert.equal(fs.existsSync(path.join(root.path,"fail1234")),false);
 	assert.equal(fs.readFileSync(kept.outputPath,"utf8"),"keep me");
 	assert.throws(()=>createTaskDirectory(root,"keep1234"),/EEXIST/);
@@ -68,24 +69,22 @@ test("confirmed process cleanup clears the PID without pretending the terminal w
 	assert.equal(meta.resourcePid,null);assert.equal(meta.readyAt,null);
 });
 
-test("atomic config rename failure retains the old data and removes staging",(t)=>{
+test("atomic config rename failure retains the old data and removes temp file",(t)=>{
 	const base=fixture(t), file=path.join(base,"settings.json"), original=fs.renameSync;
 	fs.writeFileSync(file,"old settings");
 	try {
 		fs.renameSync=(from,to)=>{if(to===file)throw new Error("rename failed");return original(from,to);};
-		assert.throws(()=>writeOwnedAtomic(file,"new settings"),/rename failed/);
+		assert.throws(()=>writeAtomic(file,"new settings"),/rename failed/);
 	} finally {fs.renameSync=original;}
 	assert.equal(fs.readFileSync(file,"utf8"),"old settings");assert.deepEqual(fs.readdirSync(base),["settings.json"]);
 });
 
-test("an atomic-config cleanup error is nonfatal and its closed staging can be reclaimed later",(t)=>{
+test("an atomic-config cleanup error after rename is nonfatal",(t)=>{
 	const base=fixture(t), file=path.join(base,"settings.json"), original=fs.rmSync;
 	try {
-		fs.rmSync=(target,options)=>{if(path.basename(String(target)).startsWith("pi-cc-monitor-"))throw new Error("cleanup failed");return original(target,options);};
-		assert.doesNotThrow(()=>writeOwnedAtomic(file,"saved"));
+		fs.rmSync=(target,options)=>{if(path.basename(String(target)).startsWith("settings.json.tmp-"))throw new Error("cleanup failed");return original(target,options);};
+		assert.doesNotThrow(()=>writeAtomic(file,"saved"));
 	} finally {fs.rmSync=original;}
 	assert.equal(fs.readFileSync(file,"utf8"),"saved");
-	assert.equal(fs.readdirSync(base).filter(n=>n.startsWith("pi-cc-monitor-")).length,1);
-	cleanOldLogDirectories(Date.now()+5*DAY,base);
 	assert.deepEqual(fs.readdirSync(base),["settings.json"]);
 });

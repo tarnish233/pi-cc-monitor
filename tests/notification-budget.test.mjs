@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadModule } from "./helpers.mjs";
+import { createJob } from "./observation-fixtures.mjs";
 
 const { default: factory } = await loadModule("index.ts");
 const { MAX_BATCH_CHARS, MAX_LINE_CHARS, RateLimiter, TRUNCATED } = await loadModule("stream.ts");
@@ -41,13 +42,19 @@ const raw = Array.from({ length: 8 }, (_, i) => `LINE_${i} ` + "X".repeat(800) +
 const command = "node -e 'process.stdout.write(" + JSON.stringify(raw) + ")'; sleep 0.3";
 
 async function run(h, params) {
-	const receipt = await h.tools.get("Monitor").execute("run", { command, description: "budget", ...params }, undefined, undefined, h.ctx);
-	const end = Date.now() + 5000;
-	while (Date.now() < end) {
-		if (h.sent.some(value => value.message.details.cause === "exit")) return receipt;
+	const job = createJob(h.ctx.cwd, { stdout: raw });
+	const receipt = await h.tools.get("Monitor").execute("observe", { source: job.source, description: "budget", ...params }, undefined, undefined, h.ctx);
+	if (params.mode === "events") {
+		const deadline = Date.now() + 5000;
+		while (!h.sent.some(value => value.message.details.cause === "output") && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+	}
+	job.status("succeeded");
+	const deadline = Date.now() + 5000;
+	while (Date.now() < deadline) {
+		if (h.sent.some(value => value.message.details.cause === "job")) return receipt;
 		await new Promise(resolve => setTimeout(resolve, 10));
 	}
-	throw new Error("the fixture did not complete");
+	throw new Error("the external result was not observed");
 }
 
 function fakeSuppression(t, count) {

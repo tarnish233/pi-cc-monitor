@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 import { extensionDir, findPiInstall } from "./helpers.mjs";
+import { createJob } from "./observation-fixtures.mjs";
 
 const { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } =
 	await import(pathToFileURL(findPiInstall().piCodingAgent).href);
@@ -20,7 +21,7 @@ async function until(predicate) {
 }
 
 const terminalEntries = session => session.sessionManager.getBranch().filter(entry =>
-	entry.type === "custom_message" && entry.customType === "Monitor" && entry.details?.cause === "exit");
+	entry.type === "custom_message" && entry.customType === "Monitor" && entry.details?.cause === "job");
 const hasCompletion = messages => messages.some(message =>
 	message.role === "custom" && message.customType === "Monitor" && message.details?.status === "completed");
 
@@ -37,7 +38,7 @@ for (const { boundary, terminal, jobs = 1, queued = false, aborted = false } of 
 		const cwd = path.join(root, "project"), agentDir = path.join(root, "agent");
 		fs.mkdirSync(cwd);
 		fs.mkdirSync(agentDir);
-		const release = path.join(cwd, "release");
+		const fixtures = Array.from({ length: jobs }, () => createJob(cwd));
 		const provider = `monitor-fixture-${boundary.replaceAll(" ", "-")}`;
 		const model = {
 			id: "scripted", name: "scripted", api: "openai-completions", provider,
@@ -68,7 +69,7 @@ for (const { boundary, terminal, jobs = 1, queued = false, aborted = false } of 
 			}
 		});
 		const completeDuringCurrentWork = async () => {
-			fs.writeFileSync(release, "go");
+			for (const fixture of fixtures) { fs.appendFileSync(fixture.stdout, "SDK-COMPLETED\n"); fixture.status("succeeded"); }
 			await until(async () => {
 				const runner = session.extensionRunner;
 				const list = await runner.getToolDefinition("monitor_list").execute("inspect", {}, undefined, undefined, runner.createContext());
@@ -97,8 +98,6 @@ for (const { boundary, terminal, jobs = 1, queued = false, aborted = false } of 
 		}));
 		await session.bindExtensions({ mode: "print", onError: error => errors.push(error) });
 		session.subscribe(event => events.push(event.type));
-		const code = "const fs=require('node:fs');const timer=setInterval(()=>{if(fs.existsSync(process.argv[1])){clearInterval(timer);console.log('SDK-COMPLETED')}},10)";
-		const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(code)} ${JSON.stringify(release)}`;
 		// Keep real AgentSession request preparation, tool execution, persistence,
 		// boundaries and settlement; only replace the provider's response stream.
 		session.agent.streamFunction = async (_model, context) => {
@@ -109,7 +108,7 @@ for (const { boundary, terminal, jobs = 1, queued = false, aborted = false } of 
 			if (index === 0) {
 				content = Array.from({ length: jobs }, (_, job) => ({
 					type: "toolCall", id: `launch-${job}`, name: "Monitor", arguments: {
-						command, mode: "completion", description: `SDK completion ${job}`, timeout_ms: 10000,
+						source: fixtures[job].source, mode: "completion", description: `SDK completion ${job}`, timeout_ms: 10000,
 					},
 				}));
 			} else if (index === 1) {

@@ -1,141 +1,68 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import path from 'node:path';
 import test from 'node:test';
 import { loadModule } from './helpers.mjs';
-import { createHarness, until, startReady, groupAlive } from './runtime-harness.mjs';
-
+import { fixtureGroup, createHarness, until, startReady } from './runtime-harness.mjs';
+import { createJob } from './observation-fixtures.mjs';
 const { OutputBudget, outputLevel } = await loadModule('notification-budget.ts');
+function h(t, options) { const value = createHarness(options); t.after(() => value.close()); return value; }
+function jobResult(value) { return value.sent.filter(m => m.message.details.cause === 'job'); }
 
-function heldCommand(h, name, second = false) {
-  const release = path.join(h.cwd, name + '-release');
-  const emit = path.join(h.cwd, name + '-emit');
-  const command = `printf '${name}\\n'; ${second ? `while [ ! -f ${JSON.stringify(emit)} ]; do sleep 0.02; done; printf '${name}-second\\n'; ` : ''}while [ ! -f ${JSON.stringify(release)} ]; do sleep 0.02; done`;
-  return { command, release, emit };
-}
-
-test('global fixed window admits 20 output messages, including at refill boundaries', () => {
-  let now = 0;
-  const budget = new OutputBudget({ now: () => now });
-  for (let i = 0; i < 20; i++) assert.equal(budget.take(), true);
-  assert.equal(budget.take(), false);
-  now = 59_999; assert.equal(budget.take(), false); assert.equal(budget.remainingMs(), 1);
-  now = 60_000; assert.equal(budget.take(), true);
-  for (let i = 1; i < 20; i++) assert.equal(budget.take(), true);
-  assert.equal(budget.take(), false);
-  assert.equal(outputLevel('none', 'turn'), 'none');
-  assert.equal(outputLevel('context', 'turn'), 'context');
-  assert.equal(outputLevel('turn', 'context'), 'context');
+test('global fixed window admits 20 output messages including refill boundaries', () => {
+  let now = 0; const budget = new OutputBudget({ now: () => now });
+  for (let i = 0; i < 20; i++) assert.equal(budget.take(), true); assert.equal(budget.take(), false);
+  now = 59999; assert.equal(budget.take(), false); assert.equal(budget.remainingMs(), 1);
+  now = 60000; assert.equal(budget.take(), true); for (let i = 1; i < 20; i++) assert.equal(budget.take(), true); assert.equal(budget.take(), false);
+  assert.equal(outputLevel('none', 'turn'), 'none'); assert.equal(outputLevel('context', 'turn'), 'context'); assert.equal(outputLevel('turn', 'context'), 'context');
 });
-
-test('context output and terminal messages never request a model turn', async (t) => {
-  const h = createHarness(); t.after(() => h.close());
-  const fixture = heldCommand(h, 'CONTEXT');
-  await h.call('Monitor', { command: fixture.command, description: 'context', notify: { output: 'context' } });
-  assert.ok(await until(() => h.sent.some((m) => m.message.details.cause === 'output')));
-  assert.equal(h.sent[0].options.triggerTurn, false);
-  fs.writeFileSync(fixture.release, 'go');
-  assert.ok(await until(() => h.sent.some((m) => m.message.details.cause === 'exit')));
-  assert.equal(h.sent.find((m) => m.message.details.cause === 'exit').options.triggerTurn, true);
-  assert.ok(h.sent.every((m) => m.message.content.length <= 3000));
+test('context output does not request a turn, but the external terminal result does', async t => {
+  const value = h(t), job = createJob(value.cwd, { stdout: 'CONTEXT\n' });
+  await value.call('Monitor', { source: job.source, mode: 'events', description: 'context', notify: { output: 'context' } });
+  assert.ok(await until(() => value.sent.some(m => m.message.details.cause === 'output'))); assert.equal(value.sent[0].options.triggerTurn, false);
+  job.status('succeeded'); assert.ok(await until(() => jobResult(value).length === 1)); assert.equal(jobResult(value)[0].options.triggerTurn, true); assert.ok(value.sent.every(m => m.message.content.length <= 3000));
 });
-
-test('output none leaves full raw stdout/stderr and a visible failure outcome', async (t) => {
-  const h = createHarness(); t.after(() => h.close());
-  const receipt = await h.call('Monitor', { command: "printf 'QUIET\\n'; printf 'problem\\n' >&2; exit 7", description: 'muted failure', mode: 'completion', notify: { output: 'none' } });
-  assert.ok(await until(() => h.sent.length));
-  assert.equal(h.sent.length, 1);
-  assert.equal(h.sent[0].message.details.status, 'failed');
-  assert.equal(h.sent[0].options.triggerTurn, true);
-  assert.equal(fs.readFileSync(receipt.details.outputPath, 'utf8'), 'QUIET\n');
-  assert.equal(fs.readFileSync(receipt.details.stderrPath, 'utf8'), 'problem\n');
-  await assert.rejects(h.call('Monitor', { command: 'echo forbidden', description: 'bad policy', notify: { terminal: 'none' } }), /end, failure and stop always wake/);
+test('output none keeps copies and reports job failure without failing observation', async t => {
+  const value = h(t), job = createJob(value.cwd, { stdout: 'QUIET\n', stderr: 'problem\n', state: 'failed' }); job.status('failed', { exitCode: 7 });
+  const receipt = (await value.call('Monitor', { source: job.source, description: 'muted failure', notify: { output: 'none' } })).details;
+  assert.ok(await until(() => jobResult(value).length === 1)); assert.equal(value.sent.length, 1); assert.equal(jobResult(value)[0].message.details.status, 'completed'); assert.equal(jobResult(value)[0].message.details.job.state, 'failed');
+  assert.equal(jobResult(value)[0].options.triggerTurn, true); assert.equal(fs.readFileSync(receipt.outputPath, 'utf8'), 'QUIET\n'); assert.equal(fs.readFileSync(receipt.stderrPath, 'utf8'), 'problem\n');
+  await assert.rejects(value.call('Monitor', { source: job.source, description: 'bad policy', notify: { terminal: 'none' } }), /end, failure and stop/);
 });
-
-test('critical events-mode terminal result survives busy Esc settlement without restarting', async (t) => {
-  const h = createHarness({ idle: false }); t.after(() => h.close());
-  await h.call('Monitor', { command: "printf 'FINAL\\n'", description: 'final batch' });
-  assert.ok(await until(async () => (await h.snapshots())[0].status === 'exited'));
-  assert.equal(h.sent.length, 0, 'terminal result stays outside the busy queue');
-  h.setIdle(true);
-  await h.emit('agent_settled', { aborted: true });
-  assert.equal(h.sent.length, 1);
-  assert.equal(h.sent[0].message.details.cause, 'exit');
-  assert.ok(h.sent[0].message.details.finalLines.includes('FINAL'));
-  assert.equal(h.sent[0].options.triggerTurn, false);
-  await h.emit('agent_settled', { aborted: false });
-  assert.equal(h.sent.length, 1);
+test('events terminal survives busy aborted settlement without restarting', async t => {
+  const value = h(t, { idle: false }), job = createJob(value.cwd, { stdout: 'FINAL\n', state: 'succeeded' });
+  await value.call('Monitor', { source: job.source, mode: 'events', description: 'final batch' }); assert.ok(await until(async () => (await value.snapshots())[0].status === 'completed')); assert.equal(value.sent.length, 0);
+  value.setIdle(true); await value.emit('agent_settled', { aborted: true }); assert.equal(value.sent.length, 1); assert.equal(value.sent[0].message.details.cause, 'job'); assert.ok(value.sent[0].message.details.finalLines.includes('FINAL')); assert.equal(value.sent[0].options.triggerTurn, false);
+  await value.emit('agent_settled', { aborted: false }); assert.equal(value.sent.length, 1);
 });
-
-test('stop preserves pre-stop buffered output in one context-only outcome', async (t) => {
-  const h = createHarness(); t.after(() => h.close());
-  const job = await startReady(h, { mode: 'events' });
-  assert.equal(h.sent.length, 0, 'fixture stops before the 200ms batch timer');
-  assert.equal((await h.call('monitor_stop', { id: job.taskId })).details.stopped, true);
-  assert.equal(h.sent.length, 1);
-  const message = h.sent[0];
-  assert.equal(message.message.details.cause, 'stopped');
-  assert.ok(message.message.details.finalLines.includes('READY'));
-  assert.equal(message.options.triggerTurn, true, 'a stop wakes the model');
-  assert.equal(groupAlive(job.pid), false);
+test('stop flushes pre-stop output in one outcome and leaves external files intact', async t => {
+  const value = h(t), watched = await startReady(value, { mode: 'events' }); assert.equal(value.sent.length, 0);
+  assert.equal((await value.call('monitor_stop', { id: watched.taskId })).details.stopped, true); assert.equal(value.sent.length, 1); assert.ok(value.sent[0].message.details.finalLines.includes('READY')); assert.equal(value.sent[0].options.triggerTurn, true);
+  assert.equal(JSON.parse(fs.readFileSync(watched.fixture.statusPath)).state, 'running'); assert.equal(fs.readFileSync(watched.fixture.stdout, 'utf8'), 'READY\n');
 });
-
-test('a context terminal ceiling is not raised by merged turn-level output', async (t) => {
-  const h = createHarness(); t.after(() => h.close());
-  const fixture = heldCommand(h, 'CEILING');
-  const source = (await h.call('Monitor', { command: fixture.command, description: 'ceiling work', mode: 'completion' })).details;
-  await h.call('Monitor', { source: { monitorId: source.taskId }, description: 'loud watch', watches: [{ id: 'line', text: 'CEILING', notify: 'turn' }], notify: { output: 'context' } });
-  assert.ok(await until(() => h.sent.some((m) => m.message.details.cause === 'output')));
-  fs.writeFileSync(fixture.release, 'go');
-  assert.ok(await until(() => h.sent.some((m) => m.message.details.cause === 'exit' && m.message.details.status === 'completed')));
-  assert.equal((await h.snapshots()).find((r) => r.id === source.taskId)?.status, 'completed');
-  const terminal = h.sent.filter((m) => m.message.details.cause === 'exit');
-  assert.ok(terminal.length > 0);
-  assert.ok(terminal.every((m) => m.options.triggerTurn === true), 'end, failure and stop always wake');
-  assert.equal(terminal.filter((m) => m.message.details.status === 'exited').length, 0, 'observer does not add its own terminal outcome');
+test('live context ceiling is not raised by turn-level watch rules; job terminal remains turn', async t => {
+  const value = h(t), job = createJob(value.cwd, { stdout: 'CEILING\n' });
+  await value.call('Monitor', { source: job.source, mode: 'events', description: 'ceiling', watches: [{ id: 'line', text: 'CEILING', notify: 'turn' }], notify: { output: 'context' } });
+  assert.ok(await until(() => value.sent.some(m => m.message.details.cause === 'output'))); assert.equal(value.sent.find(m => m.message.details.cause === 'output').options.triggerTurn, false);
+  job.status('succeeded'); assert.ok(await until(() => jobResult(value).length === 1)); assert.equal(jobResult(value)[0].options.triggerTurn, true);
 });
-
-test('silent observer close still schedules a session-budget summary for its suppressed final batch', async (t) => {
-  const originalTake = OutputBudget.prototype.take;
-  const originalRemaining = OutputBudget.prototype.remainingMs;
-  // No output slot is ever available; the accounting summary must not need one.
-  OutputBudget.prototype.take = () => false;
-  OutputBudget.prototype.remainingMs = () => 20;
+test('loop-silent stop still delivers the accounting summary for suppressed output', async t => {
+  const originalTake = OutputBudget.prototype.take, originalRemaining = OutputBudget.prototype.remainingMs;
+  OutputBudget.prototype.take = () => false; OutputBudget.prototype.remainingMs = () => 20;
   t.after(() => { OutputBudget.prototype.take = originalTake; OutputBudget.prototype.remainingMs = originalRemaining; });
-  const h = createHarness(); t.after(() => h.close());
-  const fixture = heldCommand(h, 'SILENT_BUDGET');
-  const source = (await h.call('Monitor', { command: fixture.command, description: 'silent source', mode: 'completion' })).details;
-  await h.call('Monitor', { source: { monitorId: source.taskId }, description: 'silent observer', watches: [{ id: 'match', text: 'SILENT_BUDGET' }] });
-  await until(() => fs.existsSync(source.outputPath) && fs.readFileSync(source.outputPath, 'utf8').includes('SILENT_BUDGET'));
-  fs.writeFileSync(fixture.release, 'go');
-  assert.ok(await until(() => h.sent.some((m) => m.message.details.cause === 'exit' && m.message.details.status === 'completed')));
-  assert.ok(!h.sent.some((m) => m.message.content.includes('Session output budget')), 'summary waits for its window');
-  assert.ok(await until(() => h.sent.some((m) => m.message.content.includes('Session output budget'))), 'summary bypasses output slots');
-  const summary = h.sent.find((m) => m.message.content.includes('Session output budget'));
-  assert.equal(summary.options.triggerTurn, false);
-  assert.ok(summary.message.content.length <= 3000);
+  const value = h(t, { loop: true }), job = createJob(value.cwd, { stdout: 'SILENT_BUDGET\n' });
+  await value.call('Monitor', { source: job.fileSource, description: 'silent watch', loopPrompt: 'silent budget' });
+  assert.ok(await until(() => value.sent.some(m => m.message.content.includes('Session output budget'))));
+  await value.emitBus('loop:stopped', { observationGroups: [fixtureGroup('silent budget')], reason: 'stopped' });
+  const summary = value.sent.find(m => m.message.content.includes('Session output budget')); assert.equal(summary.options.triggerTurn, false); assert.ok(summary.message.content.length <= 3000); assert.equal(value.sent.some(m => m.message.details.cause === 'stopped'), false);
 });
-
-test('cross-source output suppression never kills work or swallows terminal outcomes', async (t) => {
-  const original = OutputBudget.prototype.take;
-  let slots = 2;
-  OutputBudget.prototype.take = () => slots > 0 ? (--slots, true) : false;
-  t.after(() => { OutputBudget.prototype.take = original; });
-  const h = createHarness(); t.after(() => h.close());
-  const fixtures = ['A', 'B', 'C'].map((name) => heldCommand(h, name, true));
-  const receipts = await Promise.all(fixtures.map((f, i) => h.call('Monitor', { command: f.command, description: `source ${i}` })));
-  assert.ok(await until(async () => (await h.snapshots()).reduce((sum, r) => sum + r.eventCount + r.globalSuppressedCount, 0) === 3));
-  assert.equal(h.sent.filter((m) => m.message.details.cause === 'output').length, 2);
-  const records = await h.snapshots();
-  assert.ok(records.every((r) => r.status === 'running' && groupAlive(r.pid)), 'global suppression is notification-only');
-  assert.equal(records.reduce((sum, r) => sum + r.globalSuppressedCount, 0), 1);
-  slots = 1;
-  fixtures.forEach((f) => fs.writeFileSync(f.emit, 'go'));
-  assert.ok(await until(() => h.sent.filter((m) => m.message.details.cause === 'output').length === 3));
-  const last = h.sent.filter((m) => m.message.details.cause === 'output').at(-1);
-  assert.match(last.message.content, /Session output budget/);
-  assert.ok(last.message.content.length <= 3000);
-  fixtures.forEach((f) => fs.writeFileSync(f.release, 'go'));
-  assert.ok(await until(() => h.sent.filter((m) => m.message.details.cause === 'exit').length === 3));
-  for (let i = 0; i < receipts.length; i++) assert.equal(fs.readFileSync(receipts[i].details.outputPath, 'utf8'), `${['A', 'B', 'C'][i]}\n${['A', 'B', 'C'][i]}-second\n`);
+test('cross-source suppression never cancels jobs or swallows terminal reports', async t => {
+  const original = OutputBudget.prototype.take; let slots = 2; OutputBudget.prototype.take = () => slots > 0 ? (--slots, true) : false; t.after(() => { OutputBudget.prototype.take = original; });
+  const value = h(t), jobs = ['A', 'B', 'C'].map(name => createJob(value.cwd, { stdout: name + '\n' }));
+  const receipts = await Promise.all(jobs.map((job, i) => value.call('Monitor', { source: job.source, mode: 'events', description: 'source ' + i })));
+  assert.ok(await until(async () => (await value.snapshots()).reduce((n, r) => n + r.eventCount + r.globalSuppressedCount, 0) === 3));
+  assert.equal(value.sent.filter(m => m.message.details.cause === 'output').length, 2); const records = await value.snapshots(); assert.ok(records.every(r => r.status === 'running' && r.job.state === 'running')); assert.equal(records.reduce((n, r) => n + r.globalSuppressedCount, 0), 1);
+  slots = 1; jobs.forEach((job, i) => fs.appendFileSync(job.stdout, ['A', 'B', 'C'][i] + '-second\n'));
+  assert.ok(await until(() => value.sent.filter(m => m.message.details.cause === 'output').length === 3)); assert.match(value.sent.filter(m => m.message.details.cause === 'output').at(-1).message.content, /Session output budget/);
+  jobs.forEach(job => job.status('succeeded')); assert.ok(await until(() => jobResult(value).length === 3));
+  for (let i = 0; i < receipts.length; i++) assert.equal(fs.readFileSync(receipts[i].details.outputPath, 'utf8'), ['A', 'B', 'C'][i] + '\n' + ['A', 'B', 'C'][i] + '-second\n');
 });

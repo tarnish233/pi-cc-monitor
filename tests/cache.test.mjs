@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadModule } from "./helpers.mjs";
+import { createJob } from "./observation-fixtures.mjs";
 
 const mod = await loadModule("index.ts");
 
@@ -47,14 +48,14 @@ function makeHarness() {
 			sent.push({ message, options });
 		},
 		events: {
-			emit() {},
+			emit(channel, payload) { bus.get(channel)?.(payload); },
 			on(channel, handler) {
 				bus.set(channel, handler);
 				return () => bus.delete(channel);
 			},
 		},
 		getAllTools() {
-			return [...tools.keys(), "cron_delete"].map((name) => ({ name }));
+			return [...tools.keys()].map((name) => ({ name }));
 		},
 	};
 	for (const method of ["setActiveTools", "setModel", "setThinkingLevel"]) {
@@ -69,6 +70,7 @@ function makeHarness() {
 		hasPendingMessages: () => false,
 	};
 
+	pi.events.on("loop:bind-observation", request => { request.acceptedVersion = 1; request.observationGroup = "cache-loop"; });
 	mod.default(pi);
 	loaded = true;
 	return { pi, ctx, tools, handlers, bus, sent, calls };
@@ -90,14 +92,14 @@ test("monitors only append: no prompt hooks, no tool changes, events are message
 	const exec = (name, params) => h.tools.get(name).execute("c", params, undefined, undefined, h.ctx);
 
 	await h.handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, h.ctx);
-	const completed = await exec("Monitor", { command: "printf 'quiet\\n'", description: "background", mode: "completion" });
+	const completed = await exec("Monitor", { source: createJob(h.ctx.cwd, { state: "succeeded", stdout: "quiet\n" }).source, description: "external result", mode: "completion" });
 	assert.equal(completed.details.mode, "completion");
-	assert.ok(await waitFor(() => h.sent.some((entry) => entry.message.details?.mode === "completion" && entry.message.details?.cause === "exit")));
-	await exec("Monitor", { command: "printf 'one\\ntwo\\n'", description: "short" });
-	assert.ok(await waitFor(() => h.sent.some((entry) => entry.message.details?.cause === "exit")), "the monitor ran to its end");
-	const bound = await exec("Monitor", { command: "sleep 30", description: "bound", persistent: true, loopPrompt: "watch CI" });
-	h.bus.get("loop:stopped")?.({ prompt: "watch CI", reason: "stopped" });
-	const kept = await exec("Monitor", { command: "sleep 30", description: "kept", persistent: true });
+	assert.ok(await waitFor(() => h.sent.some(entry => entry.message.details?.mode === "completion" && entry.message.details?.cause === "job")));
+	await exec("Monitor", { source: createJob(h.ctx.cwd, { state: "succeeded", stdout: "one\ntwo\n" }).source, description: "short", mode: "events" });
+	assert.ok(await waitFor(() => h.sent.filter(entry => entry.message.details?.cause === "job").length === 2));
+	const bound = await exec("Monitor", { source: createJob(h.ctx.cwd).fileSource, description: "bound", persistent: true, loopPrompt: "watch CI" });
+	await h.bus.get("loop:stopped")?.({ observationGroups: ["cache-loop"], reason: "stopped" });
+	const kept = await exec("Monitor", { source: createJob(h.ctx.cwd).fileSource, description: "kept", persistent: true });
 	await exec("monitor_list", {});
 	await exec("monitor_stop", { id: kept.details.taskId });
 	await h.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, h.ctx);
