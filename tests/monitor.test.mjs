@@ -94,11 +94,42 @@ test('planned source creation is observed even with from=now', async t => {
   const h = harness(t), file = path.join(h.cwd, 'later.log'); await h.call('Monitor', { source: { kind: 'file', stdout: file, from: 'now' }, description: 'new file' });
   fs.writeFileSync(file, 'NEW FILE EVENT\n'); assert.ok(await until(() => h.sent.some(s => s.message.details?.lines?.includes('NEW FILE EVENT'))));
 });
-test('a source failure is not a business verdict and stop is sent exactly once', async t => {
+test('a source failure is not a business verdict and monitor_stop succeeds once without self-wake', async t => {
   const h = harness(t), file = path.join(h.cwd, 'missing.log'); const observed = (await h.call('Monitor', { source: { kind: 'file', stdout: file }, description: 'missing source' })).details;
   assert.ok(await until(async () => Boolean((await h.snapshots())[0].sourceError))); assert.equal((await h.snapshots())[0].status, 'running');
-  await h.call('monitor_stop', { id: observed.taskId }); await sleep(40); assert.equal(h.sent.filter(s => s.message.details?.cause === 'stopped').length, 1);
+  assert.equal((await h.call('monitor_stop', { id: observed.taskId })).details.stopped, true);
+  await sleep(40); assert.equal(h.sent.filter(s => s.message.details?.cause === 'stopped').length, 0);
   assert.equal((await h.call('monitor_stop', { id: observed.taskId })).details.stopped, false);
+});
+
+test('overlapping observers warn in startReceipt and job events deliver terminal tails without early stop prompts', async t => {
+  const h = harness(t), job = createJob(h.cwd, { stdout: 'BOOT_OK\n', stderr: 'FATAL_CRASH\n' });
+  const first = await h.call('Monitor', { source: job.source, mode: 'events', description: 'single job observer', watches: [{ id: 'boot', text: 'BOOT_OK', once: true }] });
+  assert.equal(first.details.timeoutMs, (await loadModule('prompts.ts')).MONITOR_TIMEOUTS.completion.defaultMs);
+  assert.doesNotMatch(first.content[0].text, /already observes this target/);
+  assert.match(first.content[0].text, /do not open a separate completion monitor/);
+
+  const dupJob = await h.call('Monitor', { source: job.source, description: 'redundant completion' });
+  assert.match(dupJob.content[0].text, new RegExp(`active monitor #${first.details.taskId} \\(events\\) already observes this target`));
+  await h.call('monitor_stop', { id: dupJob.details.taskId });
+
+  const dupFile = await h.call('Monitor', { source: job.fileSource, description: 'redundant file log', watches: [{ id: 'boot', text: 'BOOT_OK', once: true }] });
+  assert.match(dupFile.content[0].text, new RegExp(`active monitor #${first.details.taskId} \\(events\\) already observes this target`));
+  assert.match(dupFile.content[0].text, /All watch rules are once=true/);
+
+  assert.ok(await until(() => h.sent.filter(s => s.message.details?.cause === 'output').length === 2));
+  const fileOut = h.sent.find(s => s.message.details?.monitorId === dupFile.details.taskId && s.message.details?.cause === 'output');
+  const jobOut = h.sent.find(s => s.message.details?.monitorId === first.details.taskId && s.message.details?.cause === 'output');
+  assert.match(fileOut.message.content.split('\n')[0], /all once rules matched/);
+  assert.deepEqual(fileOut.message.details.lines, ['BOOT_OK']);
+  assert.doesNotMatch(jobOut.message.content.split('\n')[0], /all once rules matched/);
+
+  await h.call('monitor_stop', { id: dupFile.details.taskId });
+  job.status('failed', { exitCode: 2 });
+  assert.ok(await until(() => h.sent.some(s => s.message.details?.cause === 'job')));
+  const completed = h.sent.find(s => s.message.details?.cause === 'job');
+  assert.match(completed.message.details.stderrTail, /FATAL_CRASH/);
+  assert.match(completed.message.content, /FATAL_CRASH/);
 });
 for (const loaded of [true, false]) test('loop binding is ' + (loaded ? 'kept' : 'ignored') + ' according to binding response', async t => {
   const h = harness(t, { loop: loaded }), job = createJob(h.cwd);

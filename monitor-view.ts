@@ -110,6 +110,8 @@ export function startReceipt(view: MonitorView): string {
 		lines.push("Observation receipt only; the external job may already be running or finished. This receipt verifies no business result. Continue independent work; if only waiting for Monitor, end your turn with one short message: what is observed and that you will report after verifying its result. Do NOT report results, conclusions or estimates for this task while it is pending. Do not poll, sleep or re-read the logs just to wait. You will be notified once at the next response/tool-batch boundary or from idle. Read and verify the required outputs before using the result; a completed task does not by itself mean the overall report is ready. Notifications are not user replies.");
 	} else {
 		lines.push("Keep working — do not poll or sleep. Events may arrive while you are waiting for the user — an event is not their reply.");
+		if (view.kind === "job") lines.push("This watcher also completes on the external job's terminal status; do not open a separate completion monitor (use action=update to mute or change watches).");
+		else if (view.watches?.length && view.watches.every((rule) => rule.once)) lines.push("All watch rules are once=true; call monitor_stop (or action=update) after they match if no longer needed.");
 		if (!view.persistent) lines.push("The watch ends at its time limit unless the source ends first; re-arm if you still need it.");
 	}
 	return lines.join("\n");
@@ -145,7 +147,7 @@ export function stopScope(view: MonitorView): string {
 	return "Stops this observation only; the external runner/job is not cancelled or signalled.";
 }
 
-export function stopReceipt(view: MonitorView, stopped: boolean): string {
+export function stopReceipt(view: MonitorView, stopped: boolean, finalLines?: string[]): string {
 	if (!stopped) return `Stop unconfirmed · ${monitorIdentity(view)}\nCleanup pending; owned resource still active. Stop can be retried.`;
 	if (view.status && view.status !== "stopped") {
 		return `Cleanup confirmed · ${monitorIdentity(view)}\nObservation resources released; the recorded observation outcome remains ${view.status}.`;
@@ -153,7 +155,8 @@ export function stopReceipt(view: MonitorView, stopped: boolean): string {
 	const scope = view.kind === "ws"
 		? "Local connection closed; remote service not stopped."
 		: "Observation resources released; external work was not cancelled.";
-	return `Stopped ${monitorIdentity(view)}\n${scope}`;
+	const tail = finalLines?.length ? `\nFinal matched output:\n${finalLines.join("\n")}` : "";
+	return `Stopped ${monitorIdentity(view)}\n${scope}${tail}`;
 }
 
 /** A snapshot, not a live status stream. Complete fields stay in structuredContent. */

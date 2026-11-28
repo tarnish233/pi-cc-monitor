@@ -368,7 +368,8 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		if (disposed) return false;
 		const events = record.mode === "events";
 		const description = sanitizeDisplay(record.description).replace(/\s+/g, " ").trim();
-		const rawHeader = `monitor ${record.id} \u00b7 ${description}`;
+		const exhausted = cause === "output" && record.kind !== "job" && Boolean(record.matcher?.snapshot().length) && !record.matcher!.hasRules();
+		const rawHeader = `monitor ${record.id} \u00b7 ${description}${exhausted ? " (all once rules matched — call monitor_stop or update if done)" : ""}`;
 		const header = capEventLines([rawHeader], MAX_LINE_CHARS).join(" ");
 		const bodyBudget = MAX_BATCH_CHARS - header.length - 1;
 		const body = events ? capEventLines(lines, bodyBudget) : lines;
@@ -480,7 +481,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 
 	interface Ending {
 		status: Exclude<MonitorStatus, "running" | "stopping" | "stop_timeout">;
-		cause: MonitorCause; notice?: () => { notices: string[]; tailLines?: string[] }; flush?: boolean;
+		cause: MonitorCause; notice?: () => { notices: string[]; tailLines?: string[] }; flush?: boolean; silent?: boolean;
 	}
 	function isActive(record: MonitorRecord): boolean { return record.status === "running" || record.status === "stopping" || record.status === "stop_timeout" || record.resourceActive === true; }
 	function resourceAlive(record: MonitorRecord): boolean {
@@ -556,7 +557,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			...(global ? ["[Session budget suppressed " + global + " events; observation copying is independent.]"] : []),
 			...batch.notices,
 		];
-		const body = [...rendered.notices, ...(rendered.tailLines ?? []), ...notices.slice(rendered.notices.length), ...batch.outputLines];
+		const body = [...rendered.notices, ...(rendered.tailLines ?? []), ...notices.slice(rendered.notices.length), ...(rendered.tailLines?.length ? [] : batch.outputLines)];
 		return { body, notices, outputLines: batch.outputLines };
 	}
 	function finalizeEnd(record: MonitorRecord, ending: Ending): void {
@@ -570,7 +571,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		if (record.timeoutTimer) clearTimeout(record.timeoutTimer);
 		record.timeoutTimer = undefined;
 		void record.observationLog?.close();
-		if (record.mode === "completion") captureCompletionTails(record);
+		if (record.mode === "completion" || ending.cause === "job") captureCompletionTails(record);
 		if (ending.notice) {
 			const payload = buildEndingPayload(record, ending.notice(), batch);
 			deliver(record, ending.cause, payload.body, record.notify.terminal, payload.outputLines.length > 0, { notices: payload.notices, outputLines: payload.outputLines });
@@ -582,7 +583,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 	}
 	function endMonitor(record: MonitorRecord, ending: Ending): Promise<boolean> {
 		const current = pendingEndings.get(record.id);
-		if (!ending.notice) {
+		if (ending.silent) {
 			if (current) current.notice = undefined;
 			record.finalBatch = undefined;
 		}
@@ -614,7 +615,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					if (current?.notice) {
 						const lead = "[Observation stop unconfirmed — local observation resources are still closing. The external job was not cancelled. Stop can be retried.]";
 						if (current.cause === "job") {
-							if (record.mode === "completion") captureCompletionTails(record);
+							captureCompletionTails(record);
 							const batch = consumeFinalBatch(record, true);
 							const payload = buildEndingPayload(record, current.notice(), batch);
 							forgetSuppression(record.id);
@@ -638,10 +639,21 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		return pending;
 	}
 
-	async function stopObservation(record: MonitorRecord): Promise<boolean> {
-		const stopped = await endMonitor(record, { status: "stopped", cause: "stopped", flush: true, notice: () => ({ notices: [STOPPED_NOTICE] }) });
-		if (stopped && lastCtx?.isIdle() === true) completions.flush(true);
-		return stopped;
+	async function stopObservation(record: MonitorRecord, notifyModel = false): Promise<{ stopped: boolean; finalLines: string[] }> {
+		if (notifyModel) {
+			const stopped = await endMonitor(record, { status: "stopped", cause: "stopped", flush: true, notice: () => ({ notices: [STOPPED_NOTICE] }) });
+			if (stopped && lastCtx?.isIdle() === true) completions.flush(true);
+			return { stopped, finalLines: [] };
+		}
+		let finalLines: string[] = [];
+		if (!record.finalized && !pendingEndings.has(record.id)) {
+			record.outputLines?.stdout.finish();
+			record.outputLines?.stderr.finish();
+			record.finalBatch ??= record.batcher?.drain();
+			finalLines = capEventLines(consumeFinalBatch(record, true).outputLines, MAX_BATCH_CHARS);
+		}
+		const stopped = await endMonitor(record, { status: "stopped", cause: "stopped" });
+		return { stopped, finalLines };
 	}
 
 	/** Rate-limit a batch, then deliver it. */
@@ -698,7 +710,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			completions.delete(record.id);
 			forgetSuppression(record.id);
 			if (!isActive(record)) continue;
-			stops.push(endMonitor(record, { status: "stopped", cause: "stopped" }));
+			stops.push(endMonitor(record, { status: "stopped", cause: "stopped", silent: true }));
 			const ctx = lastCtx;
 			if (ctx) notify(ctx, `Monitor ${record.id} stopped: its /loop attempt ended (${payload?.reason ?? "stopped"}).`, "info");
 		}
@@ -746,6 +758,27 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		if (disposed || record.status !== "running" || record.notify.output === "none") return;
 		const match = record.matcher ? record.matcher.match(line, stream) : stream === "stdout" ? { ids: [], level: "turn" as const } : undefined; if (!match) return;
 		record.pendingLevel = strongerLevel(record.pendingLevel ?? "none", outputLevel(record.notify.output, match.level)); record.batcher?.pushEvent(stream === "stderr" ? "[stderr] " + line.trimEnd() : line.trimEnd());
+	}
+	function observedPaths(record: MonitorRecord): string[] {
+		if (record.source.kind === "ws") return [];
+		return [
+			...(record.source.kind === "job" ? [record.source.manifest] : [record.source.stdout, record.source.stderr]),
+			record.job?.stdoutPath,
+			record.job?.stderrPath,
+		].filter((p): p is string => Boolean(p));
+	}
+	function findOverlappingMonitor(record: MonitorRecord): MonitorRecord | undefined {
+		const paths = new Set(observedPaths(record));
+		const host = record.source.kind === "ws" ? undefined : record.source.host;
+		for (const other of monitors.values()) {
+			if (other.id === record.id || !isActive(other)) continue;
+			if (record.source.kind === "ws" || other.source.kind === "ws") {
+				if (record.source.kind === "ws" && other.source.kind === "ws" && record.source.url === other.source.url) return other;
+				continue;
+			}
+			if (other.source.host === host && observedPaths(other).some(p => paths.has(p))) return other;
+		}
+		return undefined;
 	}
 	function receipt(record: MonitorRecord) { return { taskId: record.id, ...observationDetails(record) }; }
 	function startTimeout(record: MonitorRecord): void {
@@ -875,14 +908,18 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			if (mode === "completion" && source.kind !== "job") throw new Error("completion requires a job manifest with a verifiable terminal status; a log or connection closing is not a business result");
 			if (params.watches !== undefined && mode !== "events") throw new Error("watches require mode=events"); if (params.watches !== undefined) validateWatches(params.watches); parseNotify(params.notify);
 			const persistent = params.persistent ?? false; if (typeof persistent !== "boolean") throw new Error("persistent must be boolean");
-			const { defaultMs, maxMs } = MONITOR_TIMEOUTS[mode], timeoutMs = params.timeout_ms ?? defaultMs;
+			const { defaultMs, maxMs } = MONITOR_TIMEOUTS[source.kind === "job" ? "completion" : "events"], timeoutMs = params.timeout_ms ?? defaultMs;
 			if (!Number.isFinite(timeoutMs) || timeoutMs < MIN_TIMEOUT_MS || timeoutMs > maxMs) throw new Error("timeout_ms is outside this observation mode's supported range");
 			const input: ArmInput = { description: params.description, mode, timeoutMs, persistent, notify: params.notify, watches: params.watches, ...resolveLoopBinding(params.loopPrompt) };
 			const record = source.kind === "ws" ? await armWebSocket(input, source) : await armObservation(input, source); refreshStatus(); const value = receipt(record);
+			const overlap = findOverlappingMonitor(record);
+			const overlapNote = overlap
+				? `\nNote: active monitor #${overlap.id} (${overlap.mode}) already observes this target; prefer one job mode=events monitor (and action=update) or monitor_stop redundant observers.`
+				: "";
 			const bindingNote = params.loopPrompt?.trim() && !record.loopObservationGroup
 				? "\nNo Loop activity bound; this observation remains independent."
 				: "";
-			return { content: [{ type: "text" as const, text: startReceipt(snapshotMonitor(record)) + bindingNote }], details: value, structuredContent: value };
+			return { content: [{ type: "text" as const, text: startReceipt(snapshotMonitor(record)) + overlapNote + bindingNote }], details: value, structuredContent: value };
 		},
 	});
 
@@ -895,7 +932,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			id: Type.String({ description: "The monitor id returned by Monitor." }),
 		}),
 		annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-		outputSchema: Type.Object({ stopped: Type.Boolean(), id: Type.String(), status: Type.Optional(Type.String()) }),
+		outputSchema: Type.Object({ stopped: Type.Boolean(), id: Type.String(), status: Type.Optional(Type.String()), finalLines: Type.Optional(Type.Array(Type.String())) }),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			lastCtx = ctx;
 			const record = monitors.get(params.id);
@@ -917,12 +954,17 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 					structuredContent: value,
 				};
 			}
-			const stopped = await stopObservation(record);
+			const { stopped, finalLines } = await stopObservation(record);
 			// An already-finalized record (a natural exit with a living background
 			// group) keeps its real status; only an un-finalized stop times out.
-			const value = { stopped, id: params.id, ...(!stopped ? { status: snapshotMonitor(record).status } : {}) };
+			const value = {
+				stopped,
+				id: params.id,
+				...(!stopped ? { status: snapshotMonitor(record).status } : {}),
+				...(finalLines.length ? { finalLines } : {}),
+			};
 			return {
-				content: [{ type: "text" as const, text: stopReceipt(snapshotMonitor(record), stopped) }],
+				content: [{ type: "text" as const, text: stopReceipt(snapshotMonitor(record), stopped, finalLines) }],
 				...(!stopped ? { isError: true } : {}),
 				details: value,
 				structuredContent: value,
@@ -971,7 +1013,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 		async stop(id: string): Promise<TaskStopResult> {
 			const record = monitors.get(id);
 			if (!record || !isActive(record)) return { stopped: false, message: "Observation " + id + " is not running." };
-			const stopped = await stopObservation(record);
+			const { stopped } = await stopObservation(record, true);
 			return { stopped, message: stopReceipt(snapshotMonitor(record), stopped) };
 		},
 	});
@@ -1037,7 +1079,7 @@ export default function piCcMonitorExtension(pi: ExtensionAPI): void {
 			if (pending) pending.notice = undefined;
 			await stopResource(record, true);
 			if (!releaseResource(record)) awaitCleanup(record);
-			finalizeEnd(record, { status: "stopped", cause: "stopped" });
+			finalizeEnd(record, { status: "stopped", cause: "stopped", silent: true });
 		}));
 		if (!liveResources.size) removeExitHook();
 		globallySuppressed.clear();

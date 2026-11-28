@@ -27,9 +27,9 @@ test('simultaneous stops share one closing outcome and reap a TERM-ignoring SSH 
   const observer = await remoteReady(h, ssh.host); const a = h.call('monitor_stop', { id: observer.taskId }), b = h.call('monitor_stop', { id: observer.taskId });
   assert.equal((await h.snapshots())[0].status, 'stopping'); assert.equal((await h.snapshots())[0].endedAt, undefined);
   assert.ok((await Promise.all([a, b])).every(r => r.details.stopped)); assert.equal(groupAlive(observer.pid), false); assert.equal((await h.snapshots())[0].status, 'stopped');
-  assert.equal(h.sent.filter(m => m.message.details.cause === 'stopped').length, 1); assert.equal(fs.readFileSync(observer.fixture.stdout, 'utf8'), 'READY\n');
+  assert.equal(h.sent.filter(m => m.message.details.cause === 'stopped').length, 0); assert.equal(fs.readFileSync(observer.fixture.stdout, 'utf8'), 'READY\n');
 });
-test('permission-denied helper cleanup remains listed/retryable and converges without a second notice', { skip: process.platform === 'win32' }, async t => {
+test('permission-denied helper cleanup remains listed/retryable and converges without async outbox noise', { skip: process.platform === 'win32' }, async t => {
   const h = createHarness(); const ssh = fakeSsh(t, h.cwd, { ignoreTerm: true }); t.after(() => h.close()); const observer = await remoteReady(h, ssh.host);
   const kill = process.kill, childKill = ChildProcess.prototype.kill;
   try {
@@ -38,7 +38,7 @@ test('permission-denied helper cleanup remains listed/retryable and converges wi
     const stopped = await h.call('monitor_stop', { id: observer.taskId }); assert.equal(stopped.details.stopped, false); assert.equal(stopped.details.status, 'stop_timeout'); assert.equal(stopped.isError, true); assert.equal(groupAlive(observer.pid), true);
   } finally { process.kill = kill; ChildProcess.prototype.kill = childKill; }
   kill.call(process, -observer.pid, 'SIGKILL'); assert.ok(await until(async () => (await h.snapshots())[0].status === 'stopped'));
-  assert.equal(h.sent.filter(m => ['stopped', 'stop_timeout'].includes(m.message.details.cause)).length, 1); assert.equal(fs.existsSync(observer.fixture.manifestPath), true);
+  assert.equal(h.sent.filter(m => ['stopped', 'stop_timeout'].includes(m.message.details.cause)).length, 0); assert.equal(fs.existsSync(observer.fixture.manifestPath), true);
 });
 test('shutdown clears cleanup polls and the disposed runtime never rearms them', async t => {
   const h = createHarness(); const observer = await startReady(h); const stop = FileObservation.prototype.stop;

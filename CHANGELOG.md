@@ -1,5 +1,17 @@
 # Changelog — pi-cc-monitor
 
+## [0.18.1] - 2026-11-28
+
+### Changed
+- Clarify in `Monitor` prompts, schema descriptions and start receipts that `mode: "events"` on a `job` source also completes on the external job's valid terminal status; instruct models never to pair `events` and `completion` monitors on the same job (use `action: "update"` to mute or revise `watches`).
+- Align `timeout_ms` bounds for `job` sources across both `completion` and `events` modes (30 min default, 2 h max), keeping the 5 min default / 1 h max deadline for `file` and `ws` watchers.
+- Capture and render bounded `stdout`/`stderr` log tails for `job` terminal outcomes in `mode: "events"` as well as `mode: "completion"`.
+- Add a non-blocking note to `startReceipt` when another active monitor already observes the same target (`manifest`, stream file path on the same host, or WebSocket URL), and annotate the model header when a `file`/`ws` watcher's `once` rules are all exhausted.
+
+### Fixed
+- Stop queuing redundant `Monitor Stopped` outbox wakeups when the model itself calls `monitor_stop`; drain any buffered pre-stop matched lines directly into the synchronous `monitor_stop` tool receipt (`finalLines`), while preserving asynchronous `Monitor Stopped` notifications for user-initiated stops from `/tasks`.
+- Use `details.job.exitCode` when rendering terminal `job` message bodies so validated exit codes do not duplicate banner lines in expanded `Output` sections.
+
 ## [0.18.0] - 2026-11-27
 
 ### Breaking

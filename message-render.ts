@@ -151,10 +151,11 @@ export function messageBody(content: unknown, details: MonitorMessageDetails): s
 	const raw = contentText(content).replace(/^monitor \S+ ·[^\n]*\n?/, "");
 	const lines = withoutBannerPaths(bodyLines(sanitizeDisplay(raw)));
 	const hasTails = typeof details.stdoutTail === "string" || typeof details.stderrTail === "string";
-	if (details.mode === "completion" && hasTails && (details.cause === "job" || details.cause === "exit" || details.cause === "timeout")) {
+	if (hasTails && (details.cause === "job" || details.mode === "completion" && (details.cause === "exit" || details.cause === "timeout"))) {
 		const result: string[] = [];
+		const exitCode = details.job ? details.job.exitCode : details.exitCode;
 		// A deadline, signal, or missing code needs its actual reason, not just log output.
-		if (details.cause === "timeout" || details.exitCode === null || details.exitCode === undefined) {
+		if (details.cause === "timeout" || exitCode === null || exitCode === undefined) {
 			if (lines[0]) result.push(lines[0]);
 		}
 		const streams = details.job?.state === "failed" || details.status === "failed" ? ["stderr", "stdout"] as const : ["stdout", "stderr"] as const;
@@ -223,8 +224,9 @@ function cardSections(details: MonitorMessageDetails, body: string[]): Notificat
 	const notices = structured
 		? details.notices!.flatMap((line) => bodyLines(sanitizeDisplay(line)))
 		: body.filter(isNotice);
+	const hasTails = typeof details.stdoutTail === "string" || typeof details.stderrTail === "string";
 	const output = structured
-		? details.mode === "completion"
+		? hasTails || details.mode === "completion"
 			? body
 			: (details.outputLines ?? []).flatMap((line) => bodyLines(sanitizeDisplay(line)))
 		: body.filter((line) => !isNotice(line));

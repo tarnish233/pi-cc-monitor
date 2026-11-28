@@ -203,7 +203,7 @@ test('a late disk-callback failure after the watch ended reports an incomplete l
 		assert.equal(state.resourceActive, undefined, 'the resource stays released');
 		assert.match(state.logError, /EIO|flush timed out/);
 		assert.equal(state.eventCount, 0, 'the warning costs no event slot');
-		assert.equal(h.sent.filter((m) => m.message.details.monitorId === armed.details.taskId && ['closed', 'stopped'].includes(m.message.details.cause)).length, 1, 'no second closing notice');
+		assert.equal(h.sent.filter((m) => m.message.details.monitorId === armed.details.taskId && ['closed', 'stopped'].includes(m.message.details.cause)).length, end === 'natural-close' ? 1 : 0, 'no second closing notice');
 		// A later error on the destroyed stream never warns twice.
 		log.stream.emit('error', new Error('late destroy error'));
 		await sleep(20);

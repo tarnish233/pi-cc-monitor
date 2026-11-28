@@ -34,4 +34,6 @@ test('observer deadlines keep existing values but cannot control job lifetime', 
 test('artifact and source-error guidance prevents accidental cleanup or false job results', () => {
   assert.match(description, /OBSERVATION COPIES/); assert.match(description, /read|Read/); assert.match(description, /\.1/); assert.match(description, /logTruncated and sourceGap/); assert.match(description, /Runner logs require their own/);
   assert.match(description, /Keep run scripts, manifests, status, checkpoints and formal outputs/); assert.match(description, /A log EOF, a stopped watcher, or an SSH error is never a business-job result/);
+  assert.match(description, /never open both `events` and `completion` for the same job/);
+  assert.match(guidelines[4], /never open a second completion Monitor for the same job/);
 });

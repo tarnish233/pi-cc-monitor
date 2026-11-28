@@ -34,9 +34,13 @@ test('events terminal survives busy aborted settlement without restarting', asyn
   value.setIdle(true); await value.emit('agent_settled', { aborted: true }); assert.equal(value.sent.length, 1); assert.equal(value.sent[0].message.details.cause, 'job'); assert.ok(value.sent[0].message.details.finalLines.includes('FINAL')); assert.equal(value.sent[0].options.triggerTurn, false);
   await value.emit('agent_settled', { aborted: false }); assert.equal(value.sent.length, 1);
 });
-test('stop flushes pre-stop output in one outcome and leaves external files intact', async t => {
+test('monitor_stop drains pre-stop output synchronously into tool receipt without self-waking outbox noise', async t => {
   const value = h(t), watched = await startReady(value, { mode: 'events' }); assert.equal(value.sent.length, 0);
-  assert.equal((await value.call('monitor_stop', { id: watched.taskId })).details.stopped, true); assert.equal(value.sent.length, 1); assert.ok(value.sent[0].message.details.finalLines.includes('READY')); assert.equal(value.sent[0].options.triggerTurn, true);
+  const stopped = await value.call('monitor_stop', { id: watched.taskId });
+  assert.equal(stopped.details.stopped, true);
+  assert.ok(stopped.details.finalLines.includes('READY'));
+  assert.match(stopped.content[0].text, /Final matched output:\n.*READY/);
+  assert.equal(value.sent.length, 0);
   assert.equal(JSON.parse(fs.readFileSync(watched.fixture.statusPath)).state, 'running'); assert.equal(fs.readFileSync(watched.fixture.stdout, 'utf8'), 'READY\n');
 });
 test('live context ceiling is not raised by turn-level watch rules; job terminal remains turn', async t => {

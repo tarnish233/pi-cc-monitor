@@ -1,6 +1,6 @@
 {
 	"name": "pi-cc-monitor",
-	"version": "0.18.0",
+	"version": "0.18.1",
 	"description": "Observe files, external runner job status and WebSocket events without owning business tasks.",
 	"author": "tarnish233",
 	"type": "module",

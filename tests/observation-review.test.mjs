@@ -120,7 +120,7 @@ test('schema and runtime agree on mode-dependent timeouts, source modes and WebS
     const bad = [
       { source: job.fileSource, timeout_ms: 3600001 },
       { source: { kind: 'ws', url: 'ws://localhost/events' }, timeout_ms: 7200000 },
-      { source: job.source, mode: 'events', timeout_ms: 3600001 },
+      { source: job.source, mode: 'events', timeout_ms: 7200001 },
       { source: job.fileSource, mode: 'completion' },
       { source: job.source, watches: [] },
       { action: 'update', id: 'observer', source: job.source },
@@ -134,7 +134,7 @@ test('schema and runtime agree on mode-dependent timeouts, source modes and WebS
     assert.deepEqual(await h.snapshots(), []);
     for (const args of [
       { source: job.source, timeout_ms: 7200000 },
-      { source: job.source, mode: 'events', timeout_ms: 3600000 },
+      { source: job.source, mode: 'events', timeout_ms: 7200000 },
       { source: job.fileSource, timeout_ms: 3600000, watches: [] },
       { source: { kind: 'ws', url: 'wss://example.com/events?q=a%20b' }, timeout_ms: 3600000 },
     ]) assert.equal(check.check({ ...args, description: 'valid contract' }), true);

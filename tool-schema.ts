@@ -18,15 +18,16 @@ export const JobSnapshotSchema = Type.Object({
 	updatedAt: Type.Optional(Type.Number()), startedAt: Type.Optional(Type.Number()), endedAt: Type.Optional(Type.Number()),
 	exitCode: Type.Optional(Type.Union([Type.Number(), Type.Null()])), signal: Type.Optional(Type.String()), error: Type.Optional(Type.String()),
 });
+const nonJobSource = { properties: { source: { properties: { kind: { enum: ["file", "ws"] } }, required: ["kind"] } }, required: ["source"] };
 const eventsMode = { anyOf: [
 	{ properties: { mode: { const: "events" } }, required: ["mode"] },
-	{ not: { required: ["mode"] }, properties: { source: { properties: { kind: { enum: ["file", "ws"] } }, required: ["kind"] } }, required: ["source"] },
+	{ not: { required: ["mode"] }, ...nonJobSource },
 ] };
 export const MonitorParameters = Type.Object({
 	action: Type.Optional(Type.Union([Type.Literal("start"), Type.Literal("update")])),
 	id: Type.Optional(Type.String({ description: "Existing observation id; only action=update uses this." })),
 	source: Type.Optional(ObservationSourceSchema),
-	mode: Type.Optional(Type.Union([Type.Literal("events"), Type.Literal("completion")], { description: "events follows source output; completion waits for an external job's valid terminal status. Default: completion for job sources, events otherwise. No command is executed." })),
+	mode: Type.Optional(Type.Union([Type.Literal("events"), Type.Literal("completion")], { description: "events follows source output (and for job sources, also completes on terminal status — never pair with a second completion monitor); completion waits quietly for an external job's valid terminal status. Default: completion for job sources, events otherwise. No command is executed." })),
 	description: Type.Optional(Type.String({ minLength: 1, description: "Required for start; short description of what is observed." })),
 	watches: Type.Optional(Type.Array(WatchSchema, { maxItems: MAX_WATCHES, description: "events only: literal source-output matching. [] mutes; omitted means all stdout. Matching never controls the external job." })),
 	timeout_ms: Type.Optional(Type.Number({ minimum: 1000, maximum: MONITOR_TIMEOUTS.completion.maxMs, description: "Observation deadline only, never a business-job timeout. Ignored when persistent is true." })),
@@ -37,7 +38,7 @@ export const MonitorParameters = Type.Object({
 	if: { properties: { action: { const: "update" } }, required: ["action"] },
 	then: { required: ["id"], properties: { source: false, mode: false, description: false, timeout_ms: false, persistent: false, loopPrompt: false } },
 	else: { required: ["description", "source"], properties: { id: false }, allOf: [
-		{ if: eventsMode, then: { properties: { timeout_ms: { maximum: MONITOR_TIMEOUTS.events.maxMs } } } },
+		{ if: nonJobSource, then: { properties: { timeout_ms: { maximum: MONITOR_TIMEOUTS.events.maxMs } } } },
 		{ if: { properties: { mode: { const: "completion" } }, required: ["mode"] }, then: { properties: { source: { properties: { kind: { const: "job" } }, required: ["kind"] } } } },
 		{ if: { required: ["watches"] }, then: eventsMode },
 	] },
